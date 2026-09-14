@@ -109,3 +109,52 @@ describe('idle-window animation gate', () => {
     expect(fs.readFileSync(hud, 'utf8')).not.toContain('--nt-anim-state')
   })
 })
+
+/**
+ * The three per-node glows, under `prefers-reduced-motion`.
+ *
+ * The trap this pins is not "is there a rule" but "does the rule keep the STATE readable": each
+ * glow's keyframe rests at its DIM end (`nt-unread-glow` at `opacity: 0`), so the idiomatic
+ * `animation: none` on its own would leave the unread glow completely invisible and the other two
+ * nearly so — a motion preference silently costing the user the status, not just the movement. A
+ * reviewer reading the diff sees three plausible `animation: none` rules and no reason to suspect
+ * it; only the base opacity three hundred lines up says otherwise.
+ */
+describe('reduced-motion glows stay readable', () => {
+  const css = readStyles()
+
+  const GLOWS = ['unread', 'working', 'attention'] as const
+
+  /** The body of the `prefers-reduced-motion` block that holds the glow rules. */
+  function reducedMotionGlowBlock(): string {
+    const start = css.indexOf('@media (prefers-reduced-motion: reduce)', css.indexOf('nt-attention-glow'))
+    expect(start, 'no reduced-motion block after the glow keyframes').toBeGreaterThan(-1)
+    // The block ends at the first line that closes it at column 0.
+    const end = css.indexOf('\n}\n', start)
+    expect(end, 'reduced-motion block is not closed').toBeGreaterThan(start)
+    return css.slice(start, end)
+  }
+
+  it.each(GLOWS)('stops the %s glow animating', (state) => {
+    const body = reducedMotionGlowBlock()
+    const rule = body.match(
+      new RegExp(`\\.react-flow__node:has\\(\\.term-node\\.${state}\\)::after\\s*\\{([^}]*)\\}`)
+    )
+    expect(rule, `no reduced-motion rule for the ${state} glow`).not.toBeNull()
+    expect(rule![1]).toMatch(/animation:\s*none/)
+  })
+
+  it.each(GLOWS)('leaves the %s glow VISIBLE rather than at its dim resting frame', (state) => {
+    const body = reducedMotionGlowBlock()
+    const rule = body.match(
+      new RegExp(`\\.react-flow__node:has\\(\\.term-node\\.${state}\\)::after\\s*\\{([^}]*)\\}`)
+    )!
+    const opacity = rule[1].match(/opacity:\s*([0-9.]+)/)
+    expect(
+      opacity,
+      `the ${state} glow's reduced-motion rule sets no opacity, so it falls back to the keyframe's ` +
+        'dim rest value — for unread that is 0, i.e. the state disappears entirely'
+    ).not.toBeNull()
+    expect(Number(opacity![1])).toBeGreaterThan(0.5)
+  })
+})

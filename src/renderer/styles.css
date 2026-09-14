@@ -1504,6 +1504,37 @@ body,
   will-change: auto;
 }
 
+/* The same three glows for a reader who has asked the OS for less motion. The mascot walk and the
+   status dot beside them have honoured `prefers-reduced-motion` since they were written; these
+   three never did, which is the oversight this closes — and they are the LOUDEST motion on the
+   canvas, a full-node glow rather than a 7px dot.
+
+   `animation: none` alone is not the fix, and this is the trap: each keyframe's REST value is its
+   dim end (unread 0, attention 0.15, working 0.25), so dropping the animation would leave the
+   unread glow completely invisible and the other two nearly so — turning a motion preference into
+   a loss of the state itself. They are frozen at the LIT end instead, the contract the dot's own
+   reduced-motion rule already states. Same values as the idle-window rules above, deliberately: a
+   glow that reads "working" should look the same whatever silenced its pulse. */
+@media (prefers-reduced-motion: reduce) {
+  .react-flow__node:has(.term-node.unread)::after {
+    animation: none;
+    opacity: 0.85;
+    will-change: auto;
+  }
+
+  .react-flow__node:has(.term-node.working)::after {
+    animation: none;
+    opacity: 0.7;
+    will-change: auto;
+  }
+
+  .react-flow__node:has(.term-node.attention)::after {
+    animation: none;
+    opacity: 0.8;
+    will-change: auto;
+  }
+}
+
 /* Bridge link handles (Claude nodes): dots on the header row, on top of the node so they're
    never buried under the terminal body. Subtle until you hover the node, then prominent.
    Never set `transform` on a React Flow handle: the side classes (.react-flow__handle-left/right/
