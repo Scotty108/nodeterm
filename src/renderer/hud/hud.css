@@ -92,11 +92,16 @@ body {
   flex-direction: column;
   align-items: center;
   will-change: width, max-height;
+  /* ONLY the vertical grow animates. `left` and `transform` used to tween too, and at CENTER that
+     read as "the panel slides in from the left": `width` snaps from auto to the panel width on
+     the first frame (auto → px never animates) while the collapsed translateX(-100%) still
+     applies to that new width, so the box's left edge jumped ~116 px LEFT of its final place and
+     then slid right for 220 ms. Left/right never showed it because their anchor edge does not
+     move on expand. Snapping the horizontal placement makes center behave exactly like the
+     sides: the capsule re-centres under the notch instantly, then grows DOWN. */
   transition:
     max-height var(--capsule-dur) var(--capsule-ease),
-    border-radius var(--capsule-dur) var(--capsule-ease),
-    left var(--capsule-dur) var(--capsule-ease),
-    transform var(--capsule-dur) var(--capsule-ease);
+    border-radius var(--capsule-dur) var(--capsule-ease);
 }
 /* Which edge of the collapsed capsule sits at --capsule-x. Fused pushes anchor-right (the default
    transform above); a pill pushes the side the user chose. */

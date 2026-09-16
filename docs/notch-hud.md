@@ -172,7 +172,11 @@ the transparent rest of the window stays click-through. Hidden entirely when idl
   `HOVER_OPEN_MS` (180 ms) — grows the SAME black surface — width → `--panel-width`, height
   (driven by `max-height`, so content of unknown height animates) → the rows box, bottom corners
   still rounded, top still fused — a spring-ish `--capsule-dur` (~220 ms) `--capsule-ease` expand
-  from the notch, NOT a separate floating panel. Rows fade in and start below the bar line
+  from the notch, NOT a separate floating panel. **Only the vertical grow is animated**: the
+  horizontal re-centre (grow-left capsule → panel centred under the notch) is instant. It used to
+  tween `left`/`transform` as well, and because `width` snaps from `auto` on the first frame while
+  the collapsed `translateX(-100%)` still applies, the centred panel visibly slid in from the LEFT;
+  the edge-anchored pills never moved horizontally, so center was the odd one out. Rows fade in and start below the bar line
   (`padding-top: calc(var(--bar) + 4px)`). `HUD_ROW_CAP` (6) session rows in the pushed
   (state-priority) order. Each row:
   animated mascot/green check + title + an **Unread** badge when `row.unread` + `model · reltime`
