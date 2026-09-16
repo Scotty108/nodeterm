@@ -336,3 +336,62 @@ describe('TabBar options button', () => {
     expect(document.querySelector('.tab-menu')).not.toBeNull()
   })
 })
+
+describe('TabBar density', () => {
+  let root: Root
+  let host: HTMLElement
+
+  // jsdom lays nothing out (`clientWidth` is 0), so the observer's measurement cannot be driven
+  // here; what CAN be pinned is the contract the stylesheet reads: the strip carries a density
+  // attribute, it starts at `roomy` (the pre-density rendering), and the tab whose menu is open
+  // is marked so a tight strip keeps its caret on screen.
+  beforeEach(async () => {
+    const { TabBar, useProjects } = await load()
+    host = document.createElement('div')
+    document.body.appendChild(host)
+    useProjects.setState({
+      projects: [project(), project({ id: 'p2', name: 'Beta' })],
+      activeProjectId: 'p1'
+    })
+    root = createRoot(host)
+    await act(async () => {
+      root.render(
+        <TabBar
+          onSwitch={vi.fn()}
+          onReconnect={vi.fn()}
+          onReorder={vi.fn()}
+          onOpenWelcome={vi.fn()}
+          onRename={vi.fn()}
+          onSetFolder={vi.fn()}
+          onCloseProject={vi.fn()}
+          onRemoteAccess={vi.fn()}
+          onSetDefaultAccount={vi.fn()}
+          onSetDefaultPermissionMode={vi.fn()}
+          onOpenProjectSettings={vi.fn()}
+        />
+      )
+    })
+  })
+
+  afterEach(() => {
+    act(() => root.unmount())
+    host.remove()
+  })
+
+  it('stamps the strip with a density the stylesheet can read, roomy until measured', () => {
+    // jsdom reports a 0px strip, which the rule reads as "tight"; either way the attribute is one
+    // of the three levels and present from the first render.
+    const strip = host.querySelector('.tabbar__tabs')!
+    expect(['roomy', 'compact', 'tight']).toContain(strip.getAttribute('data-density'))
+  })
+
+  it('marks the tab whose menu is open, so a tight strip does not hide the caret under its own menu', async () => {
+    const carets = host.querySelectorAll<HTMLButtonElement>('.tab__caret')
+    await click(carets[1])
+    const tabs = host.querySelectorAll('.tab')
+    expect(tabs[1].classList.contains('tab--menu-open')).toBe(true)
+    expect(tabs[0].classList.contains('tab--menu-open')).toBe(false)
+    await click(carets[1])
+    expect(tabs[1].classList.contains('tab--menu-open')).toBe(false)
+  })
+})

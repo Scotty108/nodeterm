@@ -82,6 +82,13 @@
   --tab-radius: 8px;
   --tab-flare: 8px;
   --tab-w: 168px;
+  /* The active tab's basis is wider by its board toggle. Flex shrink is weighted by basis, so with
+     ONE basis the tab carrying the most furniture hit its floor first and its NAME took the loss —
+     measured at 8 tabs / 1340px: inactive names 77px, the active name 24px (0 characters). */
+  --tab-active-extra: 23px;
+  /* The least name a tab may show; below it the strip scrolls rather than squeezing. Mirrors
+     TAB_NAME_MIN_PX in renderer/lib/tabDensity.ts (pinned by styles.tabbar.test.ts). */
+  --tab-name-min: 60px;
   --tab-fade: 18px;
   --tab-divider-h: 16px;
   /* The strip behind the tabs. In dark it is the panel colour (#282828 over a #000 canvas, the
@@ -439,6 +446,9 @@ body,
   /* Square bottom, sitting ON the bar's bottom edge, so the fill runs straight into the canvas. */
   margin-bottom: 0;
   border-radius: var(--tab-radius) var(--tab-radius) 0 0;
+  /* Wider by its board toggle, so its name shrinks in step with the inactive names instead of
+     absorbing the toggle's width (see --tab-active-extra). */
+  width: calc(var(--tab-w) + var(--tab-active-extra));
   /* Above `.tabbar::after` and the neighbouring tabs, so the tab's own bottom pixels and its
      flares replace the separator line, and the flares paint over the neighbours' edges. */
   z-index: 1;
@@ -547,17 +557,44 @@ body,
 /* The name takes whatever width the tab's fixed parts leave, and gives it back first when the
    tab shrinks. `width: 0` is what keeps the TAB's automatic minimum from being the whole label:
    a flex item's min-content contribution is its definite width when it has one, so the tab's
-   floor counts 24px of name (the `min-width`), not the full text. The text then runs under a
+   floor counts `--tab-name-min` of name, not the full text. That floor is the ONE place the strip
+   decides to scroll: a tab that cannot hold it with the furniture the density level left (see
+   `[data-density]` below) stops shrinking, and the strip overflows. It was 24px, which at 12 tabs
+   read as three letters and a fade on every tab (the #789 regression). The text runs under a
    mask that fades the last `--tab-fade` px — a fade, not an ellipsis, because the fade shows the
    letters that DO fit at every width while "…" spends three characters saying it cut something. A
    name that fits ends before the fade zone, so it is untouched. */
 .tab__name {
   flex: 1 1 0;
   width: 0;
-  min-width: 24px;
+  min-width: var(--tab-name-min);
   overflow: hidden;
   -webkit-mask-image: linear-gradient(90deg, #000 calc(100% - var(--tab-fade)), transparent);
   mask-image: linear-gradient(90deg, #000 calc(100% - var(--tab-fade)), transparent);
+}
+
+/* Density: which furniture a tab sheds so the NAME survives, decided per strip by TabBar
+   (`lib/tabDensity.ts`, from the strip's measured width and the tab count) and stamped as
+   `data-density`. Cheapest first — the chip, then the inactive caret — and the active tab keeps
+   both its buttons at every level: the board toggle belongs to the tab you are looking at. */
+.tabbar__tabs[data-density='compact'] .tab__ssh,
+.tabbar__tabs[data-density='tight'] .tab__ssh {
+  display: none;
+}
+
+/* Tight: an inactive tab's caret is there on hover (Chrome's close button does the same at this
+   width) and stays while its menu is open — the pointer is on the menu then, not the tab, and a
+   caret that vanished under an open menu would read as the menu having come from nowhere. It is
+   `display: none`, not `visibility`, so the freed width goes to the name — and it is the whole
+   actions CLUSTER that goes, not the caret inside it: on an inactive tab the cluster holds only
+   the caret, and an emptied cluster still costs its margin and the tab's gap (8px measured). */
+.tabbar__tabs[data-density='tight'] .tab:not(.active):not(:hover):not(.tab--menu-open) .tab__actions {
+  display: none;
+}
+
+/* A shorter fade on a tight strip: 18px of a 60px name is a third of it under the gradient. */
+.tabbar__tabs[data-density='tight'] .tab__name {
+  --tab-fade: 12px;
 }
 
 .tab__edit {

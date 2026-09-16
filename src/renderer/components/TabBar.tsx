@@ -12,6 +12,7 @@ import { sessionCount, sessionForProject, useProjectSession } from '../session/s
 import { tabClickAction } from '../session/relay-tab'
 import { useMenuFlip } from '../ui/useMenuFlip'
 import { commandTooltip } from '../lib/keybindingOverrides'
+import { tabDensity, type TabDensity } from '../lib/tabDensity'
 import { IconCanvasView, IconKanban, IconMoreVertical, IconPlus } from './icons'
 import { ProjectGlyph } from './ProjectGlyph'
 import {
@@ -212,6 +213,27 @@ export function TabBar({
       ?.scrollIntoView({ behavior: 'smooth', inline: 'nearest', block: 'nearest' })
   }, [activeId, projects.length])
 
+  // How much furniture a tab may carry at the width the strip can give it (see lib/tabDensity):
+  // measured on the strip itself and stamped on it as `data-density`, so the stylesheet sheds the
+  // SSH chip, then the inactive caret, BEFORE the name is squeezed. The strip is content-sized, so
+  // its clientWidth is the tabs' full width while they fit and the available width once they
+  // shrink — either way the per-tab share the rule wants. Its padding is the flares' room.
+  const [density, setDensity] = useState<TabDensity>('roomy')
+  const tabCount = projects.length
+  useEffect(() => {
+    const el = tabsRef.current
+    if (!el || typeof ResizeObserver === 'undefined') return
+    const measure = (): void => {
+      const cs = getComputedStyle(el)
+      const inner = el.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight)
+      setDensity(tabDensity(Number.isFinite(inner) ? inner : null, tabCount))
+    }
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [tabCount])
+
   // The backdrop deliberately sits BELOW the bar, so a click on another tab switches to it in one
   // go instead of being swallowed as a dismiss — which leaves the bar itself (its empty stretch,
   // the brand, the +) unable to close the menu. This covers exactly that gap, and it closes
@@ -276,6 +298,7 @@ export function TabBar({
         >
           <div
             className="tabbar__tabs"
+            data-density={density}
             ref={tabsRef}
             onWheel={(e) => {
               // Translate a vertical mouse wheel into horizontal strip scrolling (trackpads
@@ -290,7 +313,7 @@ export function TabBar({
             return (
               <div
                 key={p.id}
-                className={`tab${active ? ' active' : ''}${swimlaneHighlight ? ' tab--swimlane-highlight' : ''}${p.unavailable ? ' unavailable' : ''}${dropId === p.id ? ' is-drop-before' : ''}`}
+                className={`tab${active ? ' active' : ''}${swimlaneHighlight ? ' tab--swimlane-highlight' : ''}${p.unavailable ? ' unavailable' : ''}${dropId === p.id ? ' is-drop-before' : ''}${menuId === p.id ? ' tab--menu-open' : ''}`}
                 // The project colour rides the GLYPH (below), not the label: `.tab.active` is
                 // neutral text on the page's own surface, like a browser tab. The one exception is
                 // the swimlane highlight, whose underline is `currentColor` and is meant to be the

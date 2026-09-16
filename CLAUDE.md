@@ -4031,9 +4031,17 @@ the Settings section and ShortcutsPanel start disagreeing about what a chord mea
   surface below — which is also the kanban overlay's colour, so it merges under both views. In
   LIGHT the strip steps back to `--surface-deep` (`--tabbar-bg`), because `--panel` and
   `--canvas-bg` are one value apart there and a canvas-coloured tab would vanish. Tabs share one
-  flex basis (`--tab-w`) and shrink together; the name is `flex: 1 1 0; width: 0` under a mask fade
-  (never an ellipsis), and `width: 0` is what keeps a tab's automatic minimum at its fixed parts
-  instead of the whole label. **The bar's height is ONE number in two places that cannot read each
+  flex basis (`--tab-w`, the active one wider by its board toggle so its name shrinks in step) and
+  shrink together; the name is `flex: 1 1 0; width: 0; min-width: var(--tab-name-min)` under a mask
+  fade (never an ellipsis), and `width: 0` is what keeps a tab's automatic minimum at its fixed
+  parts instead of the whole label. **The name has priority as tabs shrink** (the #789 regression:
+  at 8 tabs / 1340px the ACTIVE name was 24px — 0 characters — because it carried the most
+  furniture and hit its floor first; at 12 every name was). `renderer/lib/tabDensity.ts` derives a
+  per-strip level from the measured strip width ÷ tab count (TabBar stamps it as `data-density`):
+  `compact` hides the SSH chip, `tight` makes the inactive caret hover-only (kept while its menu is
+  open, `tab--menu-open`); the active tab keeps both buttons at every level, and the 60px name floor
+  is the one place the strip decides to scroll instead of squeezing. Thresholds are derived from
+  the measured furniture, not chosen — change a padding and update the constants. **The bar's height is ONE number in two places that cannot read each
   other**: `--tabbar-h` in styles.css (every top-anchored panel, the kanban overlay and the usage
   popover position against it) and `TABBAR_HEIGHT_PX` in `@shared/window-chrome-metrics`, from
   which main derives the traffic-light `y` (`trafficLightY`) — a literal 15 for a 44px bar was

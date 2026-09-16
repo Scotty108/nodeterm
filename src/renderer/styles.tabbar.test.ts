@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { TABBAR_HEIGHT_PX } from '@shared/window-chrome-metrics'
+import { TAB_NAME_MIN_PX } from './lib/tabDensity'
 
 /**
  * The tab bar's height used to be a literal in four places — the bar's own rule, the kanban
@@ -83,5 +84,22 @@ describe('tab strip geometry', () => {
     expect(name).not.toMatch(/text-overflow/)
     // `width: 0` is what keeps the tab's automatic minimum from being the whole label.
     expect(name).toMatch(/width:\s*0;/)
+  })
+
+  it('keeps a readable name floor, the same number the density rule reasons from', () => {
+    expect(token('--tab-name-min')).toBe(`${TAB_NAME_MIN_PX}px`)
+    expect(rule('.tab__name')).toMatch(/min-width:\s*var\(--tab-name-min\)/)
+    // The active tab's basis is wider by its board toggle, so its name shrinks in step with the
+    // inactive names instead of absorbing the toggle (the 24px active name at 8 tabs).
+    expect(rule('.tab.active')).toMatch(/width:\s*calc\(var\(--tab-w\) \+ var\(--tab-active-extra\)\)/)
+  })
+
+  it('sheds furniture by density before the name is squeezed, and never the active tab\'s buttons', () => {
+    const compactChip = CSS.match(/\.tabbar__tabs\[data-density='compact'\] \.tab__ssh,\s*\.tabbar__tabs\[data-density='tight'\] \.tab__ssh \{[^}]*display:\s*none/)
+    expect(compactChip).not.toBeNull()
+    const tightCaret = CSS.match(/\.tabbar__tabs\[data-density='tight'\] \.tab:not\(\.active\):not\(:hover\):not\(\.tab--menu-open\) \.tab__actions \{[^}]*display:\s*none/)
+    expect(tightCaret).not.toBeNull()
+    // Nothing hides the board toggle at any density.
+    expect(CSS).not.toMatch(/\[data-density[^\]]*\][^{]*\.tab__board-toggle[^{]*\{[^}]*display:\s*none/)
   })
 })
