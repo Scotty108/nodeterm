@@ -15,7 +15,14 @@ import {
 import { RETRYABLE } from '../core/agents/agent-message-decide'
 import { PROJECT_TARGETABLE_VERBS } from '../core/project-grants'
 import { DRY_RUN_VERBS } from '../shared/control-verbs'
-import { SETTINGS_VERB_KEYS, SETTINGS_VERB_KEY_LIST } from '../shared/settings-verb'
+import {
+  SETTINGS_VERB_KEYS,
+  SETTINGS_VERB_KEY_LIST,
+  readSettingsValue
+} from '../shared/settings-verb'
+import { decideControlConfirm, isWaivableVerb } from '../shared/control-confirm'
+import { DEFAULT_SETTINGS } from '../shared/types'
+import { serverSettingsControl } from '../server/settings-control'
 import { STRICT_CONTROL_VERBS } from '../core/agents/node-identity-policy'
 import { BROWSER_ACTION_KEYS } from '../core/browser-verb'
 import { BROWSER_RETRYABLE, BROWSER_OUTCOME_LABEL } from '../core/browser-outcomes'
@@ -568,6 +575,55 @@ describe('parseControlRequest', () => {
       // The messaging line now names the way to ask for the switch, instead of implying there is none.
       expect(body).toContain('`--set agentMessaging --value true`')
     }
+  })
+
+  it('the settings text\'s claims are true of the MECHANISM, not only present in the prose', () => {
+    // "no don't ask again covers this verb" — ask the waiver table, with every waiver shape set.
+    expect(isWaivableVerb('settings')).toBe(false)
+    expect(
+      decideControlConfirm({
+        verb: 'settings',
+        sessionWaived: new Set(['settings']),
+        persisted: { always: ['settings'], projects: { p: ['settings'] }, bypassMode: true },
+        projectId: 'p',
+        permissionMode: 'bypassPermissions',
+        permissionModeSource: 'global'
+      }).skip
+    ).toBe(false)
+    // "one dialog at a time" rides the shared confirm-gated set.
+    expect(isDestructiveVerb('settings')).toBe(true)
+    // "permission modes, accounts and credentials, node identity, browser control, telemetry,
+    // keybindings, confirm waivers … can never be changed from here" — one real key per named class.
+    for (const key of [
+      'claudePermissionMode',
+      'defaultPermissionMode',
+      'claudeAccounts',
+      'modelGateway',
+      'hookIdentityStrict',
+      'agentBrowserControl',
+      'telemetryEnabled',
+      'keybindings',
+      'controlConfirmWaivers'
+    ]) {
+      const r = parseControlRequest('settings', { set: key, value: 'true' })
+      expect(r, key).toEqual({ error: expect.stringContaining('settings-key-forbidden') })
+    }
+    // "Server Edition reads settings but refuses every --set" — ask the server handler itself.
+    const serverDeps = {
+      persistedCanvases: () => [{ id: 'p', nodes: [{ id: 'n' }] }],
+      capabilityProjectFor: () => ({}),
+      projectName: () => 'p',
+      settings: () => DEFAULT_SETTINGS
+    }
+    for (const key of SETTINGS_VERB_KEY_LIST) {
+      const value = SETTINGS_VERB_KEYS[key].type.kind === 'boolean' ? 'true' : '300'
+      expect(serverSettingsControl(serverDeps, 'n', { set: key, value }).ok, key).toBe(false)
+    }
+    expect(serverSettingsControl(serverDeps, 'n', {}).ok).toBe(true)
+    // "A project key reads as what is in effect RIGHT NOW" — a file true nobody here confirmed is off.
+    expect(
+      readSettingsValue('agentMessaging', DEFAULT_SETTINGS, { id: 'p', name: 'p', agentMessaging: true })
+    ).toMatchObject({ value: false })
   })
 
   it('parseControlRequest runs the settings allowlist, so main refuses a forbidden key by name', () => {
