@@ -2803,7 +2803,9 @@ export function Canvas() {
         )
   }, [])
 
-  const writeDisk = useCallback(async () => {
+  // Resolves whether the save LANDED — a caller that must not proceed on a refused save (pop-out:
+  // the new window boots from what is on disk) reads it; every autosave path ignores it.
+  const writeDisk = useCallback(async (): Promise<boolean> => {
     // Captured BEFORE the snapshot is built (`toWorkspace()` runs synchronously on this line), so
     // it names exactly the edits this save carries. A save is not instant — an SSH mirror write
     // takes seconds — and clearing `dirty` unconditionally afterwards marked edits made DURING the
@@ -2820,17 +2822,18 @@ export function Canvas() {
       // backoff delay) and let the strip say so. Never clear `dirty` — nothing reached disk.
       console.warn('[canvas] workspace save failed', err)
       setSaveDelivery((prev) => nextSaveDelivery(prev, Date.now()))
-      return
+      return false
     }
     setSaveDelivery(undefined)
     if (canClearDirty(gen, dirtyGenRef.current)) {
       setDirty(false)
-      return
+      return true
     }
     // An edit raced the save: leave `dirty` set so nothing believes the canvas is on disk. But the
     // debounce effect only re-arms when one of its deps changes, and `dirty` never went false —
     // nudge it explicitly, or the racing edit would wait for an unrelated later edit to be saved.
     setResaveTick((v) => v + 1)
+    return true
   }, [])
 
   const persist = useCallback(async () => {
@@ -3068,12 +3071,21 @@ export function Canvas() {
         // Nothing else to show: the start screen, exactly as closing the last open tab does.
         if (nextActive === '') setWelcomeOpen(true)
       }
-      await writeDisk()
-      const result = await api.windows.popout(id)
+      // The new window is booted from what is on disk, so a save that did not land means it would
+      // open WITHOUT the edits it just carried — and its first autosave would make that permanent.
+      const saved = await writeDisk()
+      const result = saved
+        ? await api.windows.popout(id)
+        : { ok: false as const, error: 'Could not save this project, so it was not moved to a new window. Try again.' }
       if (!result.ok) {
-        // Main opened nothing, so this window still owns the project: give its tab back.
+        // Main opened nothing, so this window still owns the project: give its tab back, and the
+        // canvas it was showing.
         const now = useWindows.getState()
         now.setDetached([...now.detached].filter((d) => d !== id))
+        if (useProjects.getState().activeProjectId === nextActive && store.activeProjectId === id) {
+          useProjects.getState().setActive(id)
+          setWelcomeOpen(false)
+        }
         window.dispatchEvent(
           new CustomEvent('nodeterm:toast', { detail: { kind: 'error', message: result.error } })
         )
