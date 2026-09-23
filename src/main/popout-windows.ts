@@ -96,6 +96,22 @@ export function windowShowingProject(projectId: string | undefined): PopoutWindo
   return getMainWindow()
 }
 
+/**
+ * The window a menu command goes to: the FOCUSED window when it is one of ours (the main window or
+ * a pop-out), else `fallback` (the main window the menu was built for). The application menu is
+ * one per app, and before this every accelerator went to the main window — ⌘⇧B with a pop-out
+ * focused toggled the board in the window behind it. A focused window that is not an app window
+ * (a DevTools window, the notch HUD) never receives app commands.
+ */
+export function menuTarget<W extends { webContents: { id: number } }>(
+  focused: W | null,
+  fallback: W
+): W {
+  if (!focused) return fallback
+  if ((focused as unknown) === getMainWindow() || popoutProjectOf(focused.webContents.id) !== null) return focused
+  return fallback
+}
+
 /** Subscribe to the set of popped-out projects changing (register / closed). */
 export function onDetachedChange(cb: (ids: string[]) => void): () => void {
   changeListeners.add(cb)

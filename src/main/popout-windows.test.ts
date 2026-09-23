@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { setMainWindow, type MainWindowLike } from './main-window'
 import {
   detachedProjectIds,
+  menuTarget,
   onDetachedChange,
   popoutClientIds,
   popoutForProject,
@@ -129,5 +130,19 @@ describe('window routing', () => {
     expect(windowShowingProject(undefined)).toBe(main)
     b.emitClosed()
     expect(windowShowingProject('b')).toBe(main)
+  })
+})
+
+describe('menu target', () => {
+  it('menu commands go to the focused app window, else the main window', () => {
+    const main = fakeWindow(1)
+    setMainWindow(main)
+    const b = fakeWindow(20)
+    registerPopout('b', b)
+    const devtools = fakeWindow(99)
+    expect(menuTarget(b, main)).toBe(b)
+    expect(menuTarget(main, main)).toBe(main)
+    expect(menuTarget(devtools, main)).toBe(main)
+    expect(menuTarget(null, main)).toBe(main)
   })
 })

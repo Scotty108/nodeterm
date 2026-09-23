@@ -130,6 +130,7 @@ import {
 import { setMainWindow, getMainWindow, sendToMain, closeAction, createCrashReloadPolicy } from './main-window'
 import {
   detachedProjectIds,
+  menuTarget,
   onDetachedChange,
   popoutForProject,
   popoutProjectOf,
@@ -781,7 +782,9 @@ function buildAppMenu(win: BrowserWindow): void {
   const isMac = process.platform === 'darwin'
   const s = settingsStore.get()
   const send = (channel: string): void => {
-    if (!win.isDestroyed()) win.webContents.send(channel)
+    // Resolved at CLICK time: the focused app window, a pop-out included (menuTarget).
+    const target = menuTarget(BrowserWindow.getFocusedWindow(), win)
+    if (!target.isDestroyed()) target.webContents.send(channel)
   }
   // ONE object, placed into BOTH templates below (mac's app menu, off-mac's own `Settings` menu),
   // so `MENU_ITEM_ID_SETTINGS` resolves on every platform — which is why `menuItemIdsToSuspend`
