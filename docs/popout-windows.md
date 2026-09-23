@@ -253,10 +253,15 @@ Main used to send everything to *the* window. Now:
 
 Verified on macOS (see the PR for the run). Owed elsewhere:
 
-1. **Windows / Linux**: the tear-off's `dragend` coordinates when released OUTSIDE the window —
-   Chromium reports client coordinates on macOS (negative / past the size); confirm the same on the
-   other two platforms, or the outside-window release is a cancelled drag there (the caret menu row
-   still works).
+1. **Windows / Linux**: releasing a dragged tab OUTSIDE the window. `dragend` coordinates are only
+   trustworthy on macOS; Chromium on Linux can report an outside release as (0, 0), which reads as
+   a cancelled drag inside the strip. The decision therefore no longer rests on them alone: the tab
+   strip tracks the drag at the document level — a `dragleave` with no `relatedTarget` marks "left
+   the window", and every `dragover` records the last position inside it — and `isTabTearOff` asks
+   those first (unit-tested). Re-verified on macOS with real drags (a reorder opens nothing, a
+   release on the canvas tears off). Still to confirm on the other two: that Chromium there fires
+   the document `dragleave` when the pointer leaves the window. If it does not, the outside release
+   still falls back to the old coordinates (a cancelled drag); the caret-menu row works either way.
 2. **Linux**: the pop-out's window icon (`linuxWindowIcon`, the same png as the main window).
 3. **Windows / Linux**: closing the MAIN window while pop-outs are open — main's `close` runs the
    quit confirm and `app.quit()`, which closes the pop-outs (without the flush handshake, as on any

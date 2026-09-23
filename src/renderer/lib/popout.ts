@@ -70,6 +70,11 @@ export interface TabDragEnd {
   /** The window's client size — a release beyond it is a release outside the window. */
   innerWidth: number
   innerHeight: number
+  /** The pointer left the window during the drag and did not come back (a document-level
+   *  `dragleave` with no `relatedTarget`, cleared by the next `dragenter`). */
+  leftWindow?: boolean
+  /** Where the pointer last was INSIDE the window (the last document `dragover`), or null. */
+  lastInside?: { x: number; y: number } | null
 }
 
 /**
@@ -82,7 +87,15 @@ export interface TabDragEnd {
  */
 export function isTabTearOff(drag: TabDragEnd): boolean {
   if (drag.handledByStrip) return false
-  const { clientX, clientY, innerWidth, innerHeight, stripBottom } = drag
+  // The coordinates on `dragend` are only reliable on macOS. Chromium on Linux (and, reportedly,
+  // Windows) can report a release OUTSIDE the window as (0, 0) — inside the strip, i.e. a cancelled
+  // drag, so the gesture this exists for would silently do nothing there. Two platform-neutral
+  // signals come first: the pointer having left the window, and failing that, the last position the
+  // document saw it at. (0, 0) itself is the brand logo corner, never a place anyone releases a tab.
+  if (drag.leftWindow) return true
+  const zero = drag.clientX === 0 && drag.clientY === 0
+  const { clientX, clientY } = zero && drag.lastInside ? { clientX: drag.lastInside.x, clientY: drag.lastInside.y } : drag
+  const { innerWidth, innerHeight, stripBottom } = drag
   if (!Number.isFinite(clientX) || !Number.isFinite(clientY)) return false
   const outsideWindow = clientX < 0 || clientY < 0 || clientX > innerWidth || clientY > innerHeight
   if (outsideWindow) return true

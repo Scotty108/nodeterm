@@ -40,6 +40,16 @@ describe('nextActiveAfterDetach', () => {
 
 describe('isTabTearOff', () => {
   const base = { handledByStrip: false, stripBottom: 40, innerWidth: 1200, innerHeight: 800 }
+  it('a pointer that left the window tears off even when dragend reports (0, 0) (Linux)', () => {
+    expect(isTabTearOff({ ...base, clientX: 0, clientY: 0, leftWindow: true })).toBe(true)
+  })
+  it('(0, 0) falls back to the last position seen inside the window', () => {
+    expect(isTabTearOff({ ...base, clientX: 0, clientY: 0, lastInside: { x: 400, y: 500 } })).toBe(true)
+    expect(isTabTearOff({ ...base, clientX: 0, clientY: 0, lastInside: { x: 400, y: 20 } })).toBe(false)
+  })
+  it('leaving the window never overrides a drop the strip handled', () => {
+    expect(isTabTearOff({ ...base, clientX: 0, clientY: 0, leftWindow: true, handledByStrip: true })).toBe(false)
+  })
   it('a drop the strip handled is a reorder, never a tear-off', () => {
     expect(isTabTearOff({ ...base, handledByStrip: true, clientX: 300, clientY: 500 })).toBe(false)
   })

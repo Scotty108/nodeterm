@@ -139,6 +139,9 @@ export function TabBar({
   // way a browser tab dragged off its strip opens a new window. A ref, not state: `dragend` reads
   // it in the same event turn the drop handler wrote it.
   const dragHandledRef = useRef(false)
+  // Where the pointer is during a tab drag, tracked at the DOCUMENT (see `isTabTearOff`: dragend's
+  // own coordinates are not trustworthy off macOS). Armed on dragstart, torn down on dragend.
+  const dragTrackRef = useRef<{ leftWindow: boolean; lastInside: { x: number; y: number } | null; stop: () => void } | null>(null)
   // Whether the caret menu's "Default Claude account" group is expanded (inline, in-place).
   const [acctOpen, setAcctOpen] = useState(false)
   // Whether the caret menu's "Default permission mode" group is expanded (same idiom as acctOpen).
@@ -333,11 +336,35 @@ export function TabBar({
                   e.dataTransfer.effectAllowed = 'move'
                   dragHandledRef.current = false
                   setDragId(p.id)
+                  dragTrackRef.current?.stop()
+                  const track = { leftWindow: false, lastInside: null as { x: number; y: number } | null, stop: () => {} }
+                  const over = (ev: globalThis.DragEvent): void => {
+                    track.leftWindow = false
+                    if (ev.clientX !== 0 || ev.clientY !== 0) track.lastInside = { x: ev.clientX, y: ev.clientY }
+                  }
+                  const leave = (ev: globalThis.DragEvent): void => {
+                    if (ev.relatedTarget === null) track.leftWindow = true
+                  }
+                  const enter = (): void => {
+                    track.leftWindow = false
+                  }
+                  document.addEventListener('dragover', over)
+                  document.addEventListener('dragleave', leave)
+                  document.addEventListener('dragenter', enter)
+                  track.stop = () => {
+                    document.removeEventListener('dragover', over)
+                    document.removeEventListener('dragleave', leave)
+                    document.removeEventListener('dragenter', enter)
+                  }
+                  dragTrackRef.current = track
                 }}
                 onDragEnd={(e) => {
                   // Decided from the release point, not from `dropEffect`: a terminal's file-drop
                   // zone under the strip accepts any drag, which would read as a completed drop.
                   const strip = e.currentTarget.closest('.tabbar')?.getBoundingClientRect()
+                  const track = dragTrackRef.current
+                  track?.stop()
+                  dragTrackRef.current = null
                   const tearOff =
                     !popoutMode &&
                     !isBrowserRuntime() &&
@@ -347,7 +374,9 @@ export function TabBar({
                       handledByStrip: dragHandledRef.current,
                       stripBottom: strip?.bottom ?? 0,
                       innerWidth: window.innerWidth,
-                      innerHeight: window.innerHeight
+                      innerHeight: window.innerHeight,
+                      leftWindow: track?.leftWindow ?? false,
+                      lastInside: track?.lastInside ?? null
                     })
                   setDragId(null)
                   setDropId(null)
