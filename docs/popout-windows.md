@@ -154,6 +154,20 @@ Main used to send everything to *the* window. Now:
   application menu is one per app, and its accelerators (⌘⇧B, ⌘,, the View items) all went to the
   main window — ⌘⇧B with a pop-out focused toggled the board in the window behind it. A focused
   window that is not an app window (DevTools, the notch HUD) still falls back to the main window.
+- **Keyboard state is per window** (`main/window-key-state.ts`). The two bits the renderer mirrors
+  into main — "a shortcut recorder is armed" and "a terminal has focus" (the `terminal-first`
+  policy) — were one global pair guarded to the main window, so a pop-out's intercepts followed the
+  MAIN window's terminal focus and a recorder armed in a pop-out's Settings stood nothing down. Each
+  app window now reports its own (the sender guard accepts the main window or a pop-out, never a
+  `<webview>` guest), its intercepts read its own, and each window's bits are cleared at the same
+  three sites as before (closed, render-process-gone, a main-frame navigation), for that window
+  only. The application MENU is one per app, so its stand-down follows the focused app window, and
+  `browser-window-focus` re-syncs it when the user moves between windows. Verified in the built app
+  (sandbox, `terminal-first`) from main's own log: the pop-out's terminal taking focus reported
+  from the pop-out's webContents and disabled the menu's stand-down items while that window was
+  the focused one. The move BETWEEN windows could not be driven reliably under automation (macOS
+  often reports no focused window to a Playwright-driven app), so that half rests on the unit tests
+  of its two parts (`menuTarget`, `window-key-state`) and is on the device checklist.
 - **Pop-outs count as attached clients** (`clientIds()` includes them). Not optional: the pty
   manager decides "attached" against that list, and a subscriber missing from it reads as detached
   to the session reaper — a pop-out's terminals would be culled after the grace window.
@@ -231,13 +245,6 @@ Main used to send everything to *the* window. Now:
   explorer expansion, `nodeterm.agentStatus`'s unread/session map) are last-writer-wins across
   windows. Reading `unread` in one window can be undone by the other's next persist. The honest fix
   is per-window keys or main-owned state; not done here.
-- **The keyboard-shortcut mirrors stay the main window's.** `uiTerminalFocus` / `uiShortcutRecording`
-  are sender-guarded to the main window (a `<webview>` guest must not move them), so under the
-  `terminal-first` policy a pop-out's intercepts follow the MAIN window's terminal focus, and a
-  recorder armed in a pop-out's Settings does not suspend the menu. Relaxing the guard to "any app
-  window" was considered and refused for now: the bits are global and change-deduped, so a pop-out
-  closing with a focused terminal would strand the main window's state (the exact trap
-  `terminalFocusMirror` documents).
 - **A pop-out's geometry is not remembered** (§4).
 - **The Omni Kanban and the sessions sidebar list a detached project from main's mirrored copy**,
   which lags the pop-out by one autosave debounce (≤ 800 ms). Only NAVIGATION routes to the window
@@ -281,7 +288,10 @@ Verified on macOS (see the PR for the run). Owed elsewhere:
    eviction is likelier, and terminals streaming output during the zoom (these showed their
    prompts). If an eviction does show up there, split one budget across the windows (main hands
    each renderer its share); do not raise the cap.
-6. **The reviewer's blocking scenarios on a device**: with a terminal-bearing project popped out,
+6. **`terminal-first` with two windows**: focus a terminal in a pop-out, then click into the main
+   window (no terminal focused there) — ⌘M should minimize the main window; click back into the
+   pop-out's terminal — ⌘M should reach the terminal.
+7. **The reviewer's blocking scenarios on a device**: with a terminal-bearing project popped out,
    the main window's sidebar project menu shows only Show window / Bring back; sidebar ×, Omni
    delete and "Close project → end sessions" are refused with the strip, and `tmux ls` still lists
    the pop-out's session.

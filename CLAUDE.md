@@ -4417,7 +4417,8 @@ the Settings section and ShortcutsPanel start disagreeing about what a chord mea
   answers; external-change broadcasts are gated in the renderer by `ownsProjectHere`, and the agent
   ALERTS (unread, chime, OS notification) by `alertsHere` — bookkeeping everywhere, interrupts only
   in the owning window; `app:notify` checks the asking window's focus, and menu commands go to the
-  focused app window (`menuTarget`). (4)
+  focused app window (`menuTarget`), and the keyboard stand-down bits are per window
+  (`window-key-state.ts`; the menu's stand-down follows the focused app window). (4)
   **Pop-outs are attached clients** (`clientIds()`), or the reaper reads their sessions as
   detached. (5) **Closing runs a bounded flush handshake** (`window:popout-flush` /
   `-flushed`, 2.5 s) — the ack means "you may close me", never "the save landed"; on quit the
@@ -4427,7 +4428,7 @@ the Settings section and ShortcutsPanel start disagreeing about what a chord mea
   Deliberately not: persisted across restarts, nestable, available in a browser/relay tab
   (`windows.popout` rejects; the tab menu hides the row; `isBrowserRuntime()` disarms the drag).
   Known v1 gaps, all in the doc: shared `localStorage` across windows (last-writer-wins on the
-  per-viewer stores), the keyboard-shortcut mirrors stay the main window's, geometry not remembered,
+  per-viewer stores), geometry not remembered,
   and the WebGL budget is
   per renderer (two windows hold 2 × 16 on macOS; a two-window soak on an M5 Max saw 0 lost
   contexts — Intel / low-memory GPUs still owed).

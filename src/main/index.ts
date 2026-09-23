@@ -141,6 +141,7 @@ import {
   type PopoutWindowLike
 } from './popout-windows'
 import { popoutHash } from '../shared/popout-window'
+import { clearKeyState, keyStateOf, setKeyState } from './window-key-state'
 import {
   MENU_ITEM_ID_CLOSE,
   MENU_ITEM_ID_KANBAN,
@@ -439,11 +440,10 @@ settingsStore.onChange((s) => {
 // happens to click away and back. The three below are safe precisely because each one means that
 // page, and its mirror, are gone. `shortcutRecording` has no such constraint (the recorder
 // re-arms), so do not reason about the two bits interchangeably.
-let shortcutRecording = false
-let terminalFocused = false
-const clearRendererKeyState = (): void => {
-  shortcutRecording = false
-  terminalFocused = false
+// PER WINDOW since pop-out windows (`window-key-state.ts`): each window's intercepts read its own
+// bits, and the menu leg reads the FOCUSED app window's (see `syncMenuForStandDown`).
+const clearRendererKeyState = (webContentsId: number): void => {
+  clearKeyState(webContentsId)
   // The menu leg follows the same state, so it must follow it here too — otherwise a crash or a
   // reload while stood down would leave Window ▸ Minimize disabled with nothing left to re-enable
   // it, i.e. ⌘M dead app-wide. Safe before any window exists: it no-ops without a menu.
@@ -988,6 +988,13 @@ function buildAppMenu(win: BrowserWindow): void {
 function syncMenuForStandDown(): void {
   const menu = Menu.getApplicationMenu()
   if (!menu) return
+  // The menu is one per app, so it follows the window the user is in (the focused app window, else
+  // the main window) — the same resolution menu clicks use (`menuTarget`).
+  const main = getMainWindow() as unknown as BrowserWindow | null
+  const target = main ? menuTarget(BrowserWindow.getFocusedWindow(), main) : null
+  const { shortcutRecording, terminalFocused } = keyStateOf(
+    target && !target.isDestroyed() ? target.webContents.id : null
+  )
   const enabled = !menuStandsDown(shortcutRecording, currentInterceptPolicy(), terminalFocused)
   for (const id of menuItemIdsToSuspend(interceptIsMac)) {
     const item = menu.getMenuItemById(id)
@@ -1135,11 +1142,13 @@ function createPopoutWindow(projectId: string): BrowserWindow {
     // its pty subscriptions must be dropped here or its sessions stay paused/attached forever.
     ptyManager.dropClient(clientId)
     pendingPopoutFlush.get(clientId)?.()
+    clearRendererKeyState(clientId) // its keyboard bits die with its page (same three sites as main)
   })
   const crashReload = createCrashReloadPolicy()
   win.webContents.on('render-process-gone', (_event, details) => {
     ptyManager.dropClient(clientId)
     pendingPopoutFlush.get(clientId)?.()
+    clearRendererKeyState(clientId)
     if (quitting || win.isDestroyed()) return
     // The hash survives a reload, so the page comes back as the SAME pop-out. Past the budget the
     // window closes and the project returns to the main window — a dead pop-out must not hold a
@@ -1170,10 +1179,13 @@ function createPopoutWindow(projectId: string): BrowserWindow {
     win,
     currentInterceptBindings,
     interceptIsMac,
-    () => shortcutRecording,
-    () => policyStandsDown(currentInterceptPolicy(), terminalFocused),
-    () => closeStandsDownInTerminal(interceptIsMac, terminalFocused)
+    () => keyStateOf(clientId).shortcutRecording,
+    () => policyStandsDown(currentInterceptPolicy(), keyStateOf(clientId).terminalFocused),
+    () => closeStandsDownInTerminal(interceptIsMac, keyStateOf(clientId).terminalFocused)
   )
+  win.webContents.on('did-start-navigation', (details) => {
+    if (navigationClearsRecording(details)) clearRendererKeyState(clientId)
+  })
   lockNavigationToApp(win)
   if (process.env['ELECTRON_RENDERER_URL']) {
     win.loadURL(process.env['ELECTRON_RENDERER_URL'] + popoutHash(projectId))
@@ -1257,7 +1269,7 @@ function createWindow(): BrowserWindow {
     // can ever release either bit. Leaving one set would suppress ⌘W/⌘M/⌘0 for the NEXT window too
     // (the flags outlive the window; a dock reopen builds a fresh one). Same shape as the
     // dropClient above: state this window owned, released where its departure is observed.
-    clearRendererKeyState()
+    clearRendererKeyState(presenceId)
   })
   // A crashed/killed renderer is the same story, minus the window: drop its subscriptions so the
   // reloaded renderer reattaches to live sessions instead of inheriting the dead one's state.
@@ -1284,7 +1296,7 @@ function createWindow(): BrowserWindow {
     // A dead renderer sends no disarm and no focus-lost report. The reloaded page mounts no
     // recorder and no terminal, so without this the user would come back to an app where ⌘W does
     // nothing at all (recording) or minimizes the window (stood down).
-    clearRendererKeyState()
+    clearRendererKeyState(presenceId)
     if (quitting || win.isDestroyed()) return
     const action = crashReload(details.reason, Date.now())
     if (action === 'reload') {
@@ -1377,10 +1389,10 @@ function createWindow(): BrowserWindow {
     win,
     currentInterceptBindings,
     interceptIsMac,
-    () => shortcutRecording,
-    () => policyStandsDown(currentInterceptPolicy(), terminalFocused),
+    () => keyStateOf(presenceId).shortcutRecording,
+    () => policyStandsDown(currentInterceptPolicy(), keyStateOf(presenceId).terminalFocused),
     // The close leg's own, policy-independent stand-down (issue #383) — see the predicate's doc.
-    () => closeStandsDownInTerminal(interceptIsMac, terminalFocused)
+    () => closeStandsDownInTerminal(interceptIsMac, keyStateOf(presenceId).terminalFocused)
   )
 
   // The THIRD way the page that armed a recorder (or reported terminal focus) can go away: a
@@ -1391,7 +1403,7 @@ function createWindow(): BrowserWindow {
   // with the recorder still armed and the terminal still focused, and a subframe is not this page
   // at all.
   win.webContents.on('did-start-navigation', (details) => {
-    if (navigationClearsRecording(details)) clearRendererKeyState()
+    if (navigationClearsRecording(details)) clearRendererKeyState(presenceId)
   })
 
   lockNavigationToApp(win)
@@ -1721,6 +1733,9 @@ app.whenReady().then(async () => {
   ipcMain.on(IPC.windowPopoutFlushed, (event) => pendingPopoutFlush.get(event.sender.id)?.())
   // The main window mirrors the set (ghosted tabs, save scope is main's own business).
   onDetachedChange((ids) => sendToMain(IPC.windowDetachedChange, ids))
+  // The menu's stand-down follows the FOCUSED app window's keyboard bits, so moving between the main
+  // window and a pop-out owes a sync — a window change is not a focus-mirror event in either page.
+  app.on('browser-window-focus', () => syncMenuForStandDown())
 
   // Settings' shortcut recorder arming/disarming. Guarded on the sender being the live main window
   // (the same `getMainWindow()?.webContents.id !== event.sender.id` test `registerElectronGitHubControl`
@@ -1728,8 +1743,8 @@ app.whenReady().then(async () => {
   // process too, and this bit disables the app's own keyboard shortcuts. Resolved at call time, not
   // captured, because the window can be closed and recreated on macOS.
   ipcMain.on(IPC.uiShortcutRecording, (event, active: boolean) => {
-    if (getMainWindow()?.webContents.id !== event.sender.id) return
-    shortcutRecording = active === true
+    if (!isAppWindowSender(event.sender.id)) return
+    setKeyState(event.sender.id, { shortcutRecording: active === true })
     // The menu leg follows recording too (`menuStandsDown`), so an arm/disarm owes a sync — that is
     // what lets ⌘M, ⌘⇧B, ⌘, and off-mac Ctrl+W reach the recorder instead of the menu item that
     // owns them. A recorder arms and disarms once per chord the user records, which is the right
@@ -1745,8 +1760,8 @@ app.whenReady().then(async () => {
   // itself the window's shortcuts by claiming a terminal is focused. `focused === true` so a
   // malformed payload reads as NOT focused, the fail-safe direction (intercepts on).
   ipcMain.on(IPC.uiTerminalFocus, (event, focused: boolean) => {
-    if (getMainWindow()?.webContents.id !== event.sender.id) return
-    terminalFocused = focused === true
+    if (!isAppWindowSender(event.sender.id)) return
+    setKeyState(event.sender.id, { terminalFocused: focused === true })
     // The mirror is change-deduped, so this fires only on a real focus transition — the right
     // cadence for a menu mutation, and the reason the sync is here rather than on the keystroke
     // path. It must be INSIDE the guard: a rejected sender must not move the menu either.
