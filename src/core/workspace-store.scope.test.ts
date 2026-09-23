@@ -125,7 +125,7 @@ describe('scoped saves (pop-out windows)', () => {
     await expect(fs.access(path.join(root, 'zzz'))).rejects.toThrow()
   })
 
-  it('a pop-out is booted from the owner\'s last save, as a one-project slice, without a disk load', async () => {
+  it('a pop-out is booted as a one-project slice of the project as it now stands', async () => {
     const detached: string[] = []
     scopedStore(() => detached)
     const save = fake.handlers[IPC.workspaceSave] as (sender: number, w: Workspace) => Promise<void>
@@ -138,6 +138,26 @@ describe('scoped saves (pop-out windows)', () => {
     // Main's own load is the ordinary full one.
     const full = await load(MAIN)
     expect(full.projects.map((p) => p.id)).toEqual(['a', 'b'])
+  })
+
+  // The reviewer's probe (PR #804): a write the store makes itself while the project is popped out
+  // — here the phone's appendRemoteNode — must be what a reloading pop-out sees, and so must
+  // survive that pop-out's next save. Booting from the renderer's last save erased it.
+  it('a pop-out reload sees a store-side write made while it was open, and its next save keeps it', async () => {
+    const detached: string[] = []
+    const store = scopedStore(() => detached)
+    const save = fake.handlers[IPC.workspaceSave] as (sender: number, w: Workspace) => Promise<void>
+    const load = fake.handlers[IPC.workspaceLoad] as (sender: number) => Promise<Workspace>
+    await save(MAIN, ws([project('a'), project('b')]))
+    detached.push('b')
+    const first = await load(POPOUT)
+    await save(POPOUT, first)
+    expect(await store.appendRemoteNode('b', { id: 'term-mabc123-xyz789' })).toBe(true)
+    const reloaded = await load(POPOUT)
+    const ids = reloaded.projects[0].nodes.map((n) => n.id)
+    expect(ids).toContain('term-mabc123-xyz789')
+    await save(POPOUT, reloaded)
+    expect((await fileOf('b')).nodes.map((n) => (n as { id: string }).id)).toContain('term-mabc123-xyz789')
   })
 
   it('a pop-out with no recorded save falls back to a disk load filtered to its project', async () => {
