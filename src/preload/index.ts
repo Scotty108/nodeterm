@@ -423,6 +423,7 @@ const api: NodeTerminalApi = {
     closePopout: (projectId) => ipcRenderer.invoke(IPC.windowClosePopout, projectId),
     focusNode: (projectId, nodeId) => ipcRenderer.invoke(IPC.windowFocusNode, projectId, nodeId),
     detached: () => ipcRenderer.invoke(IPC.windowDetached),
+    presencePeers: () => ipcRenderer.invoke(IPC.windowPresencePeers),
     onDetachedChange: (listener) => {
       const handler = (_e: unknown, ids: string[]) => listener(ids)
       ipcRenderer.on(IPC.windowDetachedChange, handler)

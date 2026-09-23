@@ -137,6 +137,7 @@ export const IPC = {
   windowClosePopout: 'window:close-popout',
   windowFocusNode: 'window:focus-node',
   windowDetached: 'window:detached',
+  windowPresencePeers: 'window:presence-peers',
   windowDetachedChange: 'window:detached-change',
   windowPopoutFlush: 'window:popout-flush',
   windowPopoutFlushed: 'window:popout-flushed',

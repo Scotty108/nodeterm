@@ -1714,6 +1714,10 @@ app.whenReady().then(async () => {
     win.webContents.send(IPC.appFocusNode, nodeId)
   })
   ipcMain.handle(IPC.windowDetached, () => detachedProjectIds())
+  // A pop-out reads the peer table WITHOUT joining (it is the same person as the main window); the
+  // diffs after this reach it through `broadcast`. Pop-out senders only — nobody else needs it.
+  ipcMain.handle(IPC.windowPresencePeers, (event) =>
+    popoutProjectOf(event.sender.id) !== null ? presenceHub.peers() : [])
   ipcMain.on(IPC.windowPopoutFlushed, (event) => pendingPopoutFlush.get(event.sender.id)?.())
   // The main window mirrors the set (ghosted tabs, save scope is main's own business).
   onDetachedChange((ids) => sendToMain(IPC.windowDetachedChange, ids))

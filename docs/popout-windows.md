@@ -172,6 +172,16 @@ Main used to send everything to *the* window. Now:
   had just opened. A pop-out is the same person; treating it as a teammate would also start every
   canvas mutation casting (`hasPeers`). Its saves cannot touch another project, and
   `mainWindowClientIds` is untouched.
+
+  It does LISTEN, passively (PR #804 review, should-fix 6). The canvas publisher casts only when
+  the presence table holds more than one entry, and a pop-out that never joined had an empty
+  table, so its edits reached teammates only after one of THEIR mutations arrived. Now `connect()`
+  in a pop-out subscribes to the peer diffs (which `broadcast` already delivered to it) and seeds the
+  table from `windows.presencePeers` — main answers with the hub's table, for pop-out senders only.
+  The table holds the main window's own entry, so "more than one" means exactly "a teammate is
+  here", the same rule the main window applies. `myId` stays null, so every drawn selector
+  (facepile, cursors, the name prompt) still answers nothing. Pinned in
+  `presence-session.test.ts`.
 - **Not persisted.** Which projects are popped out is runtime state; a restart opens everything in
   the main window. Remembering pop-out geometry per project is a follow-up (the main window's
   `window-state.ts` is deliberately not reused — it records THE window).
@@ -234,14 +244,6 @@ Main used to send everything to *the* window. Now:
   (row click, "Go to", Show window); every edit or teardown is refused there with a pointer to the
   window (§1). Moving those actions INTO the owning window (e.g. "End session" run by the pop-out)
   would need a cross-window command channel; not done.
-- **Team sync from a pop-out is silent until a peer speaks first.** The canvas publisher casts only
-  when `hasPeersRef` is true, and that bit is read from the presence table — which a pop-out never
-  joins (§4). It turns true on the first INBOUND mutation (proof of a peer), and inbound mutations
-  do reach a pop-out (`broadcast` includes it), so a pop-out on a shared canvas receives teammates'
-  edits at once and starts casting its own after the first one arrives; before that its edits reach
-  teammates only through the file (git / the ssh mirror). Seeding the bit from the main window needs
-  a new main→pop-out channel carrying the main window's peer count; deferred rather than guessed at,
-  because casting while alone is not free (a ~20 Hz stream during a drag).
 - **The WebGL budget is per renderer.** `setWebglBudget` runs at each window's boot, so two windows
   can hold 2 × 24 contexts (2 × 16 on macOS) against Chromium's per-process cap of 32
   (`--max-active-webgl-contexts`) — the GPU process is shared. The macOS number was chosen to cap

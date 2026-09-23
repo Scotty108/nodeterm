@@ -222,6 +222,7 @@ export function buildStubApi(): Omit<
       closePopout: pnoop,
       focusNode: pnoop,
       detached: () => Promise.resolve([]),
+      presencePeers: () => Promise.resolve([]),
       onDetachedChange: noopUnsub,
       onProjectSaved: noopUnsub,
       onFlush: noopUnsub

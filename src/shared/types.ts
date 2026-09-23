@@ -2334,6 +2334,10 @@ export interface WindowsApi {
   focusNode(projectId: string, nodeId: string): Promise<void>
   /** Project ids currently shown in their own windows. Empty in a browser / relay tab. */
   detached(): Promise<string[]>
+  /** POP-OUT window: the presence hub's current peer table, read without joining it. A pop-out is
+   *  the same person as the main window, so it never says hello — but its canvas-sync gate still
+   *  needs to know whether teammates are there (docs/popout-windows.md). Empty everywhere else. */
+  presencePeers(): Promise<PeerState[]>
   /** MAIN window: the set of popped-out projects changed. Returns unsubscribe. */
   onDetachedChange(listener: (ids: string[]) => void): () => void
   /** MAIN window: a pop-out saved this project — adopt it into the store (the pop-out owns it, so

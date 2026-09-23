@@ -4409,7 +4409,8 @@ the Settings section and ShortcutsPanel start disagreeing about what a chord mea
   `useProjects.setState` does not. (2) **A pop-out cannot switch** —
   the refusal is in `useProjects.setActive`, the one funnel every switch path uses; and it never
   joins presence (the same person twice raised the "Someone else is on this canvas" prompt on the
-  first sandbox run) nor ghosts anything (`useWindows.detached` is empty inside one). (3) **Per-node
+  first sandbox run) — it only LISTENS, seeding the peer table from `windows.presencePeers` so its
+  canvas-sync gate knows when teammates are there nor ghosts anything (`useWindows.detached` is empty inside one). (3) **Per-node
   traffic goes to every app window** (`sendToAppWindows`: agent status, unread clears, external
   changes, pressure) and **round trips go to the window showing the node** (`windowForNode`: control
   requests, browser popups, the browser resolve, a notification click), so exactly one window
@@ -4427,7 +4428,7 @@ the Settings section and ShortcutsPanel start disagreeing about what a chord mea
   (`windows.popout` rejects; the tab menu hides the row; `isBrowserRuntime()` disarms the drag).
   Known v1 gaps, all in the doc: shared `localStorage` across windows (last-writer-wins on the
   per-viewer stores), the keyboard-shortcut mirrors stay the main window's, geometry not remembered,
-  team sync from a pop-out casts only after a peer's first inbound mutation, and the WebGL budget is
+  and the WebGL budget is
   per renderer (two windows can ask for 2 × 16 on macOS; a soak is on the device checklist).
 - **Window geometry is REMEMBERED** (`main/window-state.ts`, `<userData>/window-state.json`) — size,
   position and maximized state, restored at the next launch. Before this the window opened at a
