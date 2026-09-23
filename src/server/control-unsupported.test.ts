@@ -182,7 +182,27 @@ describe('the enabled Server Edition handler parses and dispatches the v1 surfac
     rename: vi.fn(async () => ({ ok: true as const, result: { id: 'renamed' } })),
     color: vi.fn(async () => ({ ok: true as const, result: { colored: ['term-target'] } })),
     sticky: vi.fn(async () => ({ ok: true as const, result: { id: 'sticky-new' } })),
+    settings: vi.fn(async () => ({ ok: true as const, message: 'settings' })),
     deliver: vi.fn(async () => ({ ok: true as const, message: 'queued' }))
+  })
+
+  it('routes settings to its action, after the shared allowlist parse', async () => {
+    const a = actions()
+    const handler = createServerEditionControlHandler(a)
+    await expect(
+      handler({ verb: 'settings', nodeId: 'term-source', args: { get: 'gridSize' }, verified: true })
+    ).resolves.toMatchObject({ ok: true })
+    expect(a.settings).toHaveBeenCalledWith('term-source', { get: 'gridSize' })
+    // A key off the allowlist never reaches the action.
+    await expect(
+      handler({
+        verb: 'settings',
+        nodeId: 'term-source',
+        args: { set: 'claudePermissionMode', value: 'bypassPermissions' },
+        verified: true
+      })
+    ).resolves.toMatchObject({ ok: false, error: expect.stringContaining('settings-key-forbidden') })
+    expect(a.settings).toHaveBeenCalledTimes(1)
   })
 
   it('shares parser validation and forwards source identity to an open', async () => {

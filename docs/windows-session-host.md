@@ -69,6 +69,21 @@ Electron main process                    Session-host process (standalone, detac
   this backend between the tmux branch and the plain-shell fallback, and constructs a
   `SessionHostPty` instead of calling `pty.spawn` directly.
 
+## Availability notice
+
+`pty:tmux-status` retains its tmux-only `available` field and adds `persistence`: the
+user's `enabled` setting and the discovered `backend` (`tmux`, `session-host`, or null).
+Discovery does not start the host or certify runtime health. POSIX prefers tmux; Windows
+uses the session host. A missing/errored status stays unknown, including over Server Edition's
+WS bridge. Older peers without the field also remain unknown.
+
+The desktop/browser banner warns when protection is disabled, absent, or unknown; Settings
+shows the same state and refreshes it after a setting change and periodically. The state is
+about **new local terminals**, not SSH/relay hosts or an upgrade of existing plain shells.
+An installer is offered only from a local project, so it cannot run on the selected remote
+host by mistake. Runtime session-host attach failures still use the terminal's existing error
+path; a bundle being present is not proof an individual session attached successfully.
+
 ## Windows profile resolution
 
 The profile catalog is a trusted desktop service. Its public API returns only a stable `id`,
@@ -345,6 +360,66 @@ failure distinction across reconnects: an empty capture and an idempotently abse
 confirmed `{ok:true}` host responses, while a transport/request rejection remains unknown and is
 propagated. That propagation is what lets the periodic snapshot keep its dirty bit for a retry and
 what prevents a delete from claiming a persistent process is gone when the host never confirmed it.
+
+## Windows updates and uninstalls
+
+A running host maps the installed Electron executable and its DLLs. Its separate hard-link name
+makes it identifiable; it does **not** make the install directory safe to replace. Closing the app
+alone deliberately leaves the host and its sessions running (#829).
+
+The NSIS install/uninstall preflight now refuses to proceed while the app or host is running from
+any installation, or a process runs under the installation path prefix. It replaces electron-builder's
+automatic process termination, including
+its silent/`--updated` path. Cancel leaves sessions alone. Retry performs a fresh, read-only process
+query. A failed query (including an inaccessible nodeterm process with no executable path) blocks
+instead of guessing. Silent installation returns a nonzero exit code, without a dialog or kill.
+The query uses Windows PowerShell with a child-process-only execution policy; no persistent policy
+or trust setting is changed. Group Policy restrictions still cause a safe refusal.
+
+This is deliberately conservative: an old uninstaller may use a machine-wide name match or a
+path prefix without a directory boundary. Another installation (even a sibling directory whose
+name begins with this installation's name) can therefore block an update. The new preflight must
+cover those legacy targets before invoking the old executable; it never stops them on your behalf.
+
+To update while keeping your saved canvas:
+
+1. Cancel the installer and reopen nodeterm if you already quit it. Save work in every local
+   terminal and agent, including closed/other projects and sessions accessed from a phone.
+   Let active tasks finish, then use each program's normal exit command and exit its shell.
+   Leave the canvas nodes in place. **Do not use Sessions → End session or delete nodes to prepare
+   for an update**: those actions remove nodes, rather than just stopping their processes.
+2. Quit nodeterm normally so workspace changes are saved and it cannot start replacement sessions.
+   Wait at least 30 seconds after the last shell exits for the empty host to shut down naturally.
+   Quitting the app alone does not empty the host; a host with sessions will remain running.
+3. If the host remains, keep the installer cancelled. In Windows Task Manager's **Details** view,
+   verify the user and executable path of `nodeterm-session-host.exe` for this installation.
+   After saving work and accepting that **every terminal/agent process owned by that host will
+   stop**, end only that verified host. This is a manual process shutdown, not a graceful agent
+   exit, so complete step 1 first. Do not use a machine-wide name-based kill. If the host uses
+   the fallback name `nodeterm.exe`, verify its identity/path rather than guessing which process
+   to end. Another Windows user's host requires that user's decision.
+4. Run the installer from Downloads, outside the installation directory, or Retry its preflight.
+   Other nodeterm installations/users must prepare their own sessions too if they block the check.
+   Do not reopen the app or start sessions while installation is in progress.
+
+Stopping the host after quitting leaves saved node metadata (positions, groups, agent/session
+identities) and existing closed-session history in place; it does not call the node-deletion path
+or add deletion entries to `closedSessions`. Reopen nodeterm after installation to use those nodes.
+This is **cold recovery**, not preservation of live processes: shell jobs and unsaved terminal state
+are lost. An agent can resume only when its harness supports resume, nodeterm has saved a valid
+conversation id, and the matching account's conversation history is still available. A saved node
+alone does not guarantee resume, restore an in-flight task, or recover unsaved work.
+
+New installers run this check before invoking the previous version's uninstaller. Already shipped
+installers/uninstallers cannot be patched retroactively; use the same preparation steps for them.
+This is a safe refusal and manual recovery path, not live host migration: sessions cannot yet
+survive replacing the binaries they have mapped. A process could still start after the preflight;
+it is not an installation-wide launch lock.
+
+Server Edition has no NSIS updater and is unchanged. Mobile/relay clients must expect a disconnect
+when the user deliberately ends desktop sessions; they cannot authorize an update shutdown.
+Real Windows per-user/all-users upgrades, old uninstallers, PowerShell policy variations, and
+phone reconnection still require device verification (fixtures do not prove file-lock behavior).
 
 ## Lifetime
 

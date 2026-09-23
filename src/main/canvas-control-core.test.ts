@@ -15,6 +15,20 @@ import {
 import { RETRYABLE } from '../core/agents/agent-message-decide'
 import { PROJECT_TARGETABLE_VERBS } from '../core/project-grants'
 import { DRY_RUN_VERBS } from '../shared/control-verbs'
+import {
+  SETTINGS_VERB_FORBIDDEN,
+  SETTINGS_VERB_KEYS,
+  SETTINGS_VERB_KEY_LIST,
+  readSettingsValue
+} from '../shared/settings-verb'
+import { decideControlConfirm, isWaivableVerb } from '../shared/control-confirm'
+import { DEFAULT_SETTINGS } from '../shared/types'
+import { serverSettingsControl } from '../server/settings-control'
+import {
+  REPORT_CAP_PER_DAY,
+  REPORT_CAP_PER_RUN,
+  REPORT_LABEL
+} from '../core/github/report-issue-core'
 import { STRICT_CONTROL_VERBS } from '../core/agents/node-identity-policy'
 import { BROWSER_ACTION_KEYS } from '../core/browser-verb'
 import { BROWSER_RETRYABLE, BROWSER_OUTCOME_LABEL } from '../core/browser-outcomes'
@@ -398,9 +412,10 @@ describe('parseControlRequest', () => {
       // nodes cannot act on the answer.
       expect(body).toContain('queued')
       expect(body).toContain('queuedIds')
-      // The consequence is the whole point of the field: an armed node has no process, so an
+      // The consequence is the whole point of the field: an armed node has no delivered agent launch, so an
       // orchestrator must not route work to it. Without this sentence the flag reads as trivia.
-      expect(body.toLowerCase()).toContain('no process')
+      expect(body.toLowerCase()).toContain('launch has not been delivered')
+      expect(body).toContain('deliveredIds')
       // And the three ways a node ends up armed must all be named, or a caller learns the third
       // one by reporting a --project session as started when it has not begun.
       expect(body).toContain('--after')
@@ -548,6 +563,122 @@ describe('parseControlRequest', () => {
       // Server Edition has no browser control.
       expect(lower).toContain('server edition')
     }
+  })
+
+  it('both bodies teach WHEN to file a report, with the caps rendered from the real constants', () => {
+    for (const body of [buildCanvasSkillBody('/x/shim.sh'), buildCanvasControlInstructions('/tmp/nodeterm.sh')]) {
+      expect(body).toContain('`report-issue --kind <code> --title <one line> --body <text> [--dry-run]`')
+      // The caps are RENDERED, so tuning either constant without moving the prose reddens here —
+      // an agent that believes a stale limit retries into a refusal it was told would not happen.
+      expect(body).toContain(`${REPORT_CAP_PER_RUN} reports per nodeterm run`)
+      expect(body).toContain(`${REPORT_CAP_PER_DAY} per day`)
+      expect(body).toContain(`\`${REPORT_LABEL}\``)
+      // The load-bearing half is WHEN, not the flags: the three non-cases must be named, or an
+      // agent files its own mistakes into a public tracker.
+      expect(body).toMatch(/DO NOT FILE for your own mistakes/)
+      expect(body).toMatch(/for a failing\s+test/)
+      expect(body).toMatch(/FILE WHEN the thing you could not do is a gap in the product/)
+      // Duplicate suppression is automatic; telling an agent to check first would have it burn a
+      // turn searching and then file anyway when the search came back empty.
+      expect(body).toMatch(/Do not check first and do not search for duplicates/)
+      expect(body).toMatch(/Keep `--kind` STABLE/)
+      // Default-off, and the refusal names are the agent's whole vocabulary for giving up.
+      expect(body).toMatch(/Off by\s+default/)
+      for (const refusal of ['report-disabled', 'report-no-repo', 'report-scope-missing', 'report-cap-run', 'report-cap-day']) {
+        expect(body, `refusal ${refusal} documented`).toContain(`\`${refusal}\``)
+      }
+      // The no-repo refusal must not read as an invitation to find another repository.
+      expect(body).toMatch(/do NOT file it somewhere\s+else/)
+      expect(body).toMatch(/Server Edition refuses this verb by name/)
+    }
+  })
+
+  it('both bodies document `settings` from the REAL allowlist and state that every change asks', () => {
+    for (const body of [buildCanvasSkillBody('/x/shim.sh'), buildCanvasControlInstructions('/tmp/nodeterm.sh')]) {
+      // Walked off the table, so a key added to or dropped from the allowlist reddens here unless
+      // the text moves with it.
+      for (const key of SETTINGS_VERB_KEY_LIST) {
+        expect(body, `settings key ${key} documented`).toContain(`\`${key}\` (${SETTINGS_VERB_KEYS[key].scope}`)
+      }
+      expect(body).toContain('`settings --set <key> --value <value> [--project <id>]`')
+      expect(body).toMatch(/user ALWAYS\s+confirms, every time/)
+      expect(body).toMatch(/no "don't ask again" covers this verb/)
+      expect(body).toMatch(/`denied by user` is FINAL/)
+      // The keys a human decides are named as unreachable, not merely "not listed".
+      expect(body).toMatch(/permission modes, accounts and credentials, node identity, browser\s+control, telemetry, keybindings, confirm waivers/)
+      expect(body).toMatch(/Server Edition reads settings but refuses every `--set`/)
+      // The messaging line now names the way to ask for the switch, instead of implying there is none.
+      expect(body).toContain('`--set agentMessaging --value true`')
+    }
+  })
+
+  it('the settings text\'s claims are true of the MECHANISM, not only present in the prose', () => {
+    // "no don't ask again covers this verb" — ask the waiver table, with every waiver shape set.
+    expect(isWaivableVerb('settings')).toBe(false)
+    expect(
+      decideControlConfirm({
+        verb: 'settings',
+        sessionWaived: new Set(['settings']),
+        persisted: { always: ['settings'], projects: { p: ['settings'] }, bypassMode: true },
+        projectId: 'p',
+        permissionMode: 'bypassPermissions',
+        permissionModeSource: 'global'
+      }).skip
+    ).toBe(false)
+    // "one dialog at a time" rides the shared confirm-gated set.
+    expect(isDestructiveVerb('settings')).toBe(true)
+    // "permission modes, accounts and credentials, node identity, browser control, telemetry,
+    // keybindings, confirm waivers … can never be changed from here" — one real key per named class.
+    for (const key of [
+      'claudePermissionMode',
+      'defaultPermissionMode',
+      'claudeAccounts',
+      'modelGateway',
+      'hookIdentityStrict',
+      'agentBrowserControl',
+      'telemetryEnabled',
+      'keybindings',
+      'controlConfirmWaivers'
+    ]) {
+      const r = parseControlRequest('settings', { set: key, value: 'true' })
+      expect(r, key).toEqual({ error: expect.stringContaining('settings-key-forbidden') })
+    }
+    // …and main refuses EVERY member of the set, not only the sample the prose names: a literal list
+    // above can shrink without reddening anything.
+    for (const key of SETTINGS_VERB_FORBIDDEN) {
+      expect(parseControlRequest('settings', { set: key, value: 'true' }), key).toEqual({
+        error: expect.stringContaining('settings-key-forbidden')
+      })
+    }
+    // "Server Edition reads settings but refuses every --set" — ask the server handler itself.
+    const serverDeps = {
+      persistedCanvases: () => [{ id: 'p', nodes: [{ id: 'n' }] }],
+      capabilityProjectFor: () => ({}),
+      projectName: () => 'p',
+      settings: () => DEFAULT_SETTINGS
+    }
+    for (const key of SETTINGS_VERB_KEY_LIST) {
+      const value = SETTINGS_VERB_KEYS[key].type.kind === 'boolean' ? 'true' : '300'
+      expect(serverSettingsControl(serverDeps, 'n', { set: key, value }).ok, key).toBe(false)
+    }
+    expect(serverSettingsControl(serverDeps, 'n', {}).ok).toBe(true)
+    // "A project key reads as what is in effect RIGHT NOW" — a file true nobody here confirmed is off.
+    expect(
+      readSettingsValue('agentMessaging', DEFAULT_SETTINGS, { id: 'p', name: 'p', agentMessaging: true })
+    ).toMatchObject({ value: false })
+  })
+
+  it('parseControlRequest runs the settings allowlist, so main refuses a forbidden key by name', () => {
+    expect(parseControlRequest('settings', { set: 'claudePermissionMode', value: 'bypassPermissions' })).toEqual({
+      error: expect.stringContaining('settings-key-forbidden: "claudePermissionMode"')
+    })
+    expect(parseControlRequest('settings', { get: 'fontSize' })).toEqual({
+      error: expect.stringContaining('settings-key-not-allowed: "fontSize"')
+    })
+    expect(parseControlRequest('settings', { set: 'agentMessaging', value: 'true' })).toEqual({
+      verb: 'settings',
+      args: { set: 'agentMessaging', value: 'true' }
+    })
   })
 
   // The consent sentence is a contract string owned by browser-drive.ts (main). The doc must carry
@@ -840,5 +971,14 @@ describe('the --project clause tells the truth about travel (review #363 I-1 + M
       ...sets.storedNode
     ])
     for (const v of answered) expect(offScreenDisposition(v).kind, v).not.toBe('refuse')
+  })
+})
+
+describe('link project boundary guidance', () => {
+  it('explains the scoped refusal in both generated agent instructions', () => {
+    for (const body of [buildCanvasControlInstructions('/shim'), buildCanvasSkillBody('/shim')]) {
+      expect(body).toContain('node not found in this project; cross-project linking is not supported')
+      expect(body).toContain('This does not reveal whether the id exists in another project.')
+    }
   })
 })

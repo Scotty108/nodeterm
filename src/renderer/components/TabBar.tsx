@@ -23,6 +23,7 @@ import {
   type AgentPermissionMode
 } from '@shared/agents/config'
 import { bypassSandboxCaveat, permissionModeAgentsLabel } from '@shared/agents/approval-mode'
+import { codexApprovalCaps } from '@renderer/state/codexCli'
 
 interface TabBarProps {
   onSwitch: (id: string) => void
@@ -688,7 +689,7 @@ export function TabBar({
                           // for codex the mode skips APPROVALS only: `--ask-for-approval never` does
                           // not touch `--sandbox`, which we deliberately leave alone, so "no
                           // permission checks" must not be read as "no sandbox either".
-                          `Skips every permission prompt. This override is saved in the project file (.nodeterm/project.json), so if you commit it, everyone who clones the repo runs their ${permissionModeAgentsLabel({ mode: 'bypassPermissions' })} sessions without permission checks too. ${bypassSandboxCaveat()}`.trim()
+                          `Skips every permission prompt. This override is saved in the project file (.nodeterm/project.json), so if you commit it, everyone who clones the repo runs their ${permissionModeAgentsLabel({ mode: 'bypassPermissions', caps: codexApprovalCaps() })} sessions without permission checks too. ${bypassSandboxCaveat(codexApprovalCaps())}`.trim()
                         : m === 'auto'
                           ? (menuAutoHint ?? undefined)
                           : undefined

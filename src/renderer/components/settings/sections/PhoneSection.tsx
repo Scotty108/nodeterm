@@ -9,6 +9,12 @@ import { useSettings } from '@renderer/state/settings'
 import { usePhonePairing } from '../usePhonePairing'
 import { IOS_APP_STORE_URL } from '@renderer/lib/links'
 import { hostOsFromNavigator, sshServerCopy } from '@shared/ssh-server'
+import {
+  pairingEndedMessage,
+  pairingGate,
+  relayGateMessage,
+  relayOnlyExplanation
+} from '@shared/pairing-gate'
 import { thisMachine } from '../../../lib/machineName'
 
 const ROWS = {
@@ -70,6 +76,9 @@ export function PhoneSection({ isActive }: { isActive: boolean }): React.JSX.Ele
     setQrForm,
     sshOpen,
     sshHealed,
+    sshKey,
+    windowsKeyFile,
+    ended,
     relayResult,
     relayPlan,
     error,
@@ -83,6 +92,7 @@ export function PhoneSection({ isActive }: { isActive: boolean }): React.JSX.Ele
       void refreshDevices()
     }
   )
+  const gate = pairingGate({ sshKey, sshOpen, relayPlan })
 
   const togglePhoneAccess = (next: boolean): void => {
     updateSettings({ phoneAccessEnabled: next })
@@ -204,9 +214,11 @@ export function PhoneSection({ isActive }: { isActive: boolean }): React.JSX.Ele
           {phase === 'idle' || phase === 'timeout' ? (
             <div className="space-y-3">
               {phase === 'timeout' ? (
-                <p className="text-sm text-muted">
-                  Pairing timed out — that code no longer works. Start again and scan the fresh
-                  one within ten minutes.
+                <p
+                  className={ended?.reason === 'relay-failed' ? 'text-sm' : 'text-sm text-muted'}
+                  style={ended?.reason === 'relay-failed' ? { color: '#ff9f0a' } : undefined}
+                >
+                  {pairingEndedMessage({ ...ended, windows: !sshKey })}
                 </p>
               ) : null}
               <Button variant="primary" disabled={busy} onClick={() => void start()}>
@@ -217,7 +229,13 @@ export function PhoneSection({ isActive }: { isActive: boolean }): React.JSX.Ele
 
           {phase === 'waiting' && qr ? (
             <div className="space-y-3">
-              {!sshOpen ? (
+              {gate === 'relay-off' || gate === 'relay-dev' ? (
+                // Relay-only host (Windows): no key is installed, so the relay IS the connection
+                // and a code without it would pair the phone to nothing.
+                <p className="text-sm" style={{ color: '#ff9f0a' }}>
+                  {relayGateMessage(gate, 'Remote access from your phone')}
+                </p>
+              ) : gate === 'ssh-off' ? (
                 // No QR until Remote Login is on: a pairing completed against an unreachable
                 // sshd installs a key the phone can never use — the scan must wait, not the fix.
                 // The live probe (usePhonePairing) flips sshOpen and the QR appears by itself.
@@ -270,7 +288,9 @@ export function PhoneSection({ isActive }: { isActive: boolean }): React.JSX.Ele
                       </p>
                     ) : null}
                   </div>
-                  {relayPlan === 'dev' ? (
+                  {!sshKey ? (
+                    <p className="text-xs text-muted">{relayOnlyExplanation(windowsKeyFile)}</p>
+                  ) : relayPlan === 'dev' ? (
                     <p className="text-sm" style={{ color: '#ff9f0a' }}>
                       Dev build: the relay is off regardless of the toggle, so this code pairs
                       LAN-only. Run a packaged build — or set NODETERM_RELAY_URL — for remote
@@ -297,7 +317,9 @@ export function PhoneSection({ isActive }: { isActive: boolean }): React.JSX.Ele
           {phase === 'paired' ? (
             <div className="space-y-3">
               <p className="text-sm font-medium" style={{ color: '#30d158' }}>
-                ✓ Paired. Your phone can now connect with its own key.
+                {sshKey
+                  ? '✓ Paired. Your phone can now connect with its own key.'
+                  : '✓ Paired. Your phone connects to this computer through remote access.'}
               </p>
               {relayResult === 'ok' ? (
                 <p className="text-sm" style={{ color: '#30d158' }}>

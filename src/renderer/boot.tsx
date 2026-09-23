@@ -3,6 +3,7 @@ import ReactDOM from 'react-dom/client'
 import App from './App'
 import { ensureClaudeCliCaps, ensureGrokCliCaps } from './state/permissionMode'
 import { ensureCodexIdentityCaps } from './state/codexIdentity'
+import { ensureCodexCliCaps } from './state/codexCli'
 import { initAgentResolver } from './state/agent-resolver'
 import { refreshAgentEnv } from './lib/agentEnv'
 import { applyWindowChrome } from './lib/windowChrome'
@@ -32,6 +33,11 @@ void ensureGrokCliCaps()
 // this machine has one installed and armed. Unprobed ⇒ plain `codex`, which is what every Codex
 // node ran before this feature — never a launcher path that might not resolve.
 void ensureCodexIdentityCaps()
+// What this machine's codex accepts for `--ask-for-approval`. Warmed here for the same reason as
+// the probes above it: every Codex launch line reads it synchronously, so the answer must be in
+// hand before the user can create a node. Unprobed degrades to the baseline vocabulary, never to a
+// blocked launch.
+void ensureCodexCliCaps()
 
 // One env snapshot for `${env:VAR}` expansion, fetched up front and cached (src/renderer/lib/
 // agentEnv.ts): the Settings preview and every launch path expand against the same object, so the

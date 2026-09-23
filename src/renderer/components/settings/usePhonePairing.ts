@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { toDataURL } from 'qrcode'
 import { DEFAULT_PAIR_QR_FORM, encodePairQr, type PairQrForm } from '@shared/pair-qr'
+import type { WindowsKeyFileHint } from '@shared/pairing-gate'
 
 export type PairingPhase = 'idle' | 'waiting' | 'paired' | 'timeout'
 
@@ -23,6 +24,12 @@ export function usePhonePairing(onPaired?: () => void): {
   setQrForm: (form: PairQrForm) => void
   sshOpen: boolean
   sshHealed: boolean
+  /** false = relay-only host (Windows) — see `pairingGate`. Kept after the pairing ends, so the
+   *  ended/paired copy can still tell which kind of host this is. */
+  sshKey: boolean
+  windowsKeyFile: WindowsKeyFileHint | undefined
+  /** On phase 'timeout': why it ended and whether the phone ever reached the listener. */
+  ended: { reason?: 'timeout' | 'relay-failed'; reached?: boolean } | null
   /** On phase 'paired': whether the pairing came with a relay leg ('off' = toggle disabled,
    *  'failed' = mint failed → LAN-only). Surfaced so the silent degrade is visible at the one
    *  moment the user is looking. */
@@ -46,6 +53,9 @@ export function usePhonePairing(onPaired?: () => void): {
   // Went from unreachable → reachable while the warning was showing: show a green confirmation
   // instead of silently dropping the warning (the user just flipped a toggle; acknowledge it).
   const [sshHealed, setSshHealed] = useState(false)
+  const [sshKey, setSshKey] = useState(true)
+  const [windowsKeyFile, setWindowsKeyFile] = useState<WindowsKeyFileHint | undefined>(undefined)
+  const [ended, setEnded] = useState<{ reason?: 'timeout' | 'relay-failed'; reached?: boolean } | null>(null)
   const [relayResult, setRelayResult] = useState<'ok' | 'off' | 'failed' | 'dev' | null>(null)
   const [relayPlan, setRelayPlan] = useState<'ok' | 'dev' | 'off' | null>(null)
   const [error, setError] = useState('')
@@ -58,7 +68,8 @@ export function usePhonePairing(onPaired?: () => void): {
   // in System Settings and nothing changes on screen. Poll only in that exact state (waiting +
   // unreachable); the interval dies with the warning.
   useEffect(() => {
-    if (phase !== 'waiting' || sshOpen) return
+    // A relay-only host never shows the sshd warning, so there is nothing to re-probe for.
+    if (phase !== 'waiting' || sshOpen || !sshKey) return
     let cancelled = false
     const timer = setInterval(() => {
       void window.nodeTerminal.pairing
@@ -77,14 +88,23 @@ export function usePhonePairing(onPaired?: () => void): {
       cancelled = true
       clearInterval(timer)
     }
-  }, [phase, sshOpen])
+  }, [phase, sshOpen, sshKey])
 
   const start = async (): Promise<void> => {
     setError('')
     setBusy(true)
     try {
-      const { payload: built, sshOpen: open, relayPlan: plan } = await window.nodeTerminal.pairing.start()
+      const {
+        payload: built,
+        sshOpen: open,
+        relayPlan: plan,
+        sshKey: key,
+        windowsKeyFile: keyFile
+      } = await window.nodeTerminal.pairing.start()
       setRelayPlan(plan ?? null)
+      setSshKey(key !== false)
+      setWindowsKeyFile(keyFile)
+      setEnded(null)
       // The image itself is rendered by the effect below, which also handles a later switch
       // between the JSON and URL envelopes.
       setPayload(built)
@@ -143,6 +163,7 @@ export function usePhonePairing(onPaired?: () => void): {
       setQr('')
       setPhase(result.ok ? 'paired' : 'timeout')
       setRelayResult(result.ok ? (result.relay ?? null) : null)
+      setEnded(result.ok ? null : { reason: result.reason, reached: result.reached })
       if (result.ok) onPairedRef.current?.()
     })
   }, [])
@@ -164,6 +185,9 @@ export function usePhonePairing(onPaired?: () => void): {
     setQrForm,
     sshOpen,
     sshHealed,
+    sshKey,
+    windowsKeyFile,
+    ended,
     relayResult,
     relayPlan,
     error,

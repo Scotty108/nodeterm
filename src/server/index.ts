@@ -1,3 +1,4 @@
+import { subagentReplay } from '../core/subagent-replay'
 import fs from 'fs'
 import { readAgentSessionName } from '../core/agent-session-name'
 import { startSessionNameSweep, displayNodeTitle } from '../core/session-name-sweep'
@@ -86,6 +87,8 @@ import { startSessionMemoryService, sshScopePredicate } from '../core/session-me
 import { createMemoryPressureMonitor } from '../core/memory-pressure'
 import { createPtyPressureMonitor } from '../core/pty-pressure'
 import { claudeCliCaps, type ClaudeCliCaps } from '../core/claude-cli'
+import { codexCliCaps } from '../core/codex-cli'
+import type { CodexCliCaps } from '../shared/types'
 import { claudeConfigDirFor, registerClaudeAccountsSource } from '../core/claude-config-dir'
 import { presenceHub } from '../core/presence/hub'
 import { initCanvasSync } from '../core/canvas-sync'
@@ -93,6 +96,7 @@ import { wireAgentStatus } from './agent-status'
 import { initServerContextLink } from './context-link'
 import { createServerWorkspaceWatcher } from './workspace-external-watch'
 import { registerTranscriptIpc } from '../core/transcript-ipc'
+import { registerContextEnsureIpc } from '../core/context-ensure'
 import { IPC } from '@shared/ipc'
 import { WhisperModelStore } from '../core/speech/whisper-models'
 import { SpeechService } from '../core/speech/speech-service'
@@ -433,11 +437,25 @@ export async function startServer(
       void flushAgentStatusMirror()
     })
     .catch(() => {})
+  // Same, for codex — its `--ask-for-approval` vocabulary is its own and it changed between
+  // releases (see MirrorSettings.codexApprovalValues). Registered in BOTH shells: a probe published
+  // on the desktop and missing here would leave a phone paired to a Server Edition host building
+  // Codex launch lines from a table instead of from the binary.
+  let localCodexCaps: CodexCliCaps | undefined
+  void codexCliCaps()
+    .then((c) => {
+      localCodexCaps = c
+      void flushAgentStatusMirror()
+    })
+    .catch(() => {})
   setMirrorSettingsProvider((): MirrorSettings => {
     const s = settingsStore.get()
     return {
       claudePermissionMode: s.claudePermissionMode,
       autoSupported: localClaudeCaps?.autoPermissionMode === true,
+      ...(localCodexCaps?.approvalValues
+        ? { codexApprovalValues: localCodexCaps.approvalValues }
+        : {}), // unprobed ⇒ absent ⇒ the reader uses the baseline vocabulary
       claudeAccounts: (s.claudeAccounts ?? [])
         .filter((a) => !a.host && !a.pending)
         .map((a) => ({ id: a.id, dir: claudeConfigDirFor(a.id) }))
@@ -453,7 +471,7 @@ export async function startServer(
   // Set after the initial workspace load when the opt-in flag is on. The status listener is wired
   // now so the runtime, once present, consumes the exact same normalized stream as the UI/mirror.
   let canvasControl: ServerCanvasControl | null = null
-  const { contextTail, geminiContextTail } = wireAgentStatus(platform, {
+  const { contextTail, geminiContextTail, codexContextTail } = wireAgentStatus(platform, {
     onEvent: (event) => canvasControl?.onAgentEvent(event)
   })
   // The ⌘M chat view + the find-bar's transcript index. Registered HERE rather than with the rest
@@ -461,6 +479,27 @@ export async function startServer(
   // leg: the Server Edition runs ON the host whose transcripts it reads, so local resolution is
   // the complete answer (an SSH-project node is a desktop-only concept here).
   registerTranscriptIpc({ pathFor: (sessionId) => contextTail.pathFor(sessionId) })
+  // The context meter's mount-time rehydration, registered beside the read channels and for the
+  // same reason: the tails it feeds are the ones created just above. Until this landed the Server
+  // Edition had NO handler for `context:ensure` at all — the browser cast it and nothing received
+  // it, so a browser agent node's meter filled only on its next turn, exactly the desktop bug
+  // issue #813 reported for SSH nodes. No remote leg here (see registerTranscriptIpc above): this
+  // process runs on the host whose transcripts it reads, so the local locators are complete.
+  registerContextEnsureIpc({
+    tailFor: (agentId) => {
+      switch (agentId) {
+        case undefined:
+        case 'claude':
+          return contextTail
+        case 'codex':
+          return codexContextTail
+        case 'gemini':
+          return geminiContextTail
+        default:
+          return undefined
+      }
+    }
+  })
   // Deterministic hook-reply approvals (docs/hook-reply-approvals.md): the browser canvas answers a
   // held Claude permission hook here. The Server Edition runs ON the host, so a local project's
   // answer file is written right there (under os.homedir(), which the hook uses as $HOME). SSH
@@ -492,6 +531,7 @@ export async function startServer(
   // calls it when the just-read node's latest state is `done`. The mirror resolves the node's done
   // inbox event(s) + re-sends an 'end' live-update so the paired phone dismisses its lingering DONE
   // Live Activity. Fire-and-forget; no-op with no unresolved done.
+  platform.handle(IPC.agentSubagentSnapshot, () => subagentReplay.snapshot())
   platform.handle(IPC.agentAckDone, (nodeId: string) => {
     ackDone(nodeId)
   })
@@ -578,7 +618,8 @@ export async function startServer(
     // this baseline hook pass stays unchanged when the feature flag is off.
     installHooksIntoLocalAccounts(settingsStore.get().claudeAccounts ?? [])
   }
-  await hookServer.start()
+  const hookStartupWarning = await hookServer.startForApp()
+  if (hookStartupWarning) console.error('[nodeterm-server]', hookStartupWarning)
   // Safe default and rollback path. The opt-in runtime replaces this handler only after its
   // workspace-backed services are ready; a failed initialization therefore degrades to the same
   // named permanent refusal rather than a half-wired execution surface.

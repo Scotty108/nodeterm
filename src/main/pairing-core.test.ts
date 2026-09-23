@@ -8,6 +8,7 @@ import {
   normalizeAuthorizedKeysLine,
   normalizeDeviceName,
   pickLanIPv4,
+  pickPairingIPv4,
   readDevices,
   removeDevice,
   rewriteKeyComment,
@@ -400,5 +401,36 @@ describe('encodePairQr over a built payload', () => {
     expect(url.startsWith(PAIR_URL_PREFIX)).toBe(true)
     const code = url.slice(PAIR_URL_PREFIX.length)
     expect(Buffer.from(code, 'base64url').toString('utf-8')).toBe(payload)
+  })
+})
+
+describe('ssh:false in the pairing payload', () => {
+  const input = { host: 'h', user: 'u', token: 't', pairPort: 1, name: 'n' }
+  it('is appended last on a relay-only host', () => {
+    expect(buildPairingPayload({ ...input, ssh: false })).toBe(
+      '{"v":1,"host":"h","port":22,"user":"u","token":"t","pairPort":1,"nodeterm":true,"name":"n","ssh":false}'
+    )
+  })
+  it('leaves every other payload byte-identical', () => {
+    expect(buildPairingPayload(input)).not.toContain('ssh')
+  })
+})
+
+describe('pickPairingIPv4', () => {
+  const nic = (address: string, internal = false) => ({ address, family: 'IPv4', internal })
+  const ifaces = {
+    'vEthernet (WSL)': [nic('172.20.48.1')],
+    'Ethernet 2': [nic('169.254.3.3')],
+    'Wi-Fi': [nic('192.168.1.42')]
+  }
+  it('takes the default-route address when this machine owns it', () => {
+    expect(pickPairingIPv4(ifaces, '172.20.48.1')).toBe('172.20.48.1')
+  })
+  it('ignores a route address that is not one of ours, and skips virtual adapters', () => {
+    expect(pickPairingIPv4(ifaces, '10.9.9.9')).toBe('192.168.1.42')
+    expect(pickPairingIPv4(ifaces, null)).toBe('192.168.1.42')
+  })
+  it('falls back to the old pick when only virtual adapters exist', () => {
+    expect(pickPairingIPv4({ 'vEthernet (WSL)': [nic('172.20.48.1')] }, null)).toBe('172.20.48.1')
   })
 })

@@ -13,7 +13,7 @@ import type {
 } from '@shared/types'
 import { CLOSED_SESSIONS_CAP } from '@shared/types'
 import { collisionSeed, derivedProjectId } from '@shared/project-id'
-import type { ProjectCapability } from '@shared/project-capabilities'
+import { capabilityHasMachineDefault, type ProjectCapability } from '@shared/project-capabilities'
 import type { ProjectIcon } from '@shared/project-icon'
 import { recordCapabilityAck, type CapabilityAnswer } from '@shared/project-capability-consent'
 import {
@@ -102,10 +102,19 @@ interface ProjectsState {
    * THE strict per-project capability setter (@shared/project-capabilities). `on` writes the
    * literal `true` the validators accept AND records this machine's 'kept' answer — setting a
    * switch yourself is its own consent, so the clone notice never fires on your own decision.
-   * `off` deletes the field outright (an off capability adds no bytes to the shared file) AND
-   * records 'declined': if a teammate's (or a hostile) `true` re-arrives via git, the capability
-   * is refused and re-noticed rather than silently re-granted (PR #213 C1/M-2). */
+   * `off` deletes the field (an off capability adds no bytes to the shared file) — EXCEPT for a
+   * capability with a machine default (CAPABILITY_MACHINE_DEFAULTS), where absence means "use this
+   * machine's default" and off must therefore be written as a literal `false`. Either way it records
+   * 'declined': if a teammate's (or a hostile) `true` re-arrives via git, the capability is refused
+   * and re-noticed rather than silently re-granted (PR #213 C1/M-2). */
   setProjectCapability(id: string, cap: ProjectCapability, on: boolean): void
+  /**
+   * "Use this machine's default" — only meaningful for a capability with a machine default. Removes
+   * the file's value AND this machine's recorded answer for it: a kept `'declined'` would otherwise
+   * keep an absent field off (the rule that protects a pre-default "turn it off"), so the choice the
+   * user just made would not take effect. If a `true` later re-arrives via git it meets no answer
+   * and raises the clone notice, exactly as for a never-configured project. */
+  resetProjectCapabilityToDefault(id: string, cap: ProjectCapability): void
   /**
    * Records this machine's ANSWER ('kept' | 'declined') to the one-time clone notice.
    * MACHINE-LOCAL by construction: `Project.capabilityAck` rides `IndexEntryV3.capabilityAck`
@@ -479,7 +488,8 @@ export const useProjects = create<ProjectsState>((set, get) => ({
         if (p.id !== id) return p
         if (on) return recordCapabilityAck({ ...p, [cap]: true }, cap, 'kept')
         const next = { ...p }
-        delete next[cap]
+        if (capabilityHasMachineDefault(cap)) next[cap] = false
+        else delete next[cap]
         // 'declined', not silence: the deletion lives only in this working copy, so a re-arriving
         // `true` (teammate commit, git checkout) must re-notice instead of meeting a bare ack.
         return recordCapabilityAck(next, cap, 'declined')
@@ -488,6 +498,25 @@ export const useProjects = create<ProjectsState>((set, get) => ({
     // The setter owns the persist (issue #318): its call sites — the AgentsSection toggle, the
     // clone notice's decline — schedule no save of their own, so without this the choice was lost
     // on restart unless an unrelated canvas edit happened to dirty the workspace afterwards.
+    markWorkspaceDirty()
+  },
+
+  resetProjectCapabilityToDefault(id, cap) {
+    if (!capabilityHasMachineDefault(cap)) return
+    set((s) => ({
+      projects: s.projects.map((p) => {
+        if (p.id !== id) return p
+        const next = { ...p }
+        delete next[cap]
+        if (next.capabilityAck && Object.prototype.hasOwnProperty.call(next.capabilityAck, cap)) {
+          const ack = { ...next.capabilityAck }
+          delete ack[cap]
+          if (Object.keys(ack).length) next.capabilityAck = ack
+          else delete next.capabilityAck
+        }
+        return next
+      })
+    }))
     markWorkspaceDirty()
   },
 

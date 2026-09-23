@@ -115,6 +115,19 @@ describe('per-project capability fields in the shared file', () => {
       fileToProject({ ...baseFile, agentBrowserControl: 'true' } as never, { id: 'x' }).agentBrowserControl
     ).toBeUndefined()
   })
+  it('agentMessaging carries an explicit FALSE through the file (it has a machine default); browser control does not', () => {
+    const f = projectToFile(project({ agentMessaging: false, agentBrowserControl: false }), 1, 'ts')
+    expect(f.agentMessaging).toBe(false)
+    expect('agentBrowserControl' in f).toBe(false)
+    const back = fileToProject(f, { id: 'x' })
+    expect(back.agentMessaging).toBe(false)
+    expect(back.agentBrowserControl).toBeUndefined()
+    // A non-boolean is still dropped at the boundary — it reads as absence, never as an explicit off.
+    const baseFile = projectToFile(project(), 1, 'ts')
+    expect(
+      fileToProject({ ...baseFile, agentMessaging: 'false' } as never, { id: 'x' }).agentMessaging
+    ).toBeUndefined()
+  })
   it('an off capability adds no bytes to the committed file', () => {
     const f = projectToFile(project(), 1, 'ts')
     expect('agentBrowserControl' in f).toBe(false)

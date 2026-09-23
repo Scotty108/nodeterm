@@ -1,3 +1,5 @@
+import type { NormalizedAgentEvent } from '../../shared/agents/normalize'
+import { subscribeAgentReplay } from '../../shared/agent-replay-subscription'
 // WebSocket bridge that reconstructs `window.nodeTerminal` in the browser (Server Edition).
 //
 // Under Electron the preload already defines `window.nodeTerminal`; this module only runs when
@@ -29,9 +31,12 @@ import {
   type GrokApi,
   type GrokCliCaps,
   type ClaudeSkillShareResult,
+  type ClaudeSessionCopyResult,
   type CodexApi,
   type CodexIdentityCaps,
   UNKNOWN_CODEX_IDENTITY_CAPS,
+  type CodexCliCaps,
+  UNKNOWN_CODEX_CLI_CAPS,
   type ContextApi,
   type DownloadTicket,
   type FilesApi,
@@ -58,6 +63,7 @@ import {
   type WorkspaceApi
 } from '../../shared/types'
 import type { PeerIdentity } from '../../shared/presence'
+import type { PaneOwner } from '../../shared/agents/pane-owner-predicate'
 import { buildStubApi } from './stubs'
 import { mountPickerRoot, openDirectoryPicker } from './dialog-picker'
 import { encodePcmForWire } from './speech-encode'
@@ -256,15 +262,20 @@ export function buildRealApi(
       client.request(IPC.ptyReadScrollback, persistKey) as Promise<string>,
     sendText: (persistKey, text, opts) =>
       client.request(IPC.ptySendText, persistKey, text, opts?.enter) as Promise<boolean>,
-    // Fail-open: an errored status must not raise the banner in the browser.
+    // A failed read is unknown, never evidence that persistence is available.
     tmuxStatus: () =>
       client
         .request(IPC.ptyTmuxStatus)
-        .catch(() => ({ available: true, installCommand: null, installLabel: null, platform: null })) as Promise<TmuxStatus>,
+        .catch(() => ({ available: false, installCommand: null, installLabel: null, platform: null, persistence: null })) as Promise<TmuxStatus>,
     // Unknown on failure (null), never a rejection: the restart poller reads null as "not a
     // shell yet" and gives up on its own deadline.
     paneCommand: (persistKey) =>
       client.request(IPC.ptyPaneCommand, persistKey).catch(() => null) as Promise<string | null>,
+    // A REAL implementation, not a stub: core registers the handler, so the server this browser is
+    // served from answers it. The hibernation exit fails CLOSED on a null, so a stub here would
+    // have silently switched Eco off for the whole Server Edition rather than degrade it.
+    paneOwner: (persistKey) =>
+      client.request(IPC.ptyPaneOwner, persistKey).catch(() => null) as Promise<PaneOwner | null>,
     terminateForeground: (persistKey, expectedAgentId) =>
       client.request(IPC.ptyTerminateForeground, persistKey, expectedAgentId).catch(() => false) as Promise<boolean>,
     // No server handler — the session-name poll degrades to no adopted name. A PRE-EXISTING gap,
@@ -596,8 +607,8 @@ export function buildFilesApi(
 
   const context: ContextApi = {
     onUpdate: (listener) => client.subscribe(IPC.contextUpdate, listener as Listener),
-    ensure: (sessionId, cwd, accountId) =>
-      client.cast(IPC.contextEnsure, sessionId, cwd, accountId)
+    ensure: (sessionId, cwd, accountId, nodeId, agentId) =>
+      client.cast(IPC.contextEnsure, sessionId, cwd, accountId, nodeId, agentId)
   }
 
   // Board-log: REAL over the bridge for local projects (the server routes local; SSH projects on the
@@ -658,7 +669,10 @@ export function buildAgentApi(
   | 'onAgentRenameNode'
 > {
   return {
-    onAgentStatus: (listener) => client.subscribe(IPC.agentStatus, listener as Listener),
+    onAgentStatus: (listener) => subscribeAgentReplay(
+      (cb) => client.subscribe(IPC.agentStatus, cb as Listener),
+      () => client.request(IPC.agentSubagentSnapshot) as Promise<NormalizedAgentEvent[]>, listener
+    ),
     // REAL forward: the Server Edition writes its own agent-status mirror, and the phone reads it
     // over its SSH browse path — a browser canvas hibernating a node must reach that file too.
     reportHibernated: (nodeId, on) => {
@@ -863,6 +877,14 @@ export function buildCodexApi(client: RpcClient): CodexApi {
       (client.request(IPC.codexIdentityCaps) as Promise<CodexIdentityCaps>).catch(
         () => UNKNOWN_CODEX_IDENTITY_CAPS
       ),
+    // A REAL handler server-side, unlike `identityCaps` right above it — `registerCodexCliIpc`
+    // runs in that shell for the reason spelled out there: the Server Edition's Codex sessions run
+    // on the server's own `codex`, so the browser needs that binary's real approval vocabulary.
+    // Rejection degrades to the unknown caps, i.e. the baseline vocabulary.
+    cliCaps: () =>
+      (client.request(IPC.codexCliCaps) as Promise<CodexCliCaps>).catch(
+        () => UNKNOWN_CODEX_CLI_CAPS
+      ),
     onIdentity: (listener) => client.subscribe(IPC.codexIdentity, listener as Listener)
   }
 }
@@ -979,7 +1001,19 @@ export function buildClaudeAccountsApi(client: RpcClient): Pick<NodeTerminalApi,
           IPC.claudeAccountsSetSkillSharing,
           id,
           enabled
-        ) as Promise<ClaudeSkillShareResult>
+        ) as Promise<ClaudeSkillShareResult>,
+      // Real: the copy is core, on the machine the browser is served from — the same machine whose
+      // account dirs the Server Edition's panes run under.
+      // An SSH ctx is forwarded as-is: the server registers no SSH leg, so core refuses it
+      // (`failed`) instead of copying on the server's own disk.
+      copySession: (sessionId, sourceAccountId, targetAccountId, ctx) =>
+        client.request(
+          IPC.claudeAccountsCopySession,
+          sessionId,
+          sourceAccountId,
+          targetAccountId,
+          ctx
+        ) as Promise<ClaudeSessionCopyResult>
     }
   }
 }

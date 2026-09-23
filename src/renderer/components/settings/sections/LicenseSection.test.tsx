@@ -12,8 +12,22 @@ import type { LicenseDetail, LicenseStatus } from '@shared/types'
 
 ;(globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true
 
-const PRO: LicenseStatus = { tier: 'pro', active: true, expiresAt: null, seats: 3, error: null }
-const FREE: LicenseStatus = { tier: null, active: false, expiresAt: null, seats: 0, error: null }
+const PRO: LicenseStatus = {
+  tier: 'pro',
+  active: true,
+  expiresAt: null,
+  termEndsAt: null,
+  seats: 3,
+  error: null
+}
+const FREE: LicenseStatus = {
+  tier: null,
+  active: false,
+  expiresAt: null,
+  termEndsAt: null,
+  seats: 0,
+  error: null
+}
 /** A healthy keygen read with room to spare. */
 const KEYGEN: LicenseDetail = { key: 'NT-KEY-1', used: 2, seats: 3, source: 'keygen', error: null }
 
@@ -24,6 +38,7 @@ let releaseOthers: Mock<() => Promise<LicenseDetail>>
 let deactivate: Mock<() => Promise<LicenseStatus>>
 let activate: Mock<(key: string) => Promise<LicenseStatus>>
 let writeText: Mock<(text: string) => void>
+const onNavigate = vi.fn()
 
 /**
  * The store subscribes to `license.onChange` at IMPORT time, so the bridge has to exist before the
@@ -31,8 +46,14 @@ let writeText: Mock<(text: string) => void>
  * Returns the section already mounted with `status` applied, so the mount-time `loadDetail` effect
  * runs exactly as it does in the app.
  */
-async function mount(status: LicenseStatus, read: LicenseDetail = KEYGEN): Promise<void> {
+async function mount(
+  status: LicenseStatus,
+  read: LicenseDetail = KEYGEN,
+  browser = false
+): Promise<void> {
   vi.resetModules()
+  if (browser) (await import('@renderer/bridge/runtime')).markBrowserRuntime()
+  onNavigate.mockClear()
   detail = vi.fn(async () => read)
   releaseOthers = vi.fn(async () => ({ key: null, used: 1, seats: 3, source: null, error: null }))
   deactivate = vi.fn(async () => FREE)
@@ -58,7 +79,7 @@ async function mount(status: LicenseStatus, read: LicenseDetail = KEYGEN): Promi
     await useEntitlement.getState().hydrate()
   })
   await act(async () => {
-    root.render(<LicenseSection isActive />)
+    root.render(<LicenseSection isActive onNavigate={onNavigate} />)
   })
   await act(async () => undefined) // the mount-time detail read
 }
@@ -99,6 +120,45 @@ afterEach(() => {
 
 // See testMachineNoun.ts: the rendered copy names the machine, so the host OS is pinned.
 pinNeutralMachineNoun()
+
+describe('LicenseSection — the Pro line prints the subscription term, never the token TTL (#800)', () => {
+  const WEEK_S = 7 * 24 * 60 * 60
+  const APPLE: LicenseDetail = { key: null, used: 0, seats: 0, source: 'apple', error: null }
+  /** The paragraph that carries the Pro status, read on its own so another line's date cannot pass for it. */
+  const proLine = (): string =>
+    [...document.body.querySelectorAll('p')].map((p) => p.textContent ?? '').find((t) => t.startsWith('Pro —')) ??
+    ''
+
+  it('a 7-day token expiry with no stated term shows NO date', async () => {
+    // The reported screen: an App Store yearly subscriber, a token minted with the server's 7-day TTL.
+    const tokenExp = Math.floor(Date.now() / 1000) + WEEK_S
+    await mount({ ...PRO, expiresAt: tokenExp, termEndsAt: null }, APPLE)
+    expect(proLine()).toBe('Pro — active.')
+    expect(screenText()).not.toContain(new Date(tokenExp * 1000).toLocaleDateString())
+    expect(screenText()).not.toMatch(/active until/)
+  })
+
+  it('a null term renders no date — never the epoch', async () => {
+    await mount({ ...PRO, expiresAt: null, termEndsAt: null }, APPLE)
+    expect(proLine()).toBe('Pro — active.')
+    expect(screenText()).not.toContain(new Date(0).toLocaleDateString())
+    expect(screenText()).not.toMatch(/1970|1969/)
+  })
+
+  it('renders the term when the server states one, and not the token date beside it', async () => {
+    const tokenExp = Math.floor(Date.now() / 1000) + WEEK_S
+    const term = Math.floor(Date.now() / 1000) + 363 * 24 * 60 * 60
+    await mount({ ...PRO, expiresAt: tokenExp, termEndsAt: term }, APPLE)
+    expect(proLine()).toBe(`Pro — active. Current term runs through ${new Date(term * 1000).toLocaleDateString()}.`)
+    expect(screenText()).not.toContain(new Date(tokenExp * 1000).toLocaleDateString())
+  })
+
+  it('tells an App Store subscriber where the renewal is managed', async () => {
+    await mount(PRO, APPLE)
+    expect(screenText()).toMatch(/managed by Apple, not by nodeterm/)
+    expect(screenText()).toMatch(/open the App Store on that phone/)
+  })
+})
 
 describe('LicenseSection — a release that did not land', () => {
   it('reports the RELEASE, and keeps saying the truth about the license', async () => {
@@ -269,5 +329,36 @@ describe('LicenseSection — activation failures', () => {
     const text = screenText()
     expect(text).not.toContain('gremlins')
     expect(text).toContain('Could not activate this key.')
+  })
+})
+
+
+describe('LicenseSection — existing App Store purchase (#787)', () => {
+  it('offers pairing before checkout and beside the key input without promising recovery', async () => {
+    await mount(FREE)
+    const messages = [...host.querySelectorAll('p')].filter((p) =>
+      p.textContent?.includes('Already have Pro from the App Store?')
+    )
+    expect(messages).toHaveLength(2)
+    expect(messages[0].closest('details')).toBeNull()
+    expect(messages[1].closest('details')?.querySelector('input')).toBeTruthy()
+    for (const message of messages) {
+      expect(message.textContent).toContain('can unlock Pro')
+      expect(message.textContent).toContain('Some purchases cannot be linked by pairing')
+      expect(message.textContent).toContain('contact support before buying again')
+    }
+    await act(async () => click('Open Settings → Phone'))
+    expect(onNavigate).toHaveBeenCalledWith('phone')
+    expect(activate).not.toHaveBeenCalled()
+    expect(window.nodeTerminal.license.upgrade).not.toHaveBeenCalled()
+  })
+
+  it('directs browser users to the desktop app instead of unsupported browser pairing', async () => {
+    await mount(FREE, KEYGEN, true)
+    expect(screenText()).toContain('In the desktop app, open Settings → Phone')
+    expect(screenText()).toContain('Server Edition does not support this activation route')
+    expect(
+      [...host.querySelectorAll('button')].some((b) => b.textContent === 'Open Settings → Phone')
+    ).toBe(false)
   })
 })

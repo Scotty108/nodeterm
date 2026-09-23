@@ -49,7 +49,34 @@ The repo is split by Electron process boundary and the split is enforced, not ad
 
 **Put new service logic in `src/core` behind `CorePlatform`, not inline in `src/main`.** That is the
 seam the Server Edition boots from; logic left in `src/main` silently does not exist there, and the
-boundary tests cannot tell you a feature is *missing*.
+boundary tests cannot tell you a feature is *missing*. This keeps happening to the same subsystem:
+the ⌘M transcript read and then the context meter's `context:ensure` both shipped desktop-only, and
+in both cases the browser cast the message into the void and the feature just looked empty. If your
+handler needs something only Electron has (an SSH ControlMaster, a native dialog), make that an
+**injected dep** whose absence is a documented degrade — see `registerTranscriptIpc` /
+`registerContextEnsureIpc` — rather than a reason to keep the whole handler in `src/main`.
+
+Claude usage identity is scoped to the same config directory as its credentials. Read organization
+metadata even when credentials already include an email, and degrade to the email-only row when
+metadata cannot be read. Managed usage must never fall back to an unscoped system Keychain token:
+that would label one account's limits with another account's organization.
+
+Context-link maps authorize reads. Publish changes to edges, linked metadata, and background
+projects independently of canvas geometry updates; a debounce reset by every node render can
+starve publication indefinitely. Only merge projects owned by the same core, and use the rendered
+canvas's project epoch during tab switches. Core must revoke removed links before asynchronous
+transcript discovery or debug-file writes finish; an older write must never restore that access.
+Coalesce renderer updates before building the workspace map, without resetting the scheduled task.
+Intermediate publications retain resolved transcript paths only for unchanged identities; changing
+a session/account/location/hook path or removing the target invalidates that cache immediately.
+
+Windows installer safety (#829): `build/installer.nsh` overrides NSIS's process-killing check.
+A running app or session host blocks install/uninstall, and a failed process query blocks too.
+Never restore automatic host termination: quitting the app preserves those live sessions.
+Update preparation must keep saved canvas nodes: exit programs normally, quit, then have the user
+verify and stop any remaining host. Never recommend **End session** (it deletes nodes). Cold agent
+resume depends on supported, saved conversation history; it does not preserve running tasks.
+See `docs/windows-session-host.md` for the user-controlled preparation/recovery steps and limits.
 
 ## Three surfaces
 
@@ -92,6 +119,13 @@ lane unaffected.
 
 ## House rules
 
+- **Branch labels describe a checkout on one core.** Share existing status reads through
+  `renderer/state/gitBranches.ts`; do not cache a branch forever by project id or copy a project
+  branch onto worktree nodes. Source, Sessions and worktree headers consume the same observations,
+  keyed by API identity, exact cwd and (for SSH) project identity. Never probe an SSH cwd locally
+  from a background header: only the active SSH project is git-routable. SSH headers observe
+  Source refreshes instead.
+
 - **Never call the user's machine a Mac in user-visible copy.** Use `thisMachine()` /
   `thisMachineCap()` / `machineNoun()` from `src/renderer/lib/machineName.ts` — "this Mac" on
   macOS, "this PC" on Windows, "this computer" elsewhere and in any Server Edition browser tab
@@ -101,6 +135,12 @@ lane unaffected.
   handing out shell access. `machineName.guard.test.ts` scans non-comment lines and will fail your
   PR; copy that really is macOS-specific (the ptmx-limit banner, the notch step) is exempt by name
   with its reason. Comments are not scanned.
+
+- **Bottom canvas pills must leave room for the measured dock.** `CanvasPills` bounds their row
+  and moves it above the dock when the side budget is too small. Only usage summary text may
+  truncate; keep refresh outside that overflow and keep the row free of stacking contexts so
+  popovers can still clear the sidebar/board. `scripts/usage-layout.test.ts` verifies real Chrome
+  layout and hit targets (set `CHROME_BIN` when Chrome is not at the Linux default path).
 
 - **An overlay you lay over a live terminal steals its wheel — give it `pointer-events: none`.**
   Wheel routing is a per-packet hit test on `closest('.nowheel')` (ours in `Canvas.tsx`, and React
@@ -155,6 +195,17 @@ lane unaffected.
   `.nodeterm/project.json`, which is git-shared, or a cloned repo could switch someone's confirms
   off.
 
+- **An agent may only reach settings through an ALLOWLIST, and every change asks.** The
+  canvas-control `settings` verb (`src/shared/settings-verb.ts`) reads and asks to change a short
+  table of keys; anything off the table is refused by name, and a forbidden set (permission modes,
+  accounts/credentials, node identity, browser control, telemetry, keybindings, confirm waivers)
+  outranks the table — its test walks the table against the set AND a name pattern, so an entry that
+  would let an agent grant itself a power goes red even when added on purpose. `settings` is outside
+  `CONFIRM_WAIVABLE_VERBS`: a CLI that could waive its own confirm would make the confirm decorative.
+  A capability change must land through the UI's own setter (`setProjectCapability`: file flag AND
+  this machine's `'kept'` answer), never a hand-rolled flag write. Adding a key is one line in the
+  table plus a `why`. The Server Edition has no dialog, so it refuses every `--set` by name.
+
 - **A permission mode (or anything else) that rides `project.json` is GIT-SHARED — never key a
   local gate on it alone.** `project.defaultPermissionMode` travels to everyone who clones the
   repo, so binding a confirmation-skip to "the mode is bypassPermissions" would let a cloned
@@ -163,6 +214,10 @@ lane unaffected.
   act only on the user's own machine-local choice — and keep `default` distinct from `global`,
   because reading an unset setting as a deliberate choice is reading consent into silence. Anything
   machine-local goes in `settings.json`; nothing that grants a capability goes in `project.json`.
+  A machine-local DEFAULT for a project capability (`agentMessagingDefault`) is allowed only because
+  it answers ABSENCE: an explicit `true` in `project.json` still needs this machine's recorded
+  answer, an explicit `false` still wins, and "off" must therefore be written as a literal `false`.
+  Read grants through `projectCapabilityGrantedFor(project, cap, settings)` — never the file bit.
 
 - **Nothing an agent asks for may take the user's screen.** Canvas control routes by SOURCE: the
   request names the agent's own node, and the dispatch has to find the canvas that owns it. For
@@ -194,6 +249,15 @@ lane unaffected.
   under them — and remember that clearing a dialog is not always just nulling its state (that one
   also has to release the ref its own busy-guard reads).
 
+- **An error must not name a remedy nobody measured — and the remedy needs its own test.** The
+  `unproven-target-owner` refusal told its caller *"Re-open the target node so its owner is
+  recorded, then try again"*, and re-opening is precisely the attach that records nothing
+  (ownership is recorded only on a genuine fresh spawn), so a caller that obeyed got the identical
+  refusal forever. It shipped because no test read the sentence. When you write a refusal, pin its
+  claim against the MECHANISM it describes — assert the remedy's precondition by calling the
+  function that decides it, so the copy goes red when the behaviour moves — and remember who reads
+  it: telling a language model to do something only a human can do is not advice.
+
 - **Anything path-shaped: Windows is a delivery target.** Most of this was written on
   macOS/Linux, so the recurring defect is code that is genuinely correct on POSIX —
   `split('/')`, `startsWith('/')` as an is-absolute test, a bare `fs.rename`. Use
@@ -223,6 +287,19 @@ lane unaffected.
   prompts and other user-controlled arguments would become shell syntax. `.bat`/`.ps1`, CR/LF/NUL
   arguments and lines above cmd's limit fail explicitly. Keep stdin direct: PowerShell's text
   pipeline changes Unicode and line endings under Windows PowerShell 5.1.
+
+- **The phone reaches a Windows desktop through the relay only.** Everything the iOS app sends over
+  SSH is POSIX sh plus tmux, and Windows OpenSSH hands out `cmd.exe`, so Windows pairing installs no
+  SSH key and requires remote access instead of an SSH server (`src/shared/pairing-gate.ts`). Do not
+  "fix" this by installing the key into `administrators_authorized_keys`. The phone tries SSH before
+  the relay, so a key that works locks it onto a path that cannot work. CLAUDE.md, "Remote access",
+  has the details.
+
+- **A relay channel that names a project needs a row in `relay-project-scope.ts`.** A relay guest
+  bound to one shared project must never reach another, and the jail is keyed on channel class:
+  anything named `githubIssues:*`, `board-log:*` or `projects.*` is refused on a scoped session
+  unless that table can read its projectId. Add the row in the same PR as the channel, or the verb
+  is refused for every scoped guest (and `relay-project-scope.test.ts` goes red telling you so).
 
 - **Normalize BOTH sides of a path comparison, through one function.** A marker normalized where
   it is built and matched raw where it is used is a no-op on the machine you wrote it on and a
@@ -277,6 +354,10 @@ lane unaffected.
 These are the ones that come up in review most often. Each exists because its absence caused a real
 bug.
 
+**A project-scoped lookup cannot prove a node does not exist elsewhere.** Link refusals must
+name the project boundary and explain that cross-project linking is unsupported; do not scan other
+projects just to improve a missing-endpoint diagnostic.
+
 **A failed read is never evidence of absence.** "Could not measure" and "there is nothing" are
 different facts and must stay distinguishable at every layer. Collapsing them is how a panel ends up
 reporting "no sessions" on a host running thirty. When something ACTS on the negative, give it three
@@ -326,6 +407,11 @@ come from git-shared JSON and can end up interpolated into a shell command line.
 `/bin/sh` against a fixture tree. A composed fixture will not tell you that `echo ##MEM` prints an
 empty line because `#` starts a comment.
 
+**Remote context polling must bound bytes before SSH transports them.** Bootstrap from the
+file's measured end, keep offsets in raw bytes, and distinguish an idle read from failure so
+the poller can back off. Bootstrap history restores usage only, never task/result events.
+`core/remote-ssh/transcript-window.ts` and the real-shell remote-context tests pin this contract.
+
 **A shared agent daemon is live-session infrastructure.** Codex's app-server control socket is
 shared by every `--remote` TUI in an account scope, so stopping or replacing one daemon disconnects
 every attached canvas node. A managed launcher must keep the already-bound thread under a bounded
@@ -339,6 +425,13 @@ command string. `/proc/<pid>/cmdline` is mode 444 on a stock Linux, and a remote
 on the host too: we shipped the hook bearer that way and any other account on the machine could read
 it and open a terminal running an arbitrary command. Pass secrets by 0600 file or by **stdin**
 (`curl --config -`), and never add an argv fallback. See `docs/node-identity.md`.
+
+**A hook socket path is not ownership proof.** Never unlink a live listener to bind a hook
+socket, or overwrite an advertisement whose socket/TCP listener still answers. Local stale cleanup requires `ECONNREFUSED` and an unchanged socket inode; regular files,
+symlinks and uncertain probes are preserved. SSH setup allocates a fresh socket and publishes an
+installation-qualified endpoint only after bearer verification. A wrong bearer answers 421 before
+any handler runs; only that explicit wrong-owner response (or transport failure) permits endpoint
+failover. A node-identity 403 stays final. Test with disposable sockets, never a running user's tunnel.
 
 **Both raw listeners change together** — `src/main/index.ts` and `src/server/agent-status.ts`. A new
 field on a hook event that reaches only the desktop leaves the Server Edition quietly without the
@@ -463,7 +556,7 @@ caller's project before answering. For an OPEN that was a screen hijack: the use
 project B, an agent in project A runs `open-claude`, the tab switches and A's saved viewport is
 applied, so the camera appears to jump and zoom. The rule now has three tiers, all membership lists
 in `renderer/lib/controlRouting.ts`: `STORE_ANSWERED_VERBS` ("no canvas is needed at either end" —
-`list`, `send`, `reply`, `sticky`, `open-project`), `canColdOpen` ("a canvas IS needed, but the
+`list`, `send`, `reply`, `sticky`, `open-project`, `settings`), `canColdOpen` ("a canvas IS needed, but the
 serialized one will do" — `open-terminal`, `open-claude`, `open-agent`, which write into the owning
 project's stored nodes with their launch armed and report `queued: true`) and `answersOffCanvas`
 ("…and there is nothing to defer" — `show-image`, `show-video`, `show-web`, `open-browser`, whose
@@ -549,6 +642,11 @@ arrangement on screen both confirm first, because layout edits are not in the un
 does not, because it is. Whether a dialog claims the edit reaches other people comes from
 `layoutIsShared`, which is true for an SSH project as well as a folder one.
 
+**Keep-alive webview ghosts must stay mounted, but must not enter minimap geometry.**
+They use `display:none`, not React Flow's `hidden` (which unmounts the guest). Render canvas maps
+through `VisibleMiniMap`: it filters both drawing and bounds in a minimap-only store while sharing
+the live camera. A transparent rectangle alone still distorts the map's scale.
+
 **React Flow's `fitView` is queued, not immediate — never use it to frame something automatically.**
 Calling it sets `fitViewQueued` and the fit runs from a later `setNodes` (only once every node is
 measured) or the next `updateNodeInternals`, against whatever the node lookup holds by then; a fit
@@ -587,7 +685,78 @@ examples). If the same effect also WRITES, latch its first run: otherwise switch
 mid-session applies stored state to whatever the user is doing right then, which is a different
 feature from the one they asked for.
 
+Maximize placement and refocusing must use the same measured usable rectangle
+(`measureMaximizeInsets`): pinned side panels plus persistent top controls and bottom dock.
+Do not hardcode chrome heights or add the outer margin twice; transient menus must not resize
+terminals. Ordinary focus and zone snap keep their own policies. Test the maximized-only
+focus decision through `viewportForNodeFocus`, the same helper Canvas calls, rather than
+passing preselected insets straight to the geometry function.
+
+**Usage readouts distinguish failed reads from empty data.** For Claude, show the failure when
+`status` is `error` and limits are empty, including beside other providers; preserve last-known
+bars when limits remain. Keep both single-account and multi-account views covered.
+
+**A context capacity needs session provenance.** Claude's effective `CLAUDE_CODE_MAX_CONTEXT_TOKENS`
+is reported by its managed hook, accepted only with verified node identity, and validated as a
+positive decimal safe integer. Never read the app's global env for another session or let a
+model-family guess enlarge an observed limit. Unobserved Claude windows are labelled estimates.
+The renderer rehydrates through `context.ensure`; it does not restore Claude denominators from
+storage. Other agents retain transcript-window persistence.
+Only an explicit ensure replays an unchanged live snapshot; repeated hook observations must not
+broadcast it again. Remote path, ControlMaster or connection changes replace the tracked generation.
+
+**Command-bearing terminal opens (issue #653):** the shared hook-server route requires verified
+node identity whenever `open-terminal` carries `cmd`, including an empty value or a dry run.
+The strict-policy override and foreign-instance fallback cannot release this gate. Desktop plain
+terminal opens keep their existing identity policy; Server Edition still requires verification
+for every control verb. Legacy mobile/SSH callers must present this instance’s node token for
+command-bearing opens; this does not add a human-confirm dialog or change mobile transport APIs.
+
+Grok billing diagnostics must keep HTTP codes and safe failure categories per billing view. Never send raw error messages, URLs or response bodies to the UI; credentials remain read-only. A failed view is not proof that there is no quota, even when the other view responds.
+
+## User-owned agent settings
+
+Claude/Gemini settings must go through the guarded transactions in
+`src/core/agents/hooks/{settings-file,remote-settings-file}.ts`. Confirmed absence or a successfully read empty/whitespace file may start from `{}`;
+malformed, non-object and unreadable files must survive unchanged.
+Keep unrelated settings and foreign hook handlers. Stage writes, serialize nodeterm writers,
+and compare the original bytes again before publishing; never use `cat … || echo '{}'` or a
+catch-all read fallback. Local and SSH symlinked profiles update and lock the resolved target without replacing
+the link; recheck resolution before publishing. SSH uses plain readlink and cd -P (no GNU -f),
+and refuses dangling/cyclic links and newline paths. A conflicting/stale lock skips installation
+with a diagnostic naming the lock and safe manual recovery; do not steal it from another process. These locks
+coordinate nodeterm, not external editors, so do not claim a filesystem-wide compare-and-swap.
+**Creating an agent node is not proof it started.** Control opens retain their launch command
+until delivery is acknowledged, and report `queued` while it is held. A successful terminal send
+proves delivery only; never describe it as a healthy/running agent without agent evidence.
+Desktop launches (automatic and Run now) use the echo-verified command writer, not `sendText`.
+Keep unsubmitted UI intent durable through shell settle/unmount. New intent carries `attempted:false`;
+Desktop and Server save `attempted:true` before input. Never-attempted warm `--after` launches may
+proceed after shell verification; attempted/legacy-unknown intent requires Run now. Only confirmed
+submission clears intent. Desktop open replies use `createControlOpenBatch` for queued accounting;
+protect that contract and concurrent submission with behavior tests, never source-text pins.
+Relay queued/restored launches and Run now are refused until a scoped durable claim API exists.
+A new relay UI initialCommand may run once on a fresh PTY through the verified writer, without
+workspace writes or pendingLaunch creation. Consume its transient attempt before shell settle;
+never retry it on remount or serialize it as durable intent.
+Never round-trip a relay workspace load into save: the load can contain only one shared project,
+while save replaces the entire host index. A pre-input parked-project deferral keeps intent
+never-attempted; it must not poison the writer or trigger a retry timer.
+Held Desktop launches retain their attached transport even offscreen with tmux (large fan-outs cost
+memory). Server deferred delivery is one-shot: a failed probe/send needs explicit recovery.
+
 ## Testing
+
+**Screenshot paste has one route per gesture.** On macOS, Cmd+V saves/uploads a file and
+pastes its path; Ctrl+V belongs to the foreground program. A node's configured agent is not
+proof of foreground clipboard-image support. Keep shell/SSH/Server file routing and capture
+suppression of accompanying text; do not synthesize Ctrl+V or try both routes without a
+capability and receipt protocol. The shortcuts panel documents this distinction (#712).
+
+The titlebar's scroll viewport owns its `no-drag` region. Do not add `app-region: no-drag`
+to tabs or their descendants: Electron can subtract their off-screen rectangles from the
+wordmark's drag area. `scripts/tabbar-drag.test.ts` checks native hit testing with isolated
+Electron/Xvfb on Linux; macOS traffic lights and actual window movement still need device checks.
 
 `npm test` must pass, and `npm run typecheck` is the fastest gate.
 
@@ -666,3 +835,57 @@ Two files, two audiences:
 **If you change or discover something other contributors must know, update this file too.** An
 invariant that only lives in a commit message is one refactor away from being violated by someone
 who never saw it.
+
+An unanswered Claude `AskUserQuestion` is correlated by session and tool-use ID in the core
+mirror, independently of its short-lived display stash. Ordinary hooks, subagent activity and
+unrelated transcript results must not clear attention or archive its inbox card. Both shells
+use `recordQuestionResult` for transcript rescue (including Escape/decline), and broadcast the
+mirror's effective event. Keep result IDs through local and SSH tails; a boolean “some tool
+finished” is insufficient. Explicit new user turns, interrupts and session boundaries reset it.
+
+Remote Codex account safety (#736): managed SSH Codex sessions and agent-less login terminals
+require a known safe account id and a safe resolved remote home before spawning. The remote env
+builder supplies their private `CODEX_HOME`; never fall back to the system login when that scope
+is unavailable. System SSH Codex retains the host environment, including during early attach
+before home discovery; never inject a guessed `HOME` or `CODEX_HOME`. Custom Codex harnesses use
+the same guard. Desktop supports remote account lifecycle; the Server browser still explicitly
+rejects managed Codex account management.
+
+- Media URLs live for the app run. Remote cache pruning must keep files already handed to
+  players; the cache cap is soft until restart. Use the existing `video` node for audio too.
+- Subagent reload replay is display-only and current-host-only. Never replay status/permission
+  events or treat a replayed card as verified process ownership; subscribe before taking its snapshot.
+
+**Phone consent belongs to the verified handshake, not the browse socket.** A standing phone's
+SAS request survives transport closure only until its 120-second deadline; approval requires the
+issued id and displayed box key together. Keep request/reply outcomes distinct (stale request,
+failed pin save, missing IPC response, saved-but-disconnected). All production pin/revoke writers
+must use `updateApprovedDevices` for the whole read/modify/write, so concurrent updates cannot
+lose approvals or resurrect revoked keys. Server Edition does not host this legacy relay path.
+
+Managed Codex login terminals are agent-less: core identifies their provider from the saved
+account list. Before opening one, await `useSettings.getState().flush()` after adding the account.
+The normal 300 ms coalesced save is too late: an unknown id can launch against the system home.
+
+Claude child `PreToolUse`/`PostToolUse`/`PostToolUseFailure` hooks must not drive parent state.
+Child `PermissionRequest` and attention `Notification` hooks still reach needs-you and phone
+approvals, including the raw approval summary and deterministic reply ticket. Keep raw summary
+recording before the child transcript-association guard in both shells.
+
+A held parent question can overlap child permissions: retain its question card and waiting
+state while publishing each approval ticket separately. Approval replies resolve only their
+own ticket; the picker stays pending until its correlated answer or explicit reset.
+When the parent answers first, retain concurrent approval tickets and blocked attention until
+their own replies; ordinary tool activity cannot settle them. Explicit turn/session resets
+still cancel both kinds of pending attention.
+
+Optional hook ownership failures must never stop Desktop window creation or Server boot. Use the
+shared nonfatal startup path and surface its actionable diagnostic. A responding HTTP port is not
+nodeterm identity: verify bearer acceptance and rejection. Legacy SSH endpoint migration requires
+ownership proof, an unchanged-file check, and stdin-only credential transfer; a project name alone
+is not permission to replace another installation's advertisement.
+
+Held approval attention must not replace subagent, recurring or background-task events, or refresh
+state evidence from those lifecycle hooks. A parent may ask several questions while a child ticket
+is outstanding: track each new picker and preserve child approval cards independently, including
+when their display titles match. Answering either resolves only that question or ticket.

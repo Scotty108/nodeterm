@@ -7,10 +7,17 @@
 // rather than a nearest match. A silent substitution would show the user "Plan" while codex ran in
 // on-request, or "Auto" while gemini auto-approved every file edit.
 //
-// Measured: `gemini --help` (0.54.4) and `codex --help` (0.146.0). `--sandbox` is deliberately not
-// touched: it is a separate axis (read-only | workspace-write | danger-full-access), and folding
-// `danger-full-access` into `bypassPermissions` would widen filesystem access invisibly —
-// `--ask-for-approval never` on its own still sandboxes.
+// Measured: `gemini --help` (0.54.4) and `codex --help` (0.146.0 … 0.154.0). `--sandbox` is
+// deliberately not touched: it is a separate axis (read-only | workspace-write |
+// danger-full-access), and folding `danger-full-access` into `bypassPermissions` would widen
+// filesystem access invisibly — `--ask-for-approval never` on its own still sandboxes.
+//
+// AND ONE AGENT'S VOCABULARY IS NOT A CONSTANT. codex accepted `untrusted|on-request|never`
+// through 0.148.0 and accepts `on-request|never` from 0.149.0 on — measured release by release,
+// see `CODEX_APPROVAL_BASELINE`. clap does not ignore a value it does not know, it EXITS, so a
+// table pinned to one release is not a stale mapping, it is a dead node. Every value this module
+// emits is therefore checked against what the CLI that will actually run the session says it
+// takes (`ApprovalCaps`), and a value we have not seen it advertise is never emitted.
 import {
   AGENT_CONFIG,
   ALL_PERMISSION_MODES,
@@ -25,12 +32,68 @@ import {
 } from './config'
 import { argvHasFlag } from '../shell-quote'
 
+/**
+ * What we know about the CLI that will actually RUN this session — the facts that decide whether a
+ * value in the tables below may be emitted at all.
+ *
+ * Optional and empty-by-default ON PURPOSE. A caller that passes nothing gets the baseline
+ * vocabulary, which is the safe answer everywhere: the launch keeps working, at worst one mode
+ * degrades to the CLI's own default (and the derived UI copy says so). A caller that forgets to
+ * pass its probe result therefore costs a mode, never a dead pane — which is the only degrade
+ * direction this file accepts.
+ */
+export interface ApprovalCaps {
+  /** The values this machine's (or this host's) `codex` advertises for `--ask-for-approval`, read
+   *  from its own `--help` — see `core/codex-cli.ts`. `null`/absent = not probed, not probeable
+   *  (a remote host, a relay tab), or the probe failed. */
+  codexApprovalValues?: readonly string[] | null
+}
+
+/**
+ * The `--ask-for-approval` values EVERY codex we have measured accepts, and therefore the answer
+ * when we do not know which codex will run.
+ *
+ * Measured one release at a time on real binaries (`@openai/codex@<v>-linux-x64`, `--help`):
+ * 0.146.0 · 0.147.0 · 0.148.0 advertise `untrusted, on-request, never`; 0.149.0 · 0.150.0 ·
+ * 0.151.0 · 0.152.0 · 0.153.0 · 0.154.0 advertise `on-request, never`. So `untrusted` was removed
+ * in **0.149.0** — five releases before the one issue #785 reported it from — and `on-request` /
+ * `never` are common to every one of them.
+ *
+ * `untrusted` is deliberately NOT in the baseline. An unknown value does not degrade: clap answers
+ *
+ *   error: invalid value 'untrusted' for '--ask-for-approval <APPROVAL_POLICY>'
+ *
+ * and exits, so the pane is left at a bare shell with the launch dead (issue #785). A value we
+ * have not SEEN this CLI advertise is never emitted; the two we have seen on every measured
+ * release are what an unprobed launch falls back to, because that is the command line nodeterm has
+ * always sent for those modes.
+ */
+const CODEX_APPROVAL_BASELINE: readonly string[] = ['on-request', 'never']
+
 /** One agent's approval dialect: the flag it spells, and the values it accepts. ONE fact per agent —
  *  a flag and a table maintained separately is how a third agent added to the table silently emits
  *  the second agent's flag. */
 interface ApprovalDialect {
   flag: string
   modes: Partial<Record<AgentPermissionMode, string>>
+  /**
+   * Does this CLI's OWN default already prompt before every action?
+   *
+   * This is what decides whether `manual` ("Ask each time") is honoured by emitting NOTHING. For
+   * gemini it is true — its `default` mode is documented as "prompt for approval" — so the bare
+   * command already keeps the promise. For codex it is false: its built-in default is
+   * `on-request`, "the model decides when to ask", so an unflagged codex delivers something else
+   * entirely under that label. Kept as a per-agent fact rather than a special case in
+   * `modeSupported`, because it is a property of the CLI, not of the mode.
+   */
+  manualIsDefault: boolean
+  /** The values this CLI accepts, when that is version-dependent. `undefined` = every value in
+   *  `modes` is stable across the releases we have measured, so the table alone decides (gemini).
+   *  Only codex has one — see `CODEX_APPROVAL_BASELINE`. */
+  vocabulary?: (caps: ApprovalCaps) => readonly string[]
+  /** What this CLI actually does when `manual` turns out to be inexpressible, for the UI note.
+   *  Lives beside the table so the sentence cannot drift from it. */
+  manualGapNote?: string
 }
 
 const GEMINI_MODES: Partial<Record<AgentPermissionMode, string>> = {
@@ -52,22 +115,34 @@ const GEMINI_MODES: Partial<Record<AgentPermissionMode, string>> = {
 }
 
 const CODEX_MODES: Partial<Record<AgentPermissionMode, string>> = {
-  // codex is the FIRST agent where `manual` emits a flag, and it has to. For every other agent
-  // `manual` = no flag = a default that already prompts (gemini's own `default` is documented as
-  // "prompt for approval"), which is exactly what the label "Ask each time" promises. codex's
-  // built-in default is NOT that: measured on 0.146.0, `codex doctor` reports `approval policy
-  // OnRequest` with no `approval` key in ~/.codex/config.toml — the model decides when to ask. So
-  // leaving `manual` unflagged would deliver `on-request` under an "ask each time" label, and
-  // collapse two dropdown entries onto one behaviour — the same dishonesty this module exists to
-  // remove, just expressed as an unflagged claim instead of a substituted flag. `untrusted` is the
-  // real equivalent: "only run trusted commands without asking; escalate anything not in the trusted
-  // set". No codex launch has ever carried this flag (codex joined the list in the same change), so
-  // there is no historical command line to keep byte-identical here.
+  // codex is the FIRST agent where `manual` emits a flag, and — where the CLI still has the value
+  // — it has to. For every other agent `manual` = no flag = a default that already prompts
+  // (gemini's own `default` is documented as "prompt for approval"), which is exactly what the
+  // label "Ask each time" promises. codex's built-in default is NOT that: measured on 0.146.0 AND
+  // re-measured on 0.151.0, `codex doctor` reports `approval policy OnRequest` with no `approval`
+  // key in ~/.codex/config.toml — the model decides when to ask. So leaving `manual` unflagged
+  // delivers `on-request` under an "ask each time" label, and collapses two dropdown entries onto
+  // one behaviour — the same dishonesty this module exists to remove, just expressed as an
+  // unflagged claim instead of a substituted flag. `untrusted` is the real equivalent: "only run
+  // trusted commands without asking; escalate anything not in the trusted set".
+  //
+  // THIS ENTRY IS A CANDIDATE, NOT A PROMISE. codex removed `untrusted` in 0.149.0, so on any
+  // current CLI it is filtered out by `vocabulary` below and `manual` emits nothing — and
+  // `modeSupported` then answers false, so `unsupportedModesNote` admits it instead of the
+  // dropdown quietly lying. It stays in the table because a codex <= 0.148.0 is still a codex a
+  // user may be running, and on THAT CLI "Ask each time" really is expressible; the probe is what
+  // decides, not this file.
+  //
+  // What was checked before concluding the mode is gone (all on 0.151.0): `-a unless-trusted` —
+  // rejected by clap; `-c approval_policy=untrusted` and `-c approval_policy=unless-trusted` —
+  // both refused with "config could not be loaded", so the TOML route is not a back door either;
+  // `--approve-for-me` — a real flag, but it routes approvals through AUTOMATIC review, which is
+  // the opposite of asking the user. 0.149.0+ genuinely cannot express "ask every time".
   manual: 'untrusted',
   auto: 'on-request',
   bypassPermissions: 'never'
-  // No `plan` and no edit-specific mode exist in codex 0.146.0, so `plan` and `acceptEdits` are
-  // absent ON PURPOSE — see modeSupported.
+  // No `plan` and no edit-specific mode exists in ANY measured codex (0.146.0 … 0.154.0), so
+  // `plan` and `acceptEdits` are absent ON PURPOSE — see modeSupported.
 }
 
 /**
@@ -82,8 +157,37 @@ const CODEX_MODES: Partial<Record<AgentPermissionMode, string>> = {
  * user-typed ids), so a plain-object index answers `'constructor'` with a Function.
  */
 const APPROVAL_DIALECTS: Partial<Record<AgentId, ApprovalDialect>> = {
-  gemini: { flag: '--approval-mode', modes: GEMINI_MODES },
-  codex: { flag: '--ask-for-approval', modes: CODEX_MODES }
+  gemini: { flag: '--approval-mode', modes: GEMINI_MODES, manualIsDefault: true },
+  codex: {
+    flag: '--ask-for-approval',
+    modes: CODEX_MODES,
+    manualIsDefault: false,
+    vocabulary: (caps) =>
+      caps.codexApprovalValues?.length ? caps.codexApprovalValues : CODEX_APPROVAL_BASELINE,
+    manualGapNote:
+      'That default asks only when the model chooses to: `untrusted`, the policy that meant ' +
+      'ask-every-time, was removed in codex-cli 0.149.0 and has no replacement.'
+  }
+}
+
+/**
+ * The value this dialect may actually EMIT for this mode — the table entry, filtered through what
+ * the target CLI says it accepts. `undefined` = emit nothing.
+ *
+ * `Object.hasOwn`, not `[mode]`, for the same reason `dialectFor` uses it: the callers below
+ * validate `mode` with `isPermissionMode` first, and this keeps the lookup honest even so — a
+ * plain-object index answers `'constructor'` with a Function, and this value is headed for a shell
+ * command line.
+ */
+function emittableValue(
+  dialect: ApprovalDialect,
+  mode: AgentPermissionMode,
+  caps: ApprovalCaps
+): string | undefined {
+  const value = Object.hasOwn(dialect.modes, mode) ? dialect.modes[mode] : undefined
+  if (!value) return undefined
+  if (!dialect.vocabulary) return value
+  return dialect.vocabulary(caps).includes(value) ? value : undefined
 }
 
 const dialectFor = (agentId: AgentId): ApprovalDialect | null =>
@@ -91,17 +195,24 @@ const dialectFor = (agentId: AgentId): ApprovalDialect | null =>
 
 /** Can this agent actually start in this mode? `false` means the launch omits the flag and the
  *  agent uses its own default — surfaced in the UI so the user is not misled. */
-export function modeSupported(agentId: AgentId, mode: AgentPermissionMode): boolean {
+export function modeSupported(
+  agentId: AgentId,
+  mode: AgentPermissionMode,
+  caps: ApprovalCaps = {}
+): boolean {
   if (!isPermissionMode(mode)) return false
-  // `manual` — "ask each time" — is reachable on every capable agent, but for two different reasons,
-  // which is why the table is not its authority: claude/grok/gemini get there by emitting NO flag
-  // (their own default already prompts), and codex gets there through `untrusted`, because its
-  // default does not. Either way the promise holds; an agent whose CLI could offer neither would
-  // need this early return revisited.
-  if (mode === 'manual') return hasPermissionMode(agentId)
   const dialect = dialectFor(agentId)
-  if (dialect) return Object.hasOwn(dialect.modes, mode)
-  return hasPermissionMode(agentId)
+  // claude and grok speak our own vocabulary and their defaults prompt: every mode is reachable.
+  if (!dialect) return hasPermissionMode(agentId)
+  // `manual` — "ask each time" — is reached two different ways, which is why the table alone is
+  // not its authority: by emitting NO flag on a CLI whose own default already prompts
+  // (`manualIsDefault`: claude, grok, gemini), or by emitting a value that means it (codex's
+  // `untrusted`). An agent that can do NEITHER cannot keep the promise, and this is where that is
+  // admitted — codex >= 0.149.0 is exactly that case, and it is why this early return stopped
+  // being an unconditional `true`.
+  if (mode === 'manual')
+    return dialect.manualIsDefault || emittableValue(dialect, 'manual', caps) !== undefined
+  return emittableValue(dialect, mode, caps) !== undefined
 }
 
 /**
@@ -113,11 +224,15 @@ export function modeSupported(agentId: AgentId, mode: AgentPermissionMode): bool
  * indexes a plain-object table and hands back a Function — one that would have been stringified
  * onto a tmux `send-keys` line. (`dialectFor` closes the same hole on the agent id.)
  */
-export function approvalFlags(agentId: AgentId, mode: AgentPermissionMode): string[] {
+export function approvalFlags(
+  agentId: AgentId,
+  mode: AgentPermissionMode,
+  caps: ApprovalCaps = {}
+): string[] {
   if (!isPermissionMode(mode)) return []
   const dialect = dialectFor(agentId)
   if (dialect) {
-    const value = dialect.modes[mode]
+    const value = emittableValue(dialect, mode, caps)
     return value ? [dialect.flag, value] : []
   }
   // claude + grok keep their exact historical spelling, validated at the interpolation site.
@@ -153,8 +268,13 @@ export function approvalFlags(agentId: AgentId, mode: AgentPermissionMode): stri
  * A command with no override cannot reach the suppression — nodeterm builds it and never puts the
  * flag in twice — so every existing launch line is byte-identical.
  */
-export function withPermissionMode(cmd: string, id: AgentId, mode: AgentPermissionMode): string {
-  const flags = approvalFlags(id, mode)
+export function withPermissionMode(
+  cmd: string,
+  id: AgentId,
+  mode: AgentPermissionMode,
+  caps: ApprovalCaps = {}
+): string {
+  const flags = approvalFlags(id, mode, caps)
   if (!flags.length) return cmd
   if (argvHasFlag(cmd, flags[0])) return cmd
   return `${cmd} ${flags.join(' ')}`
@@ -191,6 +311,9 @@ export function permissionModeAgentsLabel(opts?: PermissionModeAgentFilter): str
 interface PermissionModeAgentFilter {
   mode?: AgentPermissionMode
   exclude?: readonly AgentId[]
+  /** What the target CLIs accept, so a "which agents support this mode?" answer is about the CLIs
+   *  the user actually has. Omitted = the baseline, exactly as everywhere else in this file. */
+  caps?: ApprovalCaps
 }
 
 /**
@@ -203,7 +326,8 @@ interface PermissionModeAgentFilter {
 export function permissionModeAgentIds(opts?: PermissionModeAgentFilter): AgentId[] {
   return PERMISSION_MODE_CAPABLE.filter(
     (id) =>
-      !opts?.exclude?.includes(id) && (opts?.mode === undefined || modeSupported(id, opts.mode))
+      !opts?.exclude?.includes(id) &&
+      (opts?.mode === undefined || modeSupported(id, opts.mode, opts.caps ?? {}))
   )
 }
 
@@ -212,16 +336,23 @@ export function permissionModeAgentIds(opts?: PermissionModeAgentFilter): AgentI
  * happens instead. Empty string when there is nothing to admit — so the caller appends it blindly
  * and the sentence disappears by itself the day a CLI grows the missing mode.
  */
-export function unsupportedModesNote(): string {
+export function unsupportedModesNote(caps: ApprovalCaps = {}): string {
   return PERMISSION_MODE_CAPABLE.map((id) => ({
     label: agentLabel(id),
-    gaps: ALL_PERMISSION_MODES.filter((m) => !modeSupported(id, m))
+    gaps: ALL_PERMISSION_MODES.filter((m) => !modeSupported(id, m, caps)),
+    // Only rendered when `manual` is among the gaps — see below. A generic "starts in its own
+    // default" is honest for Plan and Accept edits (nothing was promised about what the default
+    // does), but it is NOT enough for "Ask each time": the user picked a promise about every
+    // single action, and codex's default keeps none of it. The sentence lives on the dialect so
+    // it can only be written where the behaviour it describes is.
+    manualGap: dialectFor(id)?.manualGapNote
   }))
     .filter((a) => a.gaps.length > 0)
-    .map(({ label, gaps }) => {
+    .map(({ label, gaps, manualGap }) => {
       const modes = joinAnd(gaps.map((m) => PERMISSION_MODE_LABELS[m]))
       const verb = gaps.length > 1 ? 'have' : 'has'
-      return `${modes} ${verb} no ${label} equivalent, so ${label} sessions start in ${label}'s own default.`
+      const head = `${modes} ${verb} no ${label} equivalent, so ${label} sessions start in ${label}'s own default.`
+      return gaps.includes('manual') && manualGap ? `${head} ${manualGap}` : head
     })
     .join(' ')
 }
@@ -236,8 +367,8 @@ const SANDBOX_RETAINED: readonly AgentId[] = ['codex']
 
 /** The clause a "Bypass all" warning owes, so "no permission checks" is not read as "no sandbox
  *  either". Empty string when it applies to nobody. */
-export function bypassSandboxCaveat(): string {
-  const ids = permissionModeAgentIds({ mode: 'bypassPermissions' }).filter((id) =>
+export function bypassSandboxCaveat(caps: ApprovalCaps = {}): string {
+  const ids = permissionModeAgentIds({ mode: 'bypassPermissions', caps }).filter((id) =>
     SANDBOX_RETAINED.includes(id)
   )
   if (!ids.length) return ''

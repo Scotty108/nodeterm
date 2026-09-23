@@ -86,17 +86,18 @@ import { findExecutableSync, findInPathString, resolveShellPath, shellPathNow } 
 import {
   AUTH_ENV_STRIP,
   accountTmuxEnvArgs,
-  isReservedSpawnEnvKey,
-  remoteAccountConfigDirAbs
+  isReservedSpawnEnvKey
 } from './claude-accounts-core'
 import {
   AUTH_ENV_STRIP as CODEX_AUTH_ENV_STRIP,
   codexSessionEnv,
   isCodexScopeRefusal,
+  isSafeAccountId,
   needsCodexAccountScope,
   resolveCodexSessionScope
 } from './codex-accounts-core'
-import { NODE_ID_MAX, isSafeNodeId } from './remote-safety'
+import { NODE_ID_MAX, isSafeNodeId, isSafeRemoteHome } from './remote-safety'
+import { remoteAccountScopeEnvArgs } from './remote-account-env'
 import { presenceHub } from './presence/hub'
 import {
   codexLauncherDir,
@@ -1773,15 +1774,15 @@ export class PtyManager {
     )
     platform().handle(IPC.ptyTmuxStatus, () => this.tmuxStatus())
     platform().handle(IPC.ptyPaneCommand, (persistKey: string) => this.paneCommand(persistKey))
+    // Registered HERE, beside its name-only sibling, rather than in either shell: core owns both
+    // reads, so the desktop and the Server Edition are served by one line and cannot drift.
+    platform().handle(IPC.ptyPaneOwner, (persistKey: string) => this.paneOwner(persistKey))
     platform().handle(IPC.ptyTerminateForeground, (persistKey: string, expectedAgentId?: string) =>
       this.terminateForeground(persistKey, expectedAgentId)
     )
   }
 
-  /** Feeds the renderer's "tmux not found" banner. Without tmux the app silently degrades to a
-   *  plain shell (no cross-restart continuity, no mobile attach) — users never discover that on
-   *  their own, so the banner surfaces it with a one-click install command when a known package
-   *  manager is present (run in a terminal node, gh-sign-in style). */
+  /** Discover the backend for NEW local terminals without starting a session host. */
   tmuxStatus(): TmuxStatus {
     // Re-probe when unavailable: the banner polls this while its install command runs, and a
     // successful probe here is what makes new sessions tmux-backed without a restart.
@@ -1789,12 +1790,19 @@ export class PtyManager {
     const available = !!this.tmuxPath
     const hint = available
       ? null
-      : tmuxInstall(process.platform, (cmd) => findCommand(cmd, process.env, fs.existsSync))
+      : tmuxInstall(this.runtimePlatform, (cmd) => findCommand(cmd, process.env, fs.existsSync))
     return {
       available,
       installCommand: hint?.command ?? null,
       installLabel: hint?.label ?? null,
-      platform: process.platform
+      platform: this.runtimePlatform,
+      persistence: {
+        enabled: this.getSettings().tmuxEnabled,
+        backend:
+          this.runtimePlatform !== 'win32' && available
+            ? 'tmux'
+            : sessionHostSupported() ? 'session-host' : null
+      }
     }
   }
 
@@ -2142,18 +2150,27 @@ export class PtyManager {
     if (options.requireRemote && !(options.sshRemote && options.persistKey && findSsh())) {
       return { sessionId: '', fresh: false, unavailable: 'ssh' }
     }
-    // FAIL-CLOSED Codex account scope (S6 §5 property 4 / Decision 2, the carried PR-1 obligation).
-    // A LOCAL Codex spawn that EXPLICITLY selected a managed account whose home is missing REFUSES
-    // here — it must never fall through and spawn against the SYSTEM `~/.codex` (silently acting as
-    // the wrong login is a worse failure for an explicit switch than for a first spawn). This is
-    // deliberately STRICTER than the Claude account path below, which falls back with a warning
-    // chip. `resolveCodexSessionScope` returns `{ unavailable: 'codex-account' }` for exactly that
-    // case; we map it straight through to a real refusal and spawn NOTHING. The system account (no
-    // id) always resolves. Remote (ssh) Codex sessions carry their account env via tmux `-e`.
-    if (needsCodexAccountScope(options.agentId, options.accountId, (id) => this.isCodexAccount(id)) && !options.sshRemote) {
-      const scope = resolveCodexSessionScope(platform().userDataDir, options.accountId)
-      if (isCodexScopeRefusal(scope)) {
-        return { sessionId: '', fresh: false, unavailable: 'codex-account' }
+    // A managed remote Codex account needs a known id and a safe resolved home so the
+    // remote env builder can supply its private CODEX_HOME. Otherwise a fresh spawn would
+    // silently use the host's system login. Agent-less login terminals use this same gate.
+    if (needsCodexAccountScope(options.agentId, options.accountId, (id) => this.isCodexAccount(id))) {
+      if (options.sshRemote) {
+        if (
+          options.accountId &&
+          (!isSafeAccountId(options.accountId) ||
+            !this.isCodexAccount(options.accountId) ||
+            !isSafeRemoteHome(options.sshRemote.remoteHome))
+        ) {
+          return { sessionId: '', fresh: false, unavailable: 'codex-account' }
+        }
+        if (!options.persistKey || !findSsh()) {
+          return { sessionId: '', fresh: false, unavailable: 'ssh' }
+        }
+      } else {
+        const scope = resolveCodexSessionScope(platform().userDataDir, options.accountId)
+        if (isCodexScopeRefusal(scope)) {
+          return { sessionId: '', fresh: false, unavailable: 'codex-account' }
+        }
       }
     }
     // A tmux-backed session is "fresh" (cold start) when no live session exists to reattach to
@@ -2495,11 +2512,35 @@ export class PtyManager {
    * Same fail-safe direction as everywhere else here: an unprobeable tmux answers "exists", so
    * the caller treats it as a warm join and types nothing into it.
    */
+  /**
+   * Would this machine ever SELECT the session-host backend? The same predicate the spawn path uses
+   * (win32, or no local tmux, with the setting on and the bundle present), lifted out so the
+   * read-only queries can ask it too.
+   *
+   * They have to: `hasSession` / `listSessions` go through `request()`, and `request()` is what
+   * establishes the connection on a cold client — so an existence probe SPAWNS a host. Before
+   * #579 that was invisible, because no packaged build had a bundle to spawn. Once it ships, an
+   * unguarded probe would start a session-host process on a tmux-backed Mac that can never choose
+   * it.
+   */
+  private hostBackendEligible(): boolean {
+    return (
+      (this.runtimePlatform === 'win32' || !this.tmuxPath) &&
+      this.getSettings().tmuxEnabled &&
+      sessionHostSupported()
+    )
+  }
+
   async sessionExists(persistKey: string): Promise<boolean> {
     if (this.liveSessionForPersistKey(persistKey)) return true
     const probes: Promise<boolean>[] = []
     if (this.tmuxPath) probes.push(this.tmuxSessionExists(persistKey))
-    if (this.getSettings().tmuxEnabled && sessionHostSupported()) {
+    // Same "would this machine ever choose the host backend" predicate the spawn path uses, and it
+    // has to be here rather than only there: `hasSession` goes through `request()`, which
+    // ESTABLISHES the connection on a cold client — so an existence probe SPAWNS a host. Without
+    // the guard, a tmux-backed Mac would start a session-host process it can never select, purely
+    // by being asked whether a session exists.
+    if (this.hostBackendEligible()) {
       // A failed host read is not evidence of absence. This mirrors tmuxSessionExists' fail-safe
       // direction and prevents a reconnect blip from being mistaken for a cold generation.
       probes.push(sessionHostHasSession(sessionName(persistKey)).catch(() => true))
@@ -3035,10 +3076,15 @@ export class PtyManager {
       // ABSOLUTE — tmux copies `-e` values verbatim (no `$HOME`/`~` expansion) — so we build it from
       // the connection's resolved remote $HOME. Fail-open: an unknown remoteHome (home resolution
       // failed on connect) skips the account env and the session runs under the remote `~/.claude`.
-      const remoteAccountEnv =
-        options.accountId && options.sshRemote.remoteHome
-          ? accountTmuxEnvArgs(remoteAccountConfigDirAbs(options.sshRemote.remoteHome, options.accountId))
-          : []
+      // Routed by PROVIDER. spawnNew refuses managed Codex until remote validation/hooks
+      // are wired. System Codex retains the host defaults, including before home discovery
+      // during early attach; never guess a credential directory from the local environment.
+      const remoteAccountEnv = remoteAccountScopeEnvArgs({
+        agentId: options.agentId,
+        accountId: options.accountId,
+        remoteHome: options.sshRemote.remoteHome,
+        isCodexAccount: (id) => this.isCodexAccount(id)
+      })
       // Custom-agent env for a REMOTE node: expand ${env:VAR} against the LOCAL process env (the
       // key stays local; only the resolved VALUE travels over SSH). PATH is skipped — the local
       // machine can't see the remote box's PATH, so a locally-resolved PATH would break CLI
@@ -4483,10 +4529,11 @@ export class PtyManager {
           )
           .catch(() => [] as string[])
       : Promise.resolve([] as string[])
-    const hostSessions =
-      this.getSettings().tmuxEnabled && sessionHostSupported()
-        ? sessionHostListSessions().catch(() => [] as string[])
-        : Promise.resolve([] as string[])
+    // Guarded for the same reason as `sessionExists`: listing is a request, and a request on a cold
+    // client spawns the host.
+    const hostSessions = this.hostBackendEligible()
+      ? sessionHostListSessions().catch(() => [] as string[])
+      : Promise.resolve([] as string[])
     const [tmux, host] = await Promise.all([tmuxSessions, hostSessions])
     return [...new Set([...tmux, ...host])]
   }

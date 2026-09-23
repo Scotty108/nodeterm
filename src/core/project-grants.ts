@@ -60,12 +60,15 @@ export function clearAll(): void {
   grants.clear()
 }
 
-/** The open verbs that accept `--project` (spec §2.2). Only these three — `--project` on any
- *  other verb is dead weight the gate deliberately ignores (spec §7.5). */
+/** The verbs that accept `--project` (spec §2.2): the three open verbs, plus `settings`, whose
+ *  per-project keys (@shared/settings-verb) may name a project other than the caller's — own or
+ *  granted only, the same rule, decided here before anything is forwarded. `--project` on any other
+ *  verb is dead weight the gate deliberately ignores (spec §7.5). */
 export const PROJECT_TARGETABLE_VERBS: ReadonlySet<string> = new Set([
   'open-terminal',
   'open-claude',
-  'open-agent'
+  'open-agent',
+  'settings'
 ])
 
 /** The flat refusal an UNVERIFIED caller's `--project` gets — one sentence, no diagnosis, no

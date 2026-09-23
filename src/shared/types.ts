@@ -5,6 +5,7 @@ import { DEFAULT_WORKTREE_PATH_TEMPLATE } from './worktree'
 import type { CloneProgress } from './clone-url'
 import type { KeybindingOverrides, TerminalShortcutPolicy } from './keybindings'
 import type { NormalizedAgentEvent } from './agents/normalize'
+import type { PaneOwner } from './agents/pane-owner-predicate'
 import type { AgentId, AgentPermissionMode, BuiltinAgentId, PromptInjectionMode } from './agents/config'
 import type { ControlConfirmWaivers } from './control-confirm'
 import type { AgentMessageDeliverRequest, AgentMessageReply } from './agents/agent-messaging'
@@ -306,7 +307,8 @@ export interface PtyCreateResult {
    *
    * `'codex-account'` is the S6 fail-closed twin: a LOCAL Codex node that explicitly selected a
    * managed account whose home is missing refuses rather than spawning against the system login
-   * (§5 property 4). Same contract — nothing spawned, the renderer shows the node's refusal.
+   * (§5 property 4). Remote managed Codex accounts refuse unknown/unsafe ids or unresolved/unsafe homes.
+   * System SSH Codex may attach before remote home discovery. Nothing spawned on refusal.
    */
   unavailable?: 'ssh' | 'codex-account'
 }
@@ -336,6 +338,10 @@ export type NodeKind = 'terminal' | 'sticky' | 'group' | 'editor' | 'diff' | 'vi
  * a stalled station must never be a dead end.
  */
 export interface PendingLaunch {
+  /** false proves no input attempt; true/absent require explicit recovery after reload. */
+  attempted?: boolean
+  /** An attempted/uncertain delivery requires explicit Run now; never replay on hooks. */
+  manualOnly?: boolean
   /**
    * Node ids to wait for. Only nodes running a hook-reporting agent may appear here — a plain
    * terminal never reports `done`, so waiting on one would stall forever (refused at creation).
@@ -786,6 +792,12 @@ export interface Project {
    *  rules as `agentBrowserControl` above — git-shared hostile input, strict `=== true` read,
    *  never a grant without this machine's recorded 'kept' (`projectCapabilityGrantedFor`). */
   agentMessaging?: boolean
+  /** Per-project capability switch: agents may file a GitHub issue in THIS project's repository
+   *  when they hit a nodeterm gap. Same rules as the two above — git-shared hostile input, strict
+   *  `=== true` read, never a grant without this machine's recorded 'kept'
+   *  (`projectCapabilityGrantedFor`). Unlike them, what it grants is PUBLICATION: the text leaves
+   *  the machine, so the copy in `PROJECT_CAPABILITY_COPY` says so in as many words. */
+  agentIssueReporting?: boolean
   /**
    * MACHINE-LOCAL record of what this machine's user ANSWERED for each capability switch —
    * 'kept' or 'declined', not a bare bit, because a declined switch whose hostile `true`
@@ -885,9 +897,12 @@ export const EMPTY_WORKSPACE: Workspace = {
 
 // ---- Contract for the API exposed to the renderer via preload ----
 
-/** Wire shape of pty:tmux-status — behind the "tmux not found" banner. */
+/** Local core backend discovery, not a runtime health check or a promise about existing sessions. */
 export interface TmuxStatus {
+  /** tmux discovery only; retained for older callers and install polling. */
   available: boolean
+  /** Absent on older peers; null when discovery could not be read. */
+  persistence?: { enabled: boolean; backend: 'tmux' | 'session-host' | null } | null
   /** One-shot install command for a terminal node; null = no known installer (text-only banner). */
   installCommand: string | null
   /** Button caption for installCommand (e.g. "Install Homebrew + tmux" when brew must come first). */
@@ -1000,6 +1015,11 @@ export interface PtyApi {
    *  node persistKey. null when it is unknown — no session, no tmux, or the query failed — which
    *  callers must read as "not observed", never as evidence of a particular command. */
   paneCommand(persistKey: string): Promise<string | null>
+  /** Kernel truth about a node's pane — its root pid, tty, tmux pane id and the full argv of its
+   *  foreground process group — so a caller can ask WHO owns the pane rather than what tmux calls
+   *  it. `null` is "could not read", never evidence that the pane is free (see `isAgentPane`'s
+   *  three-valued verdict, which is what consumers should decide on). */
+  paneOwner(persistKey: string): Promise<PaneOwner | null>
   /** Terminate the foreground process group in a node's pane. Returns false when the pane/process
    *  cannot be safely identified; it never kills the pane's login shell. When `expectedAgentId` is
    *  given, the kill happens only if that harness actually owns the foreground group (argv-verified)
@@ -1590,6 +1610,13 @@ export interface Settings {
   /** Minutes a terminal may sit fully offscreen before its xterm+PTY client is torn down in
    *  place (tmux keeps the session; re-approach reattaches and redraws). 0 = never. */
   offscreenTerminalMinutes: number
+  /** Minutes a terminal stays PARKED after its project is switched away — xterm + PTY client kept
+   *  alive off-DOM so switching back is instant and exact (no reattach). 0 = until the app quits.
+   *  Default 5. Hand-editable; re-validated at the use site (`parkWindowMs`). Issue #886. */
+  terminalParkMinutes: number
+  /** Max parked terminals across all projects before the oldest (local first, then remote) are
+   *  released early. Default 20. Re-validated at the use site (`parkCap`). Issue #886. */
+  terminalParkMax: number
   /** AI commit message agent: a local coding-agent CLI run read-only. */
   commitAgent: 'claude' | 'codex' | 'custom'
   /** For commitAgent='custom': command template; {prompt} placeholder optional (else stdin). */
@@ -1684,6 +1711,15 @@ export interface Settings {
    *  Scheduled/loop agents and sessions with live subagents are never touched
    *  (renderer/terminal/hibernation-policy.ts explains why). */
   agentHibernationEnabled: boolean
+  /**
+   * Agent messaging for a project whose `.nodeterm/project.json` carries NO `agentMessaging` value
+   * (@shared/project-capabilities, CAPABILITY_MACHINE_DEFAULTS). MACHINE-LOCAL on purpose: it is
+   * this machine's user deciding for their own unconfigured projects, which is why it may answer
+   * without a clone notice — while an explicit `true` in a cloned file still needs one, and an
+   * explicit `false` still wins. Read strictly (`=== true`). Never settable from the canvas CLI
+   * (@shared/settings-verb forbids it): it is a grant over every project at once.
+   */
+  agentMessagingDefault: boolean
   /** How long a session must be idle + offscreen before "Eco" hibernates it (minutes). */
   agentHibernationIdleMinutes: number
   /** When Eco hibernates a session, also mark it PAUSED (see `AgentNodeStatus.paused`) so it does
@@ -1854,6 +1890,8 @@ export const DEFAULT_SETTINGS: Settings = {
   tmuxScrollback: 50000,
   tmuxLeadPaneWidth: 0,
   offscreenTerminalMinutes: 10,
+  terminalParkMinutes: 5,
+  terminalParkMax: 20,
   commitAgent: 'claude',
   commitAgentCommand: '',
   commitExtraPrompt: '',
@@ -1900,6 +1938,10 @@ export const DEFAULT_SETTINGS: Settings = {
   // Opt-in: hibernation exits a live CLI, so nobody gets it without asking. The 30-minute floor
   // is deliberately long — shorter windows exit sessions the user is between turns on.
   agentHibernationEnabled: false,
+  // OFF until the cross-restart pane-ownership proof lands: messaging refuses every pane that
+  // survived an app restart (core/agents/pane-ownership.ts), so "on by default" would be false
+  // after every restart and every update. Flipping this is a separate, deliberate change.
+  agentMessagingDefault: false,
   agentHibernationIdleMinutes: 30,
   agentHibernationPersistAcrossRestart: false,
   // Opt-out (default on). Existing users pick this up on hydrate ONLY if their settings.json has
@@ -1982,6 +2024,8 @@ export type SshProjectStatus = 'connecting' | 'connected' | 'disconnected' | 're
  * Absent = not probed / nothing new ⇒ the renderer keeps omitting the `auto` flag (fail-open).
  */
 export interface SshProjectStatusEvent {
+  /** Hook-only health update; it does not imply an SSH reconnect or terminal restart. */
+  hookTunnelVerified?: boolean
   projectId: string
   status: SshProjectStatus
   error?: string
@@ -2311,6 +2355,12 @@ export interface UpdateApi {
   onError(listener: (message: string) => void): () => void
   /** No newer version is available (also the dev no-op reply to check()). Returns unsubscribe. */
   onNotAvailable(listener: () => void): () => void
+  /**
+   * This build has no update channel and can never learn whether a newer version exists
+   * (issue #814). Deliberately separate from `onNotAvailable`: "we looked and you are current"
+   * and "we cannot look" are different facts with different remedies. Returns unsubscribe.
+   */
+  onNoChannel(listener: () => void): () => void
   /** Trigger a manual update check. */
   check(): void
   /** The running app version. */
@@ -2427,9 +2477,18 @@ export interface UsageLimit {
  * One provider's usage snapshot. `ClaudeUsage` below is the Claude-shaped superset kept for the
  * existing pill; new providers use this leaner shape (they have no per-account story yet).
  */
+/** Safe billing diagnostics: never include URLs, response bodies, or exception messages. */
+export type UsageDiagnostic = {
+  view: 'credits' | 'default'
+} & ({ reason: 'http'; httpStatus: number } | {
+  reason: 'timeout' | 'network' | 'invalid-response'
+})
+
 export interface ProviderUsage {
   /** Agent id the limits belong to: 'claude' | 'codex' | … */
   provider: string
+  /** Failed billing views, including failures recovered by a successful fallback. */
+  diagnostics?: UsageDiagnostic[]
   limits: UsageLimit[]
   /** Signed-in identity, when the provider exposes one cheaply (email / account label). */
   account: string | null
@@ -2540,6 +2599,14 @@ export interface SessionMemoryApi {
   host(q?: SessionMemoryQuery): Promise<MemInfo | null>
 }
 
+/** Best-effort active organization from this account's Claude identity file. */
+export interface ClaudeUsageOrganization {
+  name: string
+  uuid?: string
+  type?: string
+  rateLimitTier?: string
+}
+
 /** Claude Code subscription usage snapshot for the bottom-left indicator. */
 export interface ClaudeUsage {
   /**
@@ -2551,6 +2618,8 @@ export interface ClaudeUsage {
   weekly: ClaudeUsageWindow | null
   /** Signed-in account email, read-only and best-effort (null if unknown). */
   email: string | null
+  /** Active organization, absent when its metadata is unavailable. */
+  organization?: ClaudeUsageOrganization
   /** Unix ms when this snapshot was produced. */
   updatedAt: number
   /**
@@ -2612,6 +2681,8 @@ export interface UsageApi {
 
 /** A Claude session's context-window fill, pushed per sessionId from the transcript tailer. */
 export interface ContextWindowUsage {
+  /** Missing on older hosts; only session-env is an observed Claude configuration. */
+  windowSource?: 'session-env' | 'transcript' | 'estimate'
   sessionId: string
   /** input + cache_read + cache_creation tokens of the latest assistant message. */
   usedTokens: number
@@ -2628,12 +2699,27 @@ export interface ContextApi {
   /** Fires whenever a session's context fill changes. Returns unsubscribe. */
   onUpdate(listener: (usage: ContextWindowUsage) => void): () => void
   /**
-   * Ask main to start (or refresh) tracking a session's transcript so the meter populates
+   * Ask the core to start (or refresh) tracking a session's transcript so the meter populates
    * without waiting for a live hook event — e.g. on node mount after an app restart, when
    * the continuing session is idle. `cwd` is a transcript-path fallback only.
    * `accountId` scopes resolution to a managed Claude account's transcript root (default `~/.claude`).
+   *
+   * `nodeId` and `agentId` are what make this work for anything but a LOCAL CLAUDE node, and both
+   * are load-bearing rather than informational (see `core/context-ensure.ts`):
+   * - `nodeId` is the only way to learn that this session runs on an SSH project's HOST, whose
+   *   transcript no local resolver can see. Without it a remote node's meter stayed blank until
+   *   its next turn, every app restart.
+   * - `agentId` routes the resolve to THAT agent's own locator and tail. Claude's resolver falls
+   *   back to the newest claude transcript for the cwd, so resolving a codex/gemini session through
+   *   it would meter a stranger's conversation. Both omitted ⇒ the legacy local-claude behaviour.
    */
-  ensure(sessionId: string, cwd?: string, accountId?: string): void
+  ensure(
+    sessionId: string,
+    cwd?: string,
+    accountId?: string,
+    nodeId?: string,
+    agentId?: string
+  ): void
 }
 
 /**
@@ -2772,7 +2858,29 @@ export interface ClaudeAccountsApi {
    * (the account's `skills/` resolves to the system one) and `failed` (an EPERM, a vanished skill).
    */
   setSkillSharing(id: string, enabled: boolean): Promise<ClaudeSkillShareResult>
+  /**
+   * Copy a conversation's transcript from one LOCAL account's config dir into another's (`undefined`
+   * = the system `~/.claude`), so a node switched onto the target account resumes the SAME
+   * conversation there with no `/login`. With an SSH `ctx` the same copy runs on that project's host,
+   * between REMOTE accounts pinned to it. Called only after the CLI has exited. Never overwrites a
+   * diverged copy (`diverged`); never throws — every refusal is a reason.
+   */
+  copySession(
+    sessionId: string,
+    sourceAccountId: string | undefined,
+    targetAccountId: string | undefined,
+    /** An SSH project's node: the copy runs ON THAT HOST, between its remote account dirs. */
+    ctx?: AccountSshCtx
+  ): Promise<ClaudeSessionCopyResult>
 }
+
+/** What `claudeAccounts.copySession` did. `copied: false` = the target already held this exact copy. */
+export type ClaudeSessionCopyResult =
+  | { ok: true; copied: boolean }
+  | {
+      ok: false
+      reason: 'bad-request' | 'unknown-account' | 'no-transcript' | 'diverged' | 'failed'
+    }
 
 /** What one `setSkillSharing` / launch reconcile did. Counts, never an exception. */
 export interface ClaudeSkillShareResult {
@@ -2800,22 +2908,26 @@ export interface ClaudeSkillShareResult {
  */
 export interface CodexAccountsApi {
   /** Mint a new managed account: create its private CODEX_HOME (0700) and symlink the shared,
-   *  non-secret runtime assets in. Returns the new id + its home. */
-  add(): Promise<{ id: string; home: string }>
+   *  non-secret runtime assets in. Returns the new id + its home. With an SSH `ctx` the home is
+   *  created ON that connected host (no credential ever travels); throws when it cannot be. */
+  add(ctx?: AccountSshCtx): Promise<{ id: string; home: string }>
   /** Poll the account's `auth.json` (a real file, never a symlink) every 2s up to 5min for a
-   *  completed device login, then read its email; null on timeout/cancel. */
-  waitLogin(id: string): Promise<{ email: string | null } | null>
+   *  completed device login, then read its email; null on timeout/cancel. With an SSH `ctx` the poll
+   *  runs on the host, and a login whose email cannot be read there resolves `{ email: null }`. */
+  waitLogin(id: string, ctx?: AccountSshCtx): Promise<{ email: string | null } | null>
   /** Cancel an in-flight `waitLogin` for this account. */
   cancelWaitLogin(id: string): Promise<void>
-  /** Read a managed account's already-logged-in identity (email), or null if not logged in. */
-  identity(id: string): Promise<{ email: string | null } | null>
+  /** Read a managed account's already-logged-in identity (email), or null if not logged in. With an
+   *  SSH `ctx`, asked of the account's home on that host. */
+  identity(id: string, ctx?: AccountSshCtx): Promise<{ email: string | null } | null>
   /** Read a machine's system (`~/.codex`) account identity. No arg ⇒ this Mac. `{ projectId }` ⇒
    *  the connected SSH host behind that project; a host whose system identity cannot be resolved
    *  resolves `null` (fail-closed — a remote machine panel never borrows this Mac's login). */
   systemIdentity(ctx?: { projectId?: string }): Promise<{ email: string | null } | null>
   /** Remove a managed account: stop its daemon and delete its home. Refused while a switch
-   *  reservation holds it or a concurrent removal is in flight (Property 10). */
-  remove(id: string): Promise<void>
+   *  reservation holds it or a concurrent removal is in flight (Property 10). With an SSH `ctx`,
+   *  the home is deleted on that host; throws when it could not be. */
+  remove(id: string, ctx?: AccountSshCtx): Promise<void>
   /** Phase 1 of the owner-authorized same-machine switch: plan + reserve the rollout exposure of a
    *  conversation from one account to another under a `rollbackToken` (TTL 60s, owner = caller). */
   switchThread(
@@ -2928,6 +3040,27 @@ export const UNKNOWN_CLAUDE_CLI_CAPS: ClaudeCliCaps = {
   sessionIdFlag: false
 }
 
+/**
+ * What the LOCAL `codex` binary can do, read from its own `--help` — see `core/codex-cli.ts`.
+ *
+ * Separate from `CodexIdentityCaps` on purpose, because the two have OPPOSITE Server Edition
+ * answers: shared identity is declined there deliberately (a constant `false`), while the
+ * approval vocabulary must be probed for real — the server's own machine is the one that runs its
+ * Codex sessions. Folding them into one bag would have made the honest answer to one question the
+ * silent absence of the other.
+ */
+export interface CodexCliCaps {
+  /** The values this `codex` advertises for `--ask-for-approval`. `null` = not probed, no codex on
+   *  PATH, or a help page we could not read — all of which mean "use the baseline vocabulary", not
+   *  "this CLI accepts nothing". Measured: 0.146.0–0.148.0 list `untrusted, on-request, never`;
+   *  0.149.0+ list `on-request, never`. */
+  approvalValues: string[] | null
+}
+
+/** The answer before the probe has run, and for any surface that cannot speak for the CLI that will
+ *  actually run the session (a relay tab, an SSH host). */
+export const UNKNOWN_CODEX_CLI_CAPS: CodexCliCaps = { approvalValues: null }
+
 /** Whether a Codex node launched on this machine right now would get a managed shared identity.
  *  Fed by core/codex-identity-caps.ts; the unknown answer is `false`, i.e. plain `codex`. */
 export interface CodexIdentityCaps {
@@ -2969,6 +3102,9 @@ export interface CodexApi {
   /** Would a Codex node launched right now get a managed shared identity on this machine?
    *  Never rejects — the unknown answer is `{ shared: false }`, i.e. plain `codex`. */
   identityCaps(): Promise<CodexIdentityCaps>
+  /** What the local Codex CLI accepts, so a launch line only carries flag values this binary
+   *  actually has. Never rejects — the unknown answer is `UNKNOWN_CODEX_CLI_CAPS`. */
+  cliCaps(): Promise<CodexCliCaps>
   /** Fires when a Codex node's launcher reports its identity mode. `plain` is the fallback, and
    *  this event is what stops that fallback being silent. Returns unsubscribe. */
   onIdentity(listener: (e: CodexIdentityEvent) => void): () => void
@@ -3033,8 +3169,14 @@ export interface LicenseStatus {
   /** 'pro' when entitled, else null. */
   tier: string | null
   active: boolean
-  /** Unix seconds when the entitlement expires, or null. */
+  /** Unix seconds when the entitlement TOKEN expires, or null — the offline grace window (the server
+   *  mints 7-day tokens and the app re-mints every 6 h, so this rolls forward forever). It is NOT
+   *  when the subscription ends and must never be shown as that; see `termEndsAt` (issue #800). */
   expiresAt: number | null
+  /** Unix seconds when the current subscription term ends, as the server stated it beside the token,
+   *  or null. Null is a first-class answer — a lifetime entitlement, a license with no expiry, or a
+   *  server that does not send the field yet — and renders as no date at all. Display only. */
+  termEndsAt: number | null
   /** Seat cap for the relay host (Team Access): premium → the token's seats (absent → 1), free/inactive → 0. */
   seats: number
   /** Last activation/refresh error reason code, or null. */
@@ -3092,6 +3234,10 @@ export interface LicenseApi {
   releaseOthers(): Promise<LicenseDetail>
 }
 
+export type PhoneApprovalResult = {
+  status: 'persisted' | 'approved' | 'saved-disconnected' | 'stale' | 'persistence-failed'
+}
+
 export interface RemoteHostApi {
   /**
    * Enter host mode: mint a pairing token, connect to the relay as the host, and return the
@@ -3117,16 +3263,17 @@ export interface RemoteHostApi {
    * verification code to display. Returns an unsubscribe function.
    */
   onPeerPending(
-    listener: (info: { sas: string | null; id: string; pub?: string | null }) => void
+    listener: (info: { sas: string | null; id: string; pub?: string | null; standing?: boolean }) => void
   ): () => void
   /** The pending prompt expired host-side (120 s) — the dialog must drop or re-arm, else its
    *  Approve is a silent no-op against a dead id (issue #372). */
   onPeerPendingCleared(
     listener: (info: { id: string | null; pub?: string | null }) => void
   ): () => void
-  /** Approve the pending client → the host begins serving its pty/fs RPCs. `pub` (the peer's
-   *  stable box key) survives the phone's reconnect churn where the per-attach `id` does not —
-   *  pass both when known. */
+  /** Standing phone consent: persist the displayed handshake identity before granting access.
+   *  Both fields must match a bounded pending request. Desktop-only; Server rejects explicitly. */
+  approvePhone(id: string, pub: string): Promise<PhoneApprovalResult>
+  /** Legacy interactive (single-use offer) approval; does not persist a device pin. */
   approve(id: string, pub?: string): void
   /** Reject the pending client → the connection is dropped. Same id/pub matching as approve. */
   reject(id: string, pub?: string): void
@@ -3271,11 +3418,28 @@ export interface DeviceRevokeResult {
 /** Phone-pairing (nodeterm iOS "scan a QR" flow) bridge. */
 export interface PairingApi {
   /** Start the one-shot LAN listener; resolves with the QR payload + an SSH-reachable hint. */
-  start(): Promise<{ payload: string; sshOpen: boolean; relayPlan?: 'ok' | 'dev' | 'off' }>
+  start(): Promise<{
+    payload: string
+    sshOpen: boolean
+    relayPlan?: 'ok' | 'dev' | 'off'
+    /** false = relay-only host (Windows): no SSH key is installed and the QR waits for the relay,
+     *  not sshd (`pairingGate`). Absent from an older main process ⇒ treat as true. */
+    sshKey?: boolean
+    /** Windows only, explanation only: which authorized_keys file sshd reads for this account. */
+    windowsKeyFile?: 'administrators' | 'profile' | 'unknown'
+  }>
   /** Cancel an in-flight pairing (e.g. when the settings section unmounts). */
   stop(): Promise<void>
-  /** Fires once when pairing finishes (ok=true paired, ok=false timeout). Returns unsubscribe. */
-  onDone(cb: (result: { ok: boolean; relay?: 'ok' | 'off' | 'failed' | 'dev' }) => void): () => void
+  /** Fires once when pairing finishes (ok=true paired, ok=false timeout / relay-only mint failure).
+   *  Returns unsubscribe. */
+  onDone(
+    cb: (result: {
+      ok: boolean
+      relay?: 'ok' | 'off' | 'failed' | 'dev'
+      reason?: 'timeout' | 'relay-failed'
+      reached?: boolean
+    }) => void
+  ): () => void
   /** Live re-probe of 127.0.0.1:22, so the "SSH server is off" warning can clear the moment the
    *  user turns it on (polled by the UI only while the warning is showing). */
   probeSsh(): Promise<boolean>

@@ -894,6 +894,34 @@ describe('SshProjectManager', () => {
       expect((await fs.readdir(dir)).filter((file) => file.endsWith('.part'))).toEqual([])
     })
 
+    it('keeps an open media file seekable after more than twenty later downloads', async () => {
+      const dir = await destDir()
+      const mgr = new SshProjectManager({
+        userDataDir: '/ud',
+        spawnMaster: vi.fn(() => ({ kill: vi.fn(), on: vi.fn() })),
+        run: vi.fn(async (args: string[]) => ({
+          code: args.at(-1)?.includes('test -d') ? 1 : 0,
+          stdout: args.at(-1)?.includes('wc -c') ? '4' : '/home/u'
+        })),
+        runScp: vi.fn(async (args: string[]) => {
+          await fs.writeFile(args.at(-1)!, 'data')
+          return { code: 0 }
+        }),
+        getHook: () => ({ port: 1, token: 't', version: '1' }),
+        onStatus: vi.fn()
+      })
+      await mgr.connect('p1', conn, '/srv/repo')
+      const first = await mgr.cacheMediaFile('p1', '/srv/first.mp3', dir)
+      expect(first.ok).toBe(true)
+      // Await the real pruner to make deletion observable, without timing sleeps.
+      for (let i = 0; i < 22; i++) {
+        const next = await mgr.cacheMediaFile('p1', `/srv/clip-${i}.mp4`, dir)
+        expect(next.ok).toBe(true)
+        if (next.ok) await (mgr as unknown as { pruneMediaCache(d: string, n: string): Promise<void> }).pruneMediaCache(dir, path.basename(next.localPath))
+      }
+      expect(first.ok && await fs.readFile(first.localPath, 'utf8')).toBe('data')
+    })
+
     it('does not replace a cache entry when checking it fails for a reason other than absence', async () => {
       const dir = await destDir()
       const runScp = vi.fn(async () => ({ code: 0 }))
@@ -1181,7 +1209,7 @@ describe('SshProjectManager', () => {
       expect(spawnMaster).toHaveBeenCalledTimes(1)
       expect(seq).toEqual(['agent', 'spawn']) // agent up BEFORE the rebuilt master, on this site too
       // The retried setup over the fresh master verified → the remote endpoint file is advertised.
-      expect(info.hookEndpointPath).toBe('/home/u/.nodeterm/hook-endpoint-p1.env')
+      expect(info.hookEndpointPath).toMatch(/^\/home\/u\/\.nodeterm\/hook-endpoint-p1-[a-f0-9]{16}\.env$/)
       expect(phases(statuses).slice(0, 2)).toEqual(['connecting', 'connected'])
     })
 
@@ -1230,7 +1258,7 @@ describe('SshProjectManager', () => {
       expect(spawnMaster).toHaveBeenCalledTimes(1)
       expect(checksAfterRespawn).toBeGreaterThanOrEqual(BIND_AT)
       // The retried setup over the (slow) fresh master verified, so the endpoint is not dropped.
-      expect(info.hookEndpointPath).toBe('/home/u/.nodeterm/hook-endpoint-p1.env')
+      expect(info.hookEndpointPath).toMatch(/^\/home\/u\/\.nodeterm\/hook-endpoint-p1-[a-f0-9]{16}\.env$/)
       expect(statuses).toContain('connected')
     })
 
@@ -1438,6 +1466,21 @@ describe('SshProjectManager', () => {
       expect(onTunnelVerified).toHaveBeenCalledWith('p1', controlPathFor('p1'), conn)
     })
 
+    it('invalidates a wrong-owner tunnel visibly and clears the warning after repair', async () => {
+      let wrongOwner = false
+      const mgr = makeVerifiedMgr(vi.fn(), () => wrongOwner ? '421' : '204')
+      const onStatus = (mgr as unknown as { r: { onStatus: ReturnType<typeof vi.fn> } }).r.onStatus
+      await mgr.connect('p1', conn, '/remote/cwd')
+      onStatus.mockClear()
+      wrongOwner = true
+      await mgr.connect('p1', conn, '/remote/cwd')
+      await mgr.connect('p1', conn, '/remote/cwd')
+      expect(onStatus.mock.calls.filter(([e]) => e.hookTunnelVerified === false)).toHaveLength(1)
+      wrongOwner = false
+      await mgr.connect('p1', conn, '/remote/cwd')
+      expect(onStatus).toHaveBeenCalledWith({ projectId: 'p1', status: 'connected', hookTunnelVerified: true })
+    })
+
     it('rebinds the forward on repair — the endpoint is re-advertised, not merely re-probed', async () => {
       // The whole failure is a master with no `-R`, so a repair that did not call `-O forward`
       // would leave every hook POST dying exactly as before while reporting success.
@@ -1493,7 +1536,7 @@ describe('SshProjectManager', () => {
       const res = await mgr.connect('p1', conn, '/remote/cwd')
       expect(res.controlPath).toBe(controlPathFor('p1'))
       // Everything AFTER the hook still ran: the connect result is complete, not truncated.
-      expect(res.hookEndpointPath).toBe('/home/u/.nodeterm/hook-endpoint-p1.env')
+      expect(res.hookEndpointPath).toMatch(/^\/home\/u\/\.nodeterm\/hook-endpoint-p1-[a-f0-9]{16}\.env$/)
       expect(res.remoteHome).toBe('/home/u')
     })
   })
@@ -2225,7 +2268,7 @@ describe('SshProjectManager', () => {
       await new Promise((r) => setImmediate(r))
       await mgr.disconnect('p1') // user tears the project down mid-setup
       const live = await mgr.connect('p1', conn) // fresh attempt, completes fully
-      expect(live.hookEndpointPath).toBe('/home/u/.nodeterm/hook-endpoint-p1.env')
+      expect(live.hookEndpointPath).toMatch(/^\/home\/u\/\.nodeterm\/hook-endpoint-p1-[a-f0-9]{16}\.env$/)
       released = true
       releaseFirstSetup!()
       await stale // settles without owning the entry
@@ -2234,7 +2277,7 @@ describe('SshProjectManager', () => {
       // which is the dead-RUNNING-badges failure). Status counts are not asserted: the live
       // attempt's claude probe legitimately re-pushes 'connected' on its own schedule.
       const reused = await mgr.connect('p1', conn)
-      expect(reused.hookEndpointPath).toBe('/home/u/.nodeterm/hook-endpoint-p1.env')
+      expect(reused.hookEndpointPath).toMatch(/^\/home\/u\/\.nodeterm\/hook-endpoint-p1-[a-f0-9]{16}\.env$/)
     })
 
     it('a publickey denial with NO passphrase ask gets the agent-only hint, ONE attempt, no retry', async () => {

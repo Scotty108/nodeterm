@@ -5,8 +5,17 @@ import { useBrowserLease, drivingNodeIds } from '../../../state/browserLease'
 import {
   PROJECT_CAPABILITIES,
   PROJECT_CAPABILITY_COPY,
+  capabilityHasMachineDefault,
+  capabilityMachineDefault,
   projectCapabilityFlagInFile
 } from '@shared/project-capabilities'
+import {
+  applyCapabilityChoice,
+  capabilityChoiceLabel,
+  capabilityChoiceOf,
+  capabilityStatusText,
+  type CapabilityChoice
+} from '../../../lib/capabilityChoice'
 import {
   isAgentEnabled,
   setAgentEnabled,
@@ -30,6 +39,7 @@ import {
   permissionModeAgentsLabel,
   unsupportedModesNote
 } from '@shared/agents/approval-mode'
+import { codexApprovalCaps } from '@renderer/state/codexCli'
 import { AgentIcon } from '../../../lib/agentIcons'
 import { chipFor } from '../../../lib/keybindingOverrides'
 import { NODE_IDENTITY_STRICT_DATE } from '@shared/node-identity'
@@ -91,6 +101,10 @@ const ROWS = {
       'credentials',
       'clear env'
     ]
+  },
+  messagingDefault: {
+    title: 'Agent messaging in projects that do not set it',
+    keywords: ['agent', 'message', 'messaging', 'default', 'project', 'send', 'reply', 'orchestration']
   },
   permissionMode: {
     title: 'Permission mode',
@@ -217,6 +231,7 @@ const CAPABILITY_ROWS = PROJECT_CAPABILITIES.map((cap) => ({
     ...PROJECT_CAPABILITY_COPY[cap].label.toLowerCase().split(/\s+/)
   ]
 }))
+const CAPABILITY_CHOICES: readonly CapabilityChoice[] = ['default', 'on', 'off']
 const ENTRIES = [
   ...Object.values(ROWS),
   ...CAPABILITY_ROWS.map(({ title, keywords }) => ({ title, keywords }))
@@ -232,9 +247,15 @@ const ENTRIES = [
  * space) the day every capable agent expresses every mode.
  */
 function permissionModeDescription(): string {
+  // The gaps are not a constant: codex's `--ask-for-approval` vocabulary changes between releases
+  // (it lost `untrusted`, and with it "Ask each time", in 0.149.0), so the sentence is derived
+  // against the codex ON THIS MACHINE rather than a table pinned to one release. Read at render;
+  // the probe is warmed at boot, so by the time Settings can be opened this is the real answer,
+  // and an unprobed read degrades to the baseline vocabulary like every other consumer.
+  const caps = codexApprovalCaps()
   return [
     `The mode ${permissionModeAgentsLabel()} terminal sessions start in; other agents ignore it.`,
-    unsupportedModesNote(),
+    unsupportedModesNote(caps),
     'Shift+Tab still switches modes at any time. Projects can override this from the tab ⌄ menu.'
   ]
     .filter(Boolean)
@@ -366,6 +387,7 @@ export function AgentsSection({ isActive }: { isActive: boolean }): React.JSX.El
   const activeProjectId = useProjects((s) => s.activeProjectId)
   const activeProject = useProjects((s) => s.projects.find((p) => p.id === activeProjectId))
   const setProjectCapability = useProjects((s) => s.setProjectCapability)
+  const resetProjectCapabilityToDefault = useProjects((s) => s.resetProjectCapabilityToDefault)
   // The kill row (Task 6.4): browser nodes an agent is driving RIGHT NOW, across every open project,
   // each with a Stop and one Stop-all. The precedent is the identity escape hatch — a user who
   // notices their browser doing something needs one obvious place to end it, not a per-node hunt.
@@ -725,44 +747,91 @@ export function AgentsSection({ isActive }: { isActive: boolean }): React.JSX.El
           )}
         </div>
       </SearchableRow>
-      {CAPABILITY_ROWS.map(({ cap, title, keywords }) => (
-        <SearchableRow key={cap} title={title} keywords={keywords}>
-          <FieldRow
-            label={title}
-            note={
-              activeProject
-                ? `Applies to the active project: ${activeProject.name}.`
-                : 'Open a project to change this — the switch belongs to a project, not to the app.'
-            }
-            // The description carries the capability's own copy AND its cloneWarning — the same
-            // "this is in the project file" sentence the clone notice shows, so the two git-shared
-            // grants read alike wherever they appear (pinned by agents-capabilities.test.tsx).
-            description={`${PROJECT_CAPABILITY_COPY[cap].description} ${PROJECT_CAPABILITY_COPY[cap].cloneWarning}`}
-            control={
-              <Switch
-                // The raw FILE FLAG is the right thing for a settings switch to display — it
-                // mirrors what is written in .nodeterm/project.json. It is NEVER the grant check:
-                // grants require the machine-local 'kept' too (projectCapabilityGrantedFor).
-                checked={projectCapabilityFlagInFile(activeProject, cap)}
-                ariaLabel={title}
-                disabled={!activeProject}
-                onChange={(on) => {
-                  // The ONE strict setter: literal `true` on, field deleted on off. Writing the
-                  // value any other way (a string, a stored false) is the bug the validators
-                  // exist to refuse.
-                  if (activeProject) setProjectCapability(activeProject.id, cap, on)
-                  // Turning browser control OFF revokes any live lease in this project immediately
-                  // (Task 6.4) — detach now, don't wait for the next drive to read the switch. Read
-                  // live off this toggle, never cached at lease start.
-                  if (activeProject && cap === 'agentBrowserControl' && !on) {
-                    window.nodeTerminal?.browser?.stopProject?.(activeProject.id)
-                  }
-                }}
-              />
-            }
-          />
-        </SearchableRow>
-      ))}
+      <SearchableRow {...ROWS.messagingDefault}>
+        <FieldRow
+          label={ROWS.messagingDefault.title}
+          description="What agent messaging does in a project whose settings do not say. It is stored on this computer only, never in a project file: a project set to on or off keeps its own setting, and a project file that turns messaging on still asks you to confirm it before it takes effect here."
+          control={
+            <Switch
+              checked={settings.agentMessagingDefault === true}
+              ariaLabel={ROWS.messagingDefault.title}
+              onChange={(on) => update({ agentMessagingDefault: on })}
+            />
+          }
+        />
+      </SearchableRow>
+      {CAPABILITY_ROWS.map(({ cap, title, keywords }) =>
+        capabilityHasMachineDefault(cap) ? (
+          // A capability with a machine default has THREE file states (on / off / use default), so
+          // it is a choice plus a sentence saying what is in effect — see lib/capabilityChoice.
+          <SearchableRow key={cap} title={title} keywords={keywords}>
+            <FieldRow
+              label={title}
+              note={capabilityStatusText(activeProject, cap, settings)}
+              description={`${PROJECT_CAPABILITY_COPY[cap].description} ${PROJECT_CAPABILITY_COPY[cap].cloneWarning}`}
+              control={
+                <Select
+                  aria-label={title}
+                  disabled={!activeProject}
+                  value={capabilityChoiceOf(activeProject, cap)}
+                  onChange={(e) => {
+                    if (!activeProject) return
+                    applyCapabilityChoice(
+                      { setProjectCapability, resetProjectCapabilityToDefault },
+                      activeProject.id,
+                      cap,
+                      e.target.value as CapabilityChoice
+                    )
+                  }}
+                >
+                  {CAPABILITY_CHOICES.map((c) => (
+                    <option key={c} value={c}>
+                      {capabilityChoiceLabel(c, capabilityMachineDefault(settings, cap))}
+                    </option>
+                  ))}
+                </Select>
+              }
+            />
+          </SearchableRow>
+        ) : (
+          <SearchableRow key={cap} title={title} keywords={keywords}>
+            <FieldRow
+              label={title}
+              note={
+                activeProject
+                  ? `Applies to the active project: ${activeProject.name}.`
+                  : 'Open a project to change this — the switch belongs to a project, not to the app.'
+              }
+              // The description carries the capability's own copy AND its cloneWarning — the same
+              // "this is in the project file" sentence the clone notice shows, so the two git-shared
+              // grants read alike wherever they appear (pinned by agents-capabilities.test.tsx).
+              description={`${PROJECT_CAPABILITY_COPY[cap].description} ${PROJECT_CAPABILITY_COPY[cap].cloneWarning}`}
+              control={
+                <Switch
+                  // The raw FILE FLAG is the right thing for a settings switch to display — it
+                  // mirrors what is written in .nodeterm/project.json. It is NEVER the grant check:
+                  // grants require the machine-local 'kept' too (projectCapabilityGrantedFor).
+                  checked={projectCapabilityFlagInFile(activeProject, cap)}
+                  ariaLabel={title}
+                  disabled={!activeProject}
+                  onChange={(on) => {
+                    // The ONE strict setter: literal `true` on, field deleted on off. Writing the
+                    // value any other way (a string, a stored false) is the bug the validators
+                    // exist to refuse.
+                    if (activeProject) setProjectCapability(activeProject.id, cap, on)
+                    // Turning browser control OFF revokes any live lease in this project immediately
+                    // (Task 6.4) — detach now, don't wait for the next drive to read the switch. Read
+                    // live off this toggle, never cached at lease start.
+                    if (activeProject && cap === 'agentBrowserControl' && !on) {
+                      window.nodeTerminal?.browser?.stopProject?.(activeProject.id)
+                    }
+                  }}
+                />
+              }
+            />
+          </SearchableRow>
+        )
+      )}
       <SearchableRow {...ROWS.hibernation}>
         <FieldRow
           label="Hibernate idle agents"

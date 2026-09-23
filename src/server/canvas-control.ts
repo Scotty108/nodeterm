@@ -25,7 +25,8 @@ import { codexIdentityCaps } from '../core/codex-identity-caps'
 import { codexThreadIdentityRoot } from '../core/codex-identity-proxy'
 import { claudeCliCaps, type ClaudeCliCaps } from '../core/claude-cli'
 import { grokCliCaps } from '../core/grok-cli'
-import type { GrokCliCaps } from '../shared/types'
+import { codexCliCaps } from '../core/codex-cli'
+import type { CodexCliCaps, GrokCliCaps } from '../shared/types'
 import { installHooksIntoLocalAccounts } from '../core/claude-accounts-service'
 import { platform } from '../core/platform'
 import type { PtyManager } from '../core/pty-manager'
@@ -39,6 +40,7 @@ import {
 } from './control-unsupported'
 import { HeadlessNodeFactory } from './headless-node-factory'
 import { sendSettledEnvelope } from './settled-envelope'
+import { serverSettingsControl } from './settings-control'
 
 export interface ServerCanvasControlDeps {
   workspaceStore: WorkspaceStore
@@ -48,6 +50,7 @@ export interface ServerCanvasControlDeps {
   cliCaps?: () => Promise<ClaudeCliCaps>
   /** grok's own `--session-id` probe; defaults to the real one. See HeadlessNodeFactoryDeps. */
   grokCaps?: () => Promise<GrokCliCaps>
+  codexCaps?: () => Promise<CodexCliCaps>
   /** Test seam for the boot-populated shared Codex capability answer. */
   codexSharedIdentity?: () => Promise<boolean>
   /**
@@ -171,6 +174,10 @@ export async function initServerCanvasControl(
     cliCaps: deps.cliCaps ?? claudeCliCaps,
     // grok answers with its own probe — see HeadlessNodeFactoryDeps.grokCaps.
     grokCaps: deps.grokCaps ?? grokCliCaps,
+    // …and so does codex, for the same reason: its `--ask-for-approval` vocabulary is its own and
+    // it MOVED (see HeadlessNodeFactoryDeps.codexCaps). The Server Edition runs its Codex sessions
+    // on this host's `codex`, so this probe is the right authority for them.
+    codexCaps: deps.codexCaps ?? codexCliCaps,
     codexSharedIdentity:
       deps.codexSharedIdentity ?? (() => codexIdentityCaps().then((caps) => caps.shared)),
     stateOf: nodeState,
@@ -195,8 +202,11 @@ export async function initServerCanvasControl(
     mirrorEntry,
     projects: () => deps.workspaceStore.persistedCanvases(),
     isRemoteNode: () => false,
-    messagingEnabled: messagingEnabledVia((projectId) =>
-      deps.workspaceStore.capabilityProjectFor(projectId)),
+    messagingEnabled: messagingEnabledVia(
+      (projectId) => deps.workspaceStore.capabilityProjectFor(projectId),
+      // The SAME machine default the desktop reads — this shell's own settings.json.
+      () => deps.settings()
+    ),
     paneOwnerProject,
     callerOwnsTarget: (sourceNodeId, targetNodeId) =>
       factory.ownsSpawn(sourceNodeId, targetNodeId),
@@ -218,6 +228,17 @@ export async function initServerCanvasControl(
     rename: (sourceNodeId, args) => factory.rename(sourceNodeId, args),
     color: (sourceNodeId, args) => factory.color(sourceNodeId, args),
     sticky: (sourceNodeId, args) => factory.sticky(sourceNodeId, args),
+    settings: async (sourceNodeId, args) =>
+      serverSettingsControl(
+        {
+          persistedCanvases: () => deps.workspaceStore.persistedCanvases(),
+          capabilityProjectFor: (id) => deps.workspaceStore.capabilityProjectFor(id),
+          projectName: (id) => deps.workspaceStore.projectTargetInfo(id)?.name,
+          settings: deps.settings
+        },
+        sourceNodeId,
+        args
+      ),
     // `runDelivery` applies caller→target creator proof before any pane probe or write, and
     // re-applies it when a queued delivery flushes.
     deliver: async (input) => (await deliverFromControl(input, messaging)).reply
