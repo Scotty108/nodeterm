@@ -4429,7 +4429,8 @@ the Settings section and ShortcutsPanel start disagreeing about what a chord mea
   Known v1 gaps, all in the doc: shared `localStorage` across windows (last-writer-wins on the
   per-viewer stores), the keyboard-shortcut mirrors stay the main window's, geometry not remembered,
   and the WebGL budget is
-  per renderer (two windows can ask for 2 × 16 on macOS; a soak is on the device checklist).
+  per renderer (two windows hold 2 × 16 on macOS; a two-window soak on an M5 Max saw 0 lost
+  contexts — Intel / low-memory GPUs still owed).
 - **Window geometry is REMEMBERED** (`main/window-state.ts`, `<userData>/window-state.json`) — size,
   position and maximized state, restored at the next launch. Before this the window opened at a
   hard-coded 1400x900 every time, on every platform, so a user who works maximized re-maximized it

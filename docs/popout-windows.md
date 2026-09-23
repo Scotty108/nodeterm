@@ -245,9 +245,10 @@ Main used to send everything to *the* window. Now:
   window (§1). Moving those actions INTO the owning window (e.g. "End session" run by the pop-out)
   would need a cross-window command channel; not done.
 - **The WebGL budget is per renderer.** `setWebglBudget` runs at each window's boot, so two windows
-  can hold 2 × 24 contexts (2 × 16 on macOS) against Chromium's per-process cap of 32
-  (`--max-active-webgl-contexts`) — the GPU process is shared. The macOS number was chosen to cap
-  compositor pressure, which this doubles in the worst case. See the checklist.
+  can hold 2 × 24 contexts (2 × 16 on macOS) where one window held 24 (16). Chromium's
+  `--max-active-webgl-contexts` cap is counted per renderer process, and each window is its own
+  renderer, so the two budgets do not compete for one cap. What they do share is the GPU and the
+  compositor, which is what the macOS number exists to limit — see the soak below.
 
 ## 7. Device checklist
 
@@ -268,12 +269,18 @@ Verified on macOS (see the PR for the run). Owed elsewhere:
    quit). Confirm no pop-out is left orphaned.
 4. **Two pop-outs closing in the same tick** — the flush map is keyed by webContents id; confirm both
    ack independently rather than one timing out.
-5. **macOS: two-window WebGL zoom-out soak.** Main window and one pop-out, each on a canvas with
-   20+ terminals, both zoomed all the way out, then pan and zoom repeatedly for several minutes. Watch
-   for Chromium's dead "lost context" placeholder (white box + sad face) and for black-composited
-   terminals. Both windows together can ask for 32 contexts against a shared GPU process whose cap
-   is also 32, so this is where a forced eviction would show. If it does, the fix is to split one
-   budget across windows (main hands each renderer its share), not to raise the cap.
+5. **macOS: two-window WebGL zoom-out soak — run 2026-09-23, clean.** MacBook Pro (Mac17,6, Apple
+   M5 Max), macOS 26.6.2, Electron 42.10.1, a build of this branch in an `NT_MULTI` sandbox. The main
+   window and a pop-out sat side by side, each on a canvas of 24 live terminals, and a driver ran
+   61 cycles over 4 minutes in each window: fit all, pinch-zoom in, zoom out past fit, pan back and
+   forth. Each window held exactly its budget of 16 WebGL terminals for the whole run (32 live
+   contexts across the two), with **0** `webglcontextlost` events in either window. In the final
+   screenshots every terminal was painted, with no "lost context" placeholder and no black terminal.
+   An earlier 4-minute run that drifted to 1% zoom with the terminals scrolled off screen also saw 0
+   losses, but it proves less. Not covered: an Intel Mac or a low-memory GPU, where a forced
+   eviction is likelier, and terminals streaming output during the zoom (these showed their
+   prompts). If an eviction does show up there, split one budget across the windows (main hands
+   each renderer its share); do not raise the cap.
 6. **The reviewer's blocking scenarios on a device**: with a terminal-bearing project popped out,
    the main window's sidebar project menu shows only Show window / Bring back; sidebar ×, Omni
    delete and "Close project → end sessions" are refused with the strip, and `tmux ls` still lists
