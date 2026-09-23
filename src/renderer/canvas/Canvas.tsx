@@ -2433,6 +2433,9 @@ export function Canvas() {
       .getState()
       .hydrate()
       .then(() => {
+        // A pop-out is torn off an established workspace: no tour, no one-shot launch card there
+        // (the main window owns both, and they share its localStorage flags).
+        if (isPopoutWindow()) return
         const s = useSettings.getState().settings
         if (s.seenOnboarding) {
           // Established install: the one-shot mobile-launch card (fresh installs get the same
