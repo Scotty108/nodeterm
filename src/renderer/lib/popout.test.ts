@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { isTabTearOff, nextActiveAfterDetach, popoutRefusal } from './popout'
+import { alertsHere, isTabTearOff, nextActiveAfterDetach, popoutRefusal } from './popout'
 
 const ctx = (over: Partial<Parameters<typeof popoutRefusal>[1]> = {}) => ({
   browser: false,
@@ -59,5 +59,22 @@ describe('isTabTearOff', () => {
   })
   it('an unmeasurable pointer is never a tear-off', () => {
     expect(isTabTearOff({ ...base, clientX: NaN, clientY: 500 })).toBe(false)
+  })
+})
+
+describe('alertsHere', () => {
+  const projects = [
+    { id: 'a', nodes: [{ id: 'a1' }] },
+    { id: 'b', nodes: [{ id: 'b1' }] }
+  ] as never
+  it('only the window owning the node\'s project alerts', () => {
+    const mainOwns = (id: string) => id !== 'b'
+    expect(alertsHere(projects, 'a1', mainOwns)).toBe(true)
+    expect(alertsHere(projects, 'b1', mainOwns)).toBe(false)
+    const popoutOwns = (id: string) => id === 'b'
+    expect(alertsHere(projects, 'b1', popoutOwns)).toBe(true)
+  })
+  it('a node no project knows yet alerts here', () => {
+    expect(alertsHere(projects, 'fresh', () => false)).toBe(true)
   })
 })

@@ -377,7 +377,7 @@ import {
 } from '../lib/explorerPinHint'
 import { useProjects } from '../state/projects'
 import { isPopoutWindow, ownsProjectHere, popoutProjectId, useWindows } from '../state/windows'
-import { nextActiveAfterDetach, popoutRefusal } from '../lib/popout'
+import { alertsHere, nextActiveAfterDetach, popoutRefusal } from '../lib/popout'
 import { useAgentStatus } from '../state/agentStatus'
 import { useLaunchDelivery } from '../state/launchDelivery'
 import { useBrowserLease, drivingNodeIds } from '../state/browserLease'
@@ -13266,6 +13266,12 @@ export function Canvas() {
         sound: 'done' | 'needsYou',
         opts?: { quiet?: boolean }
       ) => {
+        // Agent status reaches EVERY app window (a node lives in whichever window shows its
+        // project, and main does not know which), so the bookkeeping above runs in each of them.
+        // The alert — unread, chime, notification — belongs to the ONE window that shows the node:
+        // otherwise a popped-out node chimes twice, and the main window marks unread (and
+        // notifies) a finish the user sat and watched in the pop-out.
+        if (!alertsHere(useProjects.getState().projects, e.nodeId, ownsProjectHere)) return
         // Unread unless the user is actively in this node's terminal (focused window +
         // this node is the active terminal). So a finish while you're in another terminal,
         // or with nothing focused, still flags unread.

@@ -1791,8 +1791,11 @@ app.whenReady().then(async () => {
   // once already after an Electron upgrade invalidated the ncprefs signature record.
   ipcMain.handle(
     IPC.appNotify,
-    async (_e, payload: { title: string; body: string; nodeId: string; force?: boolean }) => {
-      const win = getMainWindow()
+    async (e, payload: { title: string; body: string; nodeId: string; force?: boolean }) => {
+      // The window that asked is the one showing the node (the renderer alerts only for projects
+      // it owns — a pop-out for its own), so ITS focus is the one that says "the user is looking".
+      // Asking the main window's instead notified a user sitting in the pop-out on that node.
+      const win = BrowserWindow.fromWebContents(e.sender) ?? getMainWindow()
       if (!win || !Notification.isSupported()) return 'skipped'
       // `force` (permission request / confirmation) shows even when focused; normal
       // completion notifications only show when the window is in the background.

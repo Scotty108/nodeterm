@@ -88,3 +88,19 @@ export function isTabTearOff(drag: TabDragEnd): boolean {
   if (outsideWindow) return true
   return clientY > stripBottom
 }
+
+/**
+ * Whether THIS window raises the alert (unread, chime, OS notification) for an agent event on
+ * `nodeId`. Agent status reaches every app window, so each keeps the state bookkeeping, but only
+ * the window that shows the node interrupts the user: otherwise a popped-out node chimes twice and
+ * the main window marks unread a finish the user watched in the pop-out. A node no project knows
+ * yet (spawned since the last commit) is the active canvas's, i.e. this window's.
+ */
+export function alertsHere(
+  projects: readonly Pick<Project, 'id' | 'nodes'>[],
+  nodeId: string,
+  ownsHere: (projectId: string) => boolean
+): boolean {
+  const owner = projects.find((p) => p.nodes.some((n) => n.id === nodeId))
+  return !owner || ownsHere(owner.id)
+}
