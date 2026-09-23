@@ -1094,6 +1094,23 @@ export function Canvas() {
     const t = setTimeout(() => setNotice(null), noticeDwellMs(notice.text))
     return () => clearTimeout(t)
   }, [notice])
+  /**
+   * PR #804 review, blocking 1: a project popped out into its own window is edited THERE. Every
+   * main-window surface that acts on another project (sessions sidebar, session-memory kill, Omni
+   * Kanban lanes) asks this first, because the store guard (`OWNERSHIP_GUARDED`) refuses the
+   * project.json half of an edit but cannot stop a side effect outside it — a killed tmux session,
+   * a `/rename` typed into the pane. Refused with a reason and a way to the window that owns it.
+   */
+  const refuseForeignProject = useCallback((projectId: string): boolean => {
+    if (ownsProjectHere(projectId)) return false
+    const name = useProjects.getState().getProject(projectId)?.name ?? 'This project'
+    setNotice({
+      kind: 'info',
+      text: `${name} is open in its own window. Make that change there.`,
+      action: { label: 'Show window', run: () => void api.windows.focusProject(projectId) }
+    })
+    return true
+  }, [api])
   const [zoomPct, setZoomPct] = useState(100)
   // Canvas lock (bottom-left Controls): freezes the CAMERA against gestures, namely pan (drag +
   // scroll) and zoom (pinch / Cmd+wheel / double-click). Nodes stay draggable and connectable:
@@ -9618,6 +9635,7 @@ export function Canvas() {
   useEffect(() => {
     const handler = (e: CustomEvent<{ projectId: string; choice: KanbanCreateChoice; columnId: string | null }>) => {
       const { projectId, choice, columnId } = e.detail
+      if (refuseForeignProject(projectId)) return
       if (projectId !== useProjects.getState().activeProjectId) {
         switchProject(projectId)
         // Project switch is a synchronous store update but React Flow remount is async.
@@ -9629,7 +9647,7 @@ export function Canvas() {
     }
     window.addEventListener('nodeterm:create-node' as never, handler as never)
     return () => window.removeEventListener('nodeterm:create-node' as never, handler as never)
-  }, [createNodeInColumn, switchProject])
+  }, [createNodeInColumn, switchProject, refuseForeignProject])
 
 // Delete a session from the board — same confirm + teardown as the canvas Delete key.
   const deleteNodeFromKanban = useCallback(
@@ -12564,6 +12582,7 @@ export function Canvas() {
    */
   const closeStoredNodes = useCallback(
     (projectId: string, ids: readonly string[]) => {
+      if (refuseForeignProject(projectId)) return
       const store = useProjects.getState()
       const nodes = store.getProject(projectId)?.nodes ?? []
       for (const id of ids) {
@@ -12588,13 +12607,14 @@ export function Canvas() {
       }
       void writeDisk()
     },
-    [writeDisk]
+    [writeDisk, refuseForeignProject]
   )
 
   // Close (end) a session. tmux sessions are keyed by node id, so destroy works for an
   // inactive project's node even though it isn't mounted; then drop it from the store.
   const closeSession = useCallback(
     (projectId: string, id: string, alsoOnConfirm?: () => void) => {
+      if (refuseForeignProject(projectId)) return
       setConfirm({
         // Both halves, because this does both: the tmux session ends AND the node is removed from
         // its canvas (either branch below). The wording came from the sessions sidebar, where the
@@ -12619,7 +12639,7 @@ export function Canvas() {
         }
       })
     },
-    [activeProjectId, deleteNodes, closeStoredNodes]
+    [activeProjectId, deleteNodes, closeStoredNodes, refuseForeignProject]
   )
 
   /**
@@ -12729,6 +12749,7 @@ export function Canvas() {
 
   const renameSession = useCallback(
     (projectId: string, id: string, title: string) => {
+      if (refuseForeignProject(projectId)) return
       // Both facts about the node are read BEFORE the rename lands: `renameNode` mutates the
       // store synchronously, so reading the previous title afterwards would compare the new name
       // against itself and push a duplicate `/rename` on every no-op rename (#582).
@@ -12828,6 +12849,7 @@ export function Canvas() {
     }
     const onGlobalEditSticky = (e: CustomEvent<{ projectId: string; nodeId: string; text: string }>) => {
       const { projectId, nodeId, text } = e.detail
+      if (refuseForeignProject(projectId)) return
       if (projectId === useProjects.getState().activeProjectId) {
         setNodes((ns) =>
           ns.map((n) =>
@@ -12850,6 +12872,7 @@ export function Canvas() {
       e: CustomEvent<{ projectId: string; nodeId: string; patch: { url?: string; title?: string } }>
     ) => {
       const { projectId, nodeId, patch } = e.detail
+      if (refuseForeignProject(projectId)) return
       if (projectId === useProjects.getState().activeProjectId) {
         setNodes((ns) => ns.map((n) => (n.id === nodeId ? { ...n, data: { ...n.data, ...patch } } : n)))
         markDirty()
@@ -12864,6 +12887,7 @@ export function Canvas() {
     }
     const onGlobalDelete = (e: CustomEvent<{ projectId: string; nodeId: string }>) => {
       const { projectId, nodeId } = e.detail
+      if (refuseForeignProject(projectId)) return
       if (projectId === useProjects.getState().activeProjectId) {
         deleteNodeFromKanban(nodeId)
         return
@@ -12899,6 +12923,7 @@ export function Canvas() {
     }
     const onGlobalSetIcon = (e: CustomEvent<{ projectId: string; nodeId: string; icon: import('@shared/node-icon').NodeIcon | undefined }>) => {
       const { projectId, nodeId, icon } = e.detail
+      if (refuseForeignProject(projectId)) return
       if (projectId === useProjects.getState().activeProjectId) {
         setNodes((ns) => ns.map((n) => (n.id === nodeId ? { ...n, data: { ...n.data, icon } } : n)))
         markDirty()
@@ -12923,7 +12948,7 @@ export function Canvas() {
       window.removeEventListener('nodeterm:global-delete' as never, onGlobalDelete as never)
       window.removeEventListener('nodeterm:global-set-icon' as never, onGlobalSetIcon as never)
     }
-  }, [renameSession, setNodes, markDirty, writeDisk, deleteNodeFromKanban])
+  }, [renameSession, setNodes, markDirty, writeDisk, deleteNodeFromKanban, refuseForeignProject])
 
   // Sidebar "Name with AI": generate a title from the session's captured terminal output
   // (same BYO-agent path as the terminal node's ✦), then apply it via renameSession.
@@ -12964,6 +12989,7 @@ export function Canvas() {
   // non-active project it switches FIRST — see the closure caution inside (issue #443).
   const addToProject = useCallback(
     (projectId: string, e?: { clientX: number; clientY: number }) => {
+      if (refuseForeignProject(projectId)) return
       // The sessions-sidebar "+" used to open a bare terminal. It now opens the SAME content menu
       // the pane right-click uses (terminal + agents + browser/web/sticky/dino/file/worktree), so
       // adding to a project from the sidebar is no longer a bare-terminal-only affordance that
@@ -12995,12 +13021,13 @@ export function Canvas() {
         )
       })
     },
-    [activeProjectId, switchProject, addHandlers, addCtx, agentCreationEntries]
+    [activeProjectId, switchProject, addHandlers, addCtx, agentCreationEntries, refuseForeignProject]
   )
 
   // Sidebar drag-to-group: reparent a session into a canvas group (groupId) or out (null).
   const moveSessionToGroup = useCallback(
     (projectId: string, nodeId: string, groupId: string | null) => {
+      if (refuseForeignProject(projectId)) return
       if (projectId === activeProjectId) {
         setNodes((ns) => reparentNode(ns, nodeId, groupId))
         markDirty()
@@ -13009,7 +13036,7 @@ export function Canvas() {
         void writeDisk()
       }
     },
-    [activeProjectId, setNodes, markDirty, writeDisk]
+    [activeProjectId, setNodes, markDirty, writeDisk, refuseForeignProject]
   )
 
   // Sidebar reorder: place draggedId immediately before beforeId (sidebar order = node order),
@@ -13026,6 +13053,7 @@ export function Canvas() {
 
   const reorderSession = useCallback(
     (projectId: string, draggedId: string, beforeId: string) => {
+      if (refuseForeignProject(projectId)) return
       if (projectId === activeProjectId) {
         setNodes((ns) => reorderNodeBefore(ns, draggedId, beforeId))
         markDirty()
@@ -13034,13 +13062,14 @@ export function Canvas() {
         void writeDisk()
       }
     },
-    [activeProjectId, setNodes, markDirty, writeDisk]
+    [activeProjectId, setNodes, markDirty, writeDisk, refuseForeignProject]
   )
 
   // Sibling reorder for a FRAME row in the sessions sidebar. Distinct from reorderSession:
   // a frame carries its whole subtree, and the drop never changes its parent.
   const reorderSidebarGroup = useCallback(
     (projectId: string, draggedId: string, parentId: string | null, beforeId: string | null) => {
+      if (refuseForeignProject(projectId)) return
       if (projectId === activeProjectId) {
         setNodes((ns) => reorderGroupWithinParent(ns, draggedId, parentId, beforeId))
         markDirty()
@@ -13049,13 +13078,30 @@ export function Canvas() {
         void writeDisk()
       }
     },
-    [activeProjectId, setNodes, markDirty, writeDisk]
+    [activeProjectId, setNodes, markDirty, writeDisk, refuseForeignProject]
   )
 
   const onRowContextMenu = useCallback(
     (e: React.MouseEvent, projectId: string, id: string) => {
       e.preventDefault()
       e.stopPropagation()
+      // A popped-out project's sessions are acted on in ITS window: "Go to" brings that window
+      // forward on the node (focusNodeById forwards it); nothing here edits or ends them.
+      if (useWindows.getState().detached.has(projectId)) {
+        setMenu({
+          x: e.clientX,
+          y: e.clientY,
+          items: [
+            { label: 'Go to (in its window)', icon: <IconJump />, onClick: () => focusNodeById(id) },
+            {
+              label: 'Bring project back to this window',
+              icon: <IconProject />,
+              onClick: () => void api.windows.closePopout(projectId)
+            }
+          ]
+        })
+        return
+      }
       // Session-list-specific rows that have no canvas analogue: Go to (focus) and Rename (the
       // sidebar's prompt-dialog rename). These stay on top for every project.
       const head: MenuItem[] = [
@@ -13115,6 +13161,7 @@ export function Canvas() {
       setMenu({ x: e.clientX, y: e.clientY, items: [...head, ...body] })
     },
     [
+      api,
       activeProjectId,
       focusNodeById,
       renameSession,
@@ -13897,6 +13944,7 @@ export function Canvas() {
   // amnesia), and SSH masters are NOT disconnected (close never managed the connection before,
   // and a reopen expects it exactly as a project switch left it).
   const endProjectSessions = useCallback((id: string) => {
+    if (!ownsProjectHere(id)) return
     const project = useProjects.getState().getProject(id)
     if (!project) return
     project.nodes.forEach((n) => {
@@ -13933,6 +13981,7 @@ export function Canvas() {
   // confirm time, not the set that was counted when the dialog opened.
   const performCloseProject = useCallback(
     (id: string, endSessions = false) => {
+      if (refuseForeignProject(id)) return
       const store = useProjects.getState()
       if (id === store.activeProjectId) commitActiveToStore()
       if (endSessions) endProjectSessions(id)
@@ -13941,7 +13990,7 @@ export function Canvas() {
       store.closeProject(id)
       void writeDisk()
     },
-    [commitActiveToStore, writeDisk, disposeRelayTabForProject, endProjectSessions]
+    [commitActiveToStore, writeDisk, disposeRelayTabForProject, endProjectSessions, refuseForeignProject]
   )
 
   // The one entrance for both Close surfaces (tab caret menu + sidebar context menu). A project
@@ -13956,6 +14005,7 @@ export function Canvas() {
         api.closeWindow()
         return
       }
+      if (refuseForeignProject(id)) return
       const store = useProjects.getState()
       // Count the LIVE canvas, not a stale serialization — agents may have spawned nodes since
       // the last commit.
@@ -13968,7 +14018,7 @@ export function Canvas() {
       }
       setCloseTarget({ id, name: project.name, count: plan.sessionCount, end: false })
     },
-    [api, commitActiveToStore, performCloseProject, setCloseTarget]
+    [api, commitActiveToStore, performCloseProject, setCloseTarget, refuseForeignProject]
   )
 
   // Right-click on a sidebar project header: mostly the same project actions as the tab caret
@@ -13979,6 +14029,22 @@ export function Canvas() {
       e.stopPropagation()
       const project = useProjects.getState().projects.find((p) => p.id === projectId)
       if (!project) return
+      // A popped-out project is edited in its own window: the same two rows as its ghost tab.
+      if (useWindows.getState().detached.has(projectId)) {
+        setMenu({
+          x: e.clientX,
+          y: e.clientY,
+          items: [
+            { label: 'Show window', icon: <IconSwitch />, onClick: () => void api.windows.focusProject(projectId) },
+            {
+              label: 'Bring back to this window',
+              icon: <IconProject />,
+              onClick: () => void api.windows.closePopout(projectId)
+            }
+          ]
+        })
+        return
+      }
       setMenu({
         x: e.clientX,
         y: e.clientY,
@@ -14017,6 +14083,7 @@ export function Canvas() {
       })
     },
     [
+      api,
       activeProjectId,
       switchProject,
       renameProject,
