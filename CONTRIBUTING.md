@@ -165,7 +165,10 @@ lane unaffected.
   refuses), joins no presence, and any new "act on project X" IPC you add should resolve the
   window that shows X (`windowShowingProject` / `windowForNode` in main) rather than
   `getMainWindow()`. Per-node pushes go to every app window (`sendToAppWindows`), never to
-  `sendToMain` alone.
+  `sendToMain` alone. In the renderer, write another project through the `useProjects` mutators,
+  not `useProjects.setState`: the mutators refuse a project another window owns (a test fails on
+  a new mutator you did not classify), and anything with a side effect outside the store — ending
+  a session, typing into a pane — must ask `refuseForeignProject` first.
 
 - **The node colour palette is ONE list, and it is also the control boundary.**
   `src/shared/node-colors.ts` is what every picker draws and what `nodeterm color --color C`

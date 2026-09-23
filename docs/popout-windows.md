@@ -13,7 +13,8 @@ Files:
 | Layer | File |
 |---|---|
 | Which projects a save may WRITE (pure) | `src/core/workspace-scope.ts` |
-| The store: scoped saves, the pop-out boot slice | `src/core/workspace-store.ts` (`save(ws, scope)`, `loadFor`, `lastSavedProject`) |
+| The store: scoped saves, the pop-out boot slice | `src/core/workspace-store.ts` (`save(ws, scope)`, `loadFor` → `currentProject` → `buildEntry`) |
+| The renderer store's ownership guard | `src/renderer/state/projects.ts` (`OWNERSHIP_GUARDED` / `OWNERSHIP_EXEMPT`) |
 | The registry: which window shows which project (Electron-free) | `src/main/popout-windows.ts` |
 | The window itself, flush-before-close, the IPC | `src/main/index.ts` (`createPopoutWindow`, beside `createWindow`) |
 | The hash both sides read (`#popout=<id>`) | `src/shared/popout-window.ts` |
@@ -55,6 +56,23 @@ enforced where the writes happen:
 - **A window never edits what it does not own.** A pop-out cannot switch project — the refusal is in
   the projects store's `setActive`, the one funnel every switch path uses — and the main window
   keeps a *ghosted* tab for a popped-out project whose click brings that window forward.
+- **The refusal is in the renderer too, and it has to be** (PR #804 review, blocking 1). The save
+  scope drops the project.json half of a foreign edit, silently, and cannot stop anything that
+  happens outside project.json. The review measured it: the main window's sessions sidebar renamed
+  a popped-out project (reverted with no signal at the next pop-out save) and "Close project → end
+  its sessions" KILLED the pop-out's live tmux session while the scope kept the project open on disk.
+  So: every per-project mutator of `useProjects` refuses a project this window does not own
+  (`OWNERSHIP_GUARDED`, with the value each answers when refused); the ones that must keep working
+  are listed in `OWNERSHIP_EXEMPT` with a reason (`replaceProject` IS the mirror refresh); and
+  `projects.ownership.test.ts` fails on a method in neither table, so a new mutator cannot slip past
+  by being forgotten. The Canvas paths with side effects OUTSIDE the store — ending sessions
+  (`closeStoredNodes`, `closeSession`, `endProjectSessions`, the Omni delete), a `/rename` typed
+  into the pane (`renameSession`), and the Omni handlers that call `useProjects.setState` directly —
+  ask `refuseForeignProject` first, which answers with an info strip naming the project and a
+  **Show window** action. A detached project's sidebar project menu offers only **Show window** /
+  **Bring back to this window** (the ghost tab's two rows), its session rows only **Go to (in its
+  window)** / **Bring project back**, and its Omni Kanban lane is a one-line header with **Show
+  window** instead of cards.
 
 Two rules come out of the scope, both in `scopeIndex`:
 
@@ -70,16 +88,32 @@ Two rules come out of the scope, both in `scopeIndex`:
 1. commit the live canvas into the store, mark the tab detached (optimistic — main confirms),
    activate the nearest open neighbour (`nextActiveAfterDetach`, the `closeProject` rule) or the
    start screen;
-2. **await `writeDisk()`** — the pop-out is booted from the project *as last saved*;
+2. **await `writeDisk()` and read its answer** — the pop-out is booted from the project *as it is
+   on disk*, so a save that did not land (refused, or the socket closed) means the window would open
+   WITHOUT the edits it carried and then autosave over them. `writeDisk` resolves `false` then, and
+   the pop-out is refused: the tab is un-ghosted, the canvas it was showing comes back, and the
+   user is told;
 3. ask main (`windows.popout`). Main refuses if nothing has saved the project yet, and gives the
    tab back on refusal.
 
 Main creates the window with the same preload, lock-down, keydown intercepts and trackpad ledger as
 `createWindow`, loads the same page with `#popout=<id>`, and answers that window's
-`workspace:load` with a **one-project slice from memory** (`WorkspaceStore.loadFor`), never a second
-disk load: `load()` is the boot path — it sidelines corrupt files, runs migrations, re-seeds `revs`
-and `lastWritten` — and re-running it under a live main window would race that window's autosaves
-for the store's own bookkeeping.
+`workspace:load` with a **one-project slice of the store's CURRENT copy** (`WorkspaceStore.loadFor`
+→ `currentProject` → `buildEntry`, the same per-entry assembly a full load runs: the folder's
+project.json, an ssh entry's cache, an inline data file), queued on `saveChain`. Never a second full
+`load()`: that is the boot path — it sidelines corrupt files, runs migrations, re-seeds every
+project's `revs` and `lastWritten` — and re-running it under a live main window would race that
+window's autosaves for the store's own bookkeeping.
+
+**It is not the renderer's last save either, and that was a data-loss bug** (PR #804 review,
+blocking 2). The first version answered from `lastSaved`, which only `saveNow` updates — but the
+store writes project files itself: `appendRemoteNode` (a phone registering a session), the
+watcher's re-read after a git pull, the ssh reconcile, the kanban and `removeProjectNode` writers.
+The pop-out adopts those live via `workspace:external-change` without marking itself dirty, so
+nothing re-saves them; and the hash survives a reload (⌘R, the crash auto-reload), which re-enters
+`loadFor`, whose answer the boot then saves. The reviewer's probe — save, detach, pop-out
+load+save, `appendRemoteNode`, reload, save — ended with the phone's node deleted from disk. That
+probe is now a test in `workspace-store.scope.test.ts`, and it fails on the snapshot version.
 
 While the window is open, every save it makes is forwarded to the main window
 (`window:popout-project-saved` → `replaceProject`), so main's serialized copy is never more than
@@ -110,6 +144,16 @@ Main used to send everything to *the* window. Now:
 - **External-change broadcasts are gated in the renderer** (`ownsProjectHere`): the change for a
   project another window owns is that window's to adopt, so main ignores a detached project's and a
   pop-out ignores everything but its own.
+- **Alerts belong to one window.** The agent-status bookkeeping (state, session id, account) runs in
+  every window — the sidebar needs it — but the interrupts (unread, chime, OS notification) run only
+  where the node's project is owned (`alertsHere`, `lib/popout.ts`). Otherwise a popped-out node
+  chimed twice, and the unfocused main window marked unread and notified a finish the user watched
+  in the pop-out. `app:notify` checks the focus of the window that ASKED (the owner), not the main
+  window's.
+- **Menu commands go to the focused app window** (`menuTarget`, `popout-windows.ts`): the
+  application menu is one per app, and its accelerators (⌘⇧B, ⌘,, the View items) all went to the
+  main window — ⌘⇧B with a pop-out focused toggled the board in the window behind it. A focused
+  window that is not an app window (DevTools, the notch HUD) still falls back to the main window.
 - **Pop-outs count as attached clients** (`clientIds()` includes them). Not optional: the pty
   manager decides "attached" against that list, and a subscriber missing from it reads as detached
   to the session reaper — a pop-out's terminals would be culled after the grace window.
@@ -155,8 +199,12 @@ Main used to send everything to *the* window. Now:
   temp dir: after a pop-out save carrying a stale A, A's file still holds main's edit; after a main
   save carrying a stale B, B's file still holds the pop-out's edit; the index keeps main's order and
   active project throughout.
-- The pop-out boot slice is served from memory (no disk read) and falls back to a filtered disk
-  load when nothing has recorded the project (never on the app's own path).
+- The pop-out boot slice is the store's current copy of the project: a write the store made while
+  the window was open (the reviewer's `appendRemoteNode` probe) is in the reload and survives the
+  pop-out's next save.
+- `projects.ownership.test.ts`: the main window cannot rename, recolor, re-folder, close, delete or
+  edit the nodes of a popped-out project; `replaceProject` still refreshes its mirror; a pop-out
+  writes only its own project; every store method is classified guarded or exempt.
 - `popout-windows.test.ts`: a closed window un-registers itself, a late `closed` from a replaced
   window cannot un-register its successor, a destroyed window is already not a pop-out, the scope
   by sender, and the routing helpers.
@@ -182,7 +230,22 @@ Main used to send everything to *the* window. Now:
   `terminalFocusMirror` documents).
 - **A pop-out's geometry is not remembered** (§4).
 - **The Omni Kanban and the sessions sidebar list a detached project from main's mirrored copy**,
-  which lags the pop-out by one autosave debounce (≤ 800 ms). Their actions route to the window.
+  which lags the pop-out by one autosave debounce (≤ 800 ms). Only NAVIGATION routes to the window
+  (row click, "Go to", Show window); every edit or teardown is refused there with a pointer to the
+  window (§1). Moving those actions INTO the owning window (e.g. "End session" run by the pop-out)
+  would need a cross-window command channel; not done.
+- **Team sync from a pop-out is silent until a peer speaks first.** The canvas publisher casts only
+  when `hasPeersRef` is true, and that bit is read from the presence table — which a pop-out never
+  joins (§4). It turns true on the first INBOUND mutation (proof of a peer), and inbound mutations
+  do reach a pop-out (`broadcast` includes it), so a pop-out on a shared canvas receives teammates'
+  edits at once and starts casting its own after the first one arrives; before that its edits reach
+  teammates only through the file (git / the ssh mirror). Seeding the bit from the main window needs
+  a new main→pop-out channel carrying the main window's peer count; deferred rather than guessed at,
+  because casting while alone is not free (a ~20 Hz stream during a drag).
+- **The WebGL budget is per renderer.** `setWebglBudget` runs at each window's boot, so two windows
+  can hold 2 × 24 contexts (2 × 16 on macOS) against Chromium's per-process cap of 32
+  (`--max-active-webgl-contexts`) — the GPU process is shared. The macOS number was chosen to cap
+  compositor pressure, which this doubles in the worst case. See the checklist.
 
 ## 7. Device checklist
 
@@ -198,3 +261,13 @@ Verified on macOS (see the PR for the run). Owed elsewhere:
    quit). Confirm no pop-out is left orphaned.
 4. **Two pop-outs closing in the same tick** — the flush map is keyed by webContents id; confirm both
    ack independently rather than one timing out.
+5. **macOS: two-window WebGL zoom-out soak.** Main window and one pop-out, each on a canvas with
+   20+ terminals, both zoomed all the way out, then pan and zoom repeatedly for several minutes. Watch
+   for Chromium's dead "lost context" placeholder (white box + sad face) and for black-composited
+   terminals. Both windows together can ask for 32 contexts against a shared GPU process whose cap
+   is also 32, so this is where a forced eviction would show. If it does, the fix is to split one
+   budget across windows (main hands each renderer its share), not to raise the cap.
+6. **The reviewer's blocking scenarios on a device**: with a terminal-bearing project popped out,
+   the main window's sidebar project menu shows only Show window / Bring back; sidebar ×, Omni
+   delete and "Close project → end sessions" are refused with the strip, and `tmux ls` still lists
+   the pop-out's session.

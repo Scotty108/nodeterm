@@ -4392,17 +4392,31 @@ the Settings section and ShortcutsPanel start disagreeing about what a chord mea
   `main`), and `scopeIndex` keeps the store's previous entry verbatim for everything outside it: main
   cannot delete a detached project, nothing can introduce one, a pop-out's save keeps the previous
   tab order and `activeProjectId`. The Server Edition sets no resolver: unscoped, byte-identical.
-  Rules a refactor must not undo: (1) **save BEFORE popping out** — the new window is booted from
-  the project as last saved, a one-project slice served from the store's memory (`loadFor`), never a
-  second `load()` (the boot path sidelines, migrates and re-seeds `revs`/`lastWritten`, and racing a
-  live main window's autosaves for that bookkeeping is the bug). (2) **A pop-out cannot switch** —
+  Rules a refactor must not undo: (1) **save BEFORE popping out, and only on a save that LANDED**
+  (`writeDisk` resolves whether it did; a refused save refuses the pop-out) — the new window is
+  booted from a one-project slice of the store's CURRENT copy (`loadFor` → `currentProject` →
+  `buildEntry`, the per-entry assembly a full load runs), never the renderer's last save and never a
+  second `load()`. The last save is stale the moment the store writes the project itself (a phone's
+  `appendRemoteNode`, a git pull, the ssh reconcile, the kanban writers), and a reloaded pop-out
+  SAVES what it booted from — the reviewer's probe deleted a phone-registered node that way and is
+  now a test; a second `load()` sidelines, migrates and re-seeds `revs`/`lastWritten` under a live
+  main window. (1b) **The main window refuses every edit to a project it does not own, in the
+  renderer**: the save scope drops the project.json half silently and cannot stop a killed tmux
+  session or a typed `/rename`. Every per-project `useProjects` mutator is in `OWNERSHIP_GUARDED`
+  (refused) or `OWNERSHIP_EXEMPT` (with a reason), `projects.ownership.test.ts` fails on a method in
+  neither, and Canvas paths with side effects outside the store ask `refuseForeignProject` first. A
+  new "act on project X" surface inherits this only if it goes through the store — a direct
+  `useProjects.setState` does not. (2) **A pop-out cannot switch** —
   the refusal is in `useProjects.setActive`, the one funnel every switch path uses; and it never
   joins presence (the same person twice raised the "Someone else is on this canvas" prompt on the
   first sandbox run) nor ghosts anything (`useWindows.detached` is empty inside one). (3) **Per-node
   traffic goes to every app window** (`sendToAppWindows`: agent status, unread clears, external
   changes, pressure) and **round trips go to the window showing the node** (`windowForNode`: control
   requests, browser popups, the browser resolve, a notification click), so exactly one window
-  answers; external-change broadcasts are gated in the renderer by `ownsProjectHere`. (4)
+  answers; external-change broadcasts are gated in the renderer by `ownsProjectHere`, and the agent
+  ALERTS (unread, chime, OS notification) by `alertsHere` — bookkeeping everywhere, interrupts only
+  in the owning window; `app:notify` checks the asking window's focus, and menu commands go to the
+  focused app window (`menuTarget`). (4)
   **Pop-outs are attached clients** (`clientIds()`), or the reaper reads their sessions as
   detached. (5) **Closing runs a bounded flush handshake** (`window:popout-flush` /
   `-flushed`, 2.5 s) — the ack means "you may close me", never "the save landed"; on quit the
@@ -4412,7 +4426,9 @@ the Settings section and ShortcutsPanel start disagreeing about what a chord mea
   Deliberately not: persisted across restarts, nestable, available in a browser/relay tab
   (`windows.popout` rejects; the tab menu hides the row; `isBrowserRuntime()` disarms the drag).
   Known v1 gaps, all in the doc: shared `localStorage` across windows (last-writer-wins on the
-  per-viewer stores), the keyboard-shortcut mirrors stay the main window's, geometry not remembered.
+  per-viewer stores), the keyboard-shortcut mirrors stay the main window's, geometry not remembered,
+  team sync from a pop-out casts only after a peer's first inbound mutation, and the WebGL budget is
+  per renderer (two windows can ask for 2 × 16 on macOS; a soak is on the device checklist).
 - **Window geometry is REMEMBERED** (`main/window-state.ts`, `<userData>/window-state.json`) — size,
   position and maximized state, restored at the next launch. Before this the window opened at a
   hard-coded 1400x900 every time, on every platform, so a user who works maximized re-maximized it

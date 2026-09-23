@@ -1154,9 +1154,11 @@ function createPopoutWindow(projectId: string): BrowserWindow {
   win.once('ready-to-show', () => win.show())
   let flushed = false
   win.on('close', (e) => {
-    // On quit every window closes; the main window's quit flush covers the store. Otherwise ask
-    // the renderer to save first — a close that skips this loses up to one autosave debounce of
-    // edits in a window the user deliberately closed.
+    // On quit every window closes and no renderer is asked to flush — neither this one nor the
+    // main window (the quit path flushes only the ssh mirrors and detaches the ptys), so a quit
+    // loses at most one autosave debounce of edits here, exactly as it does in the main window.
+    // Any other close asks the renderer to save first: a close that skipped it would lose that
+    // same debounce in a window the user deliberately closed.
     if (quitting || flushed) return
     e.preventDefault()
     flushed = true
@@ -2264,6 +2266,11 @@ app.whenReady().then(async () => {
     if (barHeight !== trafficLightBarHeight && process.platform === 'darwin' && !win.isDestroyed()) {
       trafficLightBarHeight = barHeight
       win.setWindowButtonPosition(trafficLightPositionFor(barHeight))
+      // Every pop-out draws the same tab bar from the same setting, so its lights move too.
+      for (const id of detachedProjectIds()) {
+        const p = popoutForProject(id) as unknown as BrowserWindow | null
+        p?.setWindowButtonPosition(trafficLightPositionFor(barHeight))
+      }
     }
   })
   // Keep awake while agents work (docs/superpowers/specs/2026-08-18-keep-awake-design.md): hold an
