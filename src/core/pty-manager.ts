@@ -33,6 +33,8 @@ import {
   remoteTmuxPtyArgs,
   type RemoteSessionEnv,
   remotePasteDelivery,
+  remoteTypedArgs,
+  remoteTmuxEnterArgs,
   remoteCapturePaneArgs,
   remoteCaptureVisibleArgs,
   remoteTmuxWatcherArgs,
@@ -112,8 +114,11 @@ import {
   sessionName,
   isSessionName,
   localPasteDelivery,
+  localTmuxEnterArgs,
+  pasteBufferName,
   runPasteDelivery
 } from './tmux-naming'
+import { localTypedArgs, localTypedEnv, typeThenSubmitWhenSettled } from './typed-input'
 import { encodeSendKeysHex } from './tmux-control'
 import {
   ZELLIJ_NESTING_ENV,
@@ -171,6 +176,7 @@ import {
   hasSharedIdentity,
   readsScreenDialogs,
   setCustomAgentBaseResolver,
+  typesChatInput,
   vanillaEnvStripPattern,
   type AgentId
 } from '../shared/agents/config'
@@ -317,6 +323,25 @@ function runWithStdin(file: string, args: readonly string[], input: string): Pro
     stdin.end(input)
   }
   return p as unknown as Promise<unknown>
+}
+
+/**
+ * The typed chat delivery's LOCAL leg (core/typed-input.ts): `/bin/sh` running the fixed script,
+ * with the tmux path in `env`. Kept apart from `runWithStdin` so the one helper that starts a shell
+ * only ever receives that fixed script — a shared runner handed `/bin/sh` by one caller is a shell
+ * for every caller's arguments (CodeQL reads it that way, and so should a reviewer). Same bounds
+ * as `runWithStdin`: `PROC_TIMEOUT_MS`, rejection on a non-zero exit, a swallowed EPIPE.
+ */
+function runTypedScript(args: readonly string[], input: string, env: NodeJS.ProcessEnv): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = execFile('/bin/sh', [...args], { timeout: PROC_TIMEOUT_MS, env }, (err) =>
+      err === null ? resolve() : reject(err)
+    )
+    child.stdin?.on('error', () => {
+      /* child gone; the exit code is what decides success */
+    })
+    child.stdin?.end(input)
+  })
 }
 
 /** `p`'s answer, or false once `ms` passed (the timer never holds the process). A rejection is false. */
@@ -5714,10 +5739,56 @@ export class PtyManager {
    * composition is exported, both callers use it, and the only thing left in this method is which
    * transport runs it.
    */
-  async sendText(persistKey: string, text: string, opts?: { enter?: boolean }): Promise<TextDeliveryResult> {
+  async sendText(
+    persistKey: string,
+    text: string,
+    opts?: { enter?: boolean; typedFor?: AgentId }
+  ): Promise<TextDeliveryResult> {
+    return this.serializePaneWrite(persistKey, () => this.sendTextNow(persistKey, text, opts))
+  }
+
+  /** Per-pane write chain: see `serializePaneWrite`. */
+  private paneWrites = new Map<string, Promise<unknown>>()
+
+  /**
+   * Run one write into a pane only after every earlier write into the SAME pane has finished.
+   * A typed chat prompt (core/typed-input.ts) takes seconds — one tmux paste per line, then a
+   * settle wait before its Enter — and a paste arriving in that window (an agent message, a
+   * reminder, dictation) would land between its lines and be submitted as part of it. So every
+   * `sendText` and `sendEnvelope` queues here instead of interleaving. Each write is itself bounded
+   * (process timeouts, a fixed number of settle polls), so a slow one delays the next, never wedges
+   * it; a failed one does not poison the chain.
+   */
+  private serializePaneWrite<T>(persistKey: string, run: () => Promise<T>): Promise<T> {
+    const key = sessionName(persistKey)
+    const prev = this.paneWrites.get(key) ?? Promise.resolve()
+    const next = prev.then(run, run)
+    const settled = next.then(
+      () => undefined,
+      () => undefined
+    )
+    this.paneWrites.set(key, settled)
+    void settled.then(() => {
+      if (this.paneWrites.get(key) === settled) this.paneWrites.delete(key)
+    })
+    return next
+  }
+
+  private async sendTextNow(
+    persistKey: string,
+    text: string,
+    opts?: { enter?: boolean; typedFor?: AgentId }
+  ): Promise<TextDeliveryResult> {
     const enter = opts?.enter ?? true
     const target = sessionName(persistKey)
     const live = this.liveSessionForPersistKey(persistKey)
+    // `typedFor` (the ⌘M chat view, set only by `sendChatPrompt`): deliver as keystrokes, not a
+    // paste — see core/typed-input.ts. Only a SUBMITTED prompt on a tmux backend; everything else
+    // keeps the paste path below.
+    if (opts?.typedFor !== undefined && enter) {
+      const typed = await this.sendTyped(persistKey, text, opts.typedFor)
+      if (typed !== null) return typed
+    }
     // A direct (non-persistent) Windows PTY has no session-host entry and no tmux: it is typed
     // into through the pane itself. Routing it to the session host below failed every time.
     if (live?.nativeWindowsPane) return live.nativeWindowsPane.sendText(text, enter)
@@ -5756,13 +5827,73 @@ export class PtyManager {
   }
 
   /**
+   * The typed half of `sendText` — `null` when this session's backend has no typed path (a direct
+   * Windows PTY, the Windows session host, Zellij, no tmux), so the caller falls back to the paste.
+   * Runs inside `serializePaneWrite`, so nothing else writes into the pane while it types.
+   *
+   * Typing takes seconds, so `sendChatPrompt`'s dialog check (made before the first keystroke) can
+   * be stale by the time the Enter goes: for an agent whose screen we can read, the screen is
+   * checked again right before the Enter, and a dialog that opened meanwhile gets no Enter — the
+   * text stays in the composer and the caller hears `pasted-not-submitted`.
+   */
+  private async sendTyped(persistKey: string, text: string, agentId: AgentId): Promise<TextDeliveryResult | null> {
+    const target = sessionName(persistKey)
+    const live = this.liveSessionForPersistKey(persistKey)
+    if (live?.nativeWindowsPane || this.isZellij(persistKey, live)) return null
+    const sshRemote = live?.sshRemote
+    let type: (stdin: string) => Promise<unknown>
+    let submit: () => Promise<unknown>
+    if (sshRemote) {
+      const ssh = findSsh()
+      if (!ssh) return false
+      type = (stdin) =>
+        runWithStdin(ssh, remoteTypedArgs(sshRemote.conn, sshRemote.controlPath, target, pasteBufferName()), stdin)
+      submit = () => runAsync(ssh, remoteTmuxEnterArgs(sshRemote.conn, sshRemote.controlPath, target))
+    } else if (live?.sessionHost || !this.tmuxPath) {
+      return null
+    } else {
+      const tmuxPath = this.tmuxPath
+      type = (stdin) =>
+        runTypedScript(localTypedArgs(TMUX_SOCKET, target, pasteBufferName()), stdin, localTypedEnv(tmuxPath))
+      submit = () => runAsync(tmuxPath, localTmuxEnterArgs(TMUX_SOCKET, target))
+    }
+    const ok = async (run: () => Promise<unknown>): Promise<boolean> => {
+      try {
+        await run()
+        return true
+      } catch {
+        return false
+      }
+    }
+    try {
+      return await typeThenSubmitWhenSettled(text, {
+        capture: async () => {
+          const screen = await this.captureSession(persistKey)
+          return screen === '' ? null : screen
+        },
+        type: (stdin) => ok(() => type(stdin)),
+        // An empty capture is not evidence of a dialog (the `sendChatPrompt` rule).
+        canSubmit: async () => {
+          if (!readsScreenDialogs(agentId)) return true
+          const screen = await this.captureSession(persistKey)
+          return screen === '' || screenGate(screen) === null
+        },
+        submit: () => ok(submit)
+      })
+    } catch {
+      return 'pasted-not-submitted'
+    }
+  }
+
+  /**
    * A prompt from the ⌘M chat view. For an agent whose screen we can read (`readsScreenDialogs`),
    * refused before anything is written when the agent's own UI owns the keyboard: such dialogs
    * (the folder-trust prompt, `/model`, one-time setup questions) fire no hook, so the chat view's
    * state gate cannot see them, and a paste into one swallowed the text while its Enter answered
    * the dialog. An empty capture (no session, a failed read) is not evidence of a dialog: the
-   * prompt is sent exactly as before. There is no second look before the Enter — `sendText`
-   * submits in the same step. Everything else is `sendText`, unchanged.
+   * prompt is sent exactly as before. A PASTED prompt submits in the same step; a TYPED one
+   * (`typesChatInput`, core/typed-input.ts) checks the screen again right before its Enter.
+   * Everything else is `sendText`, unchanged.
    */
   async sendChatPrompt(persistKey: string, text: string, agentId: string): Promise<ChatPromptResult> {
     if (readsScreenDialogs(agentId)) {
@@ -5770,7 +5901,10 @@ export class PtyManager {
       const refused = screen === '' ? null : screenGate(screen)
       if (refused !== null) return refused
     }
-    return this.sendText(persistKey, text)
+    // Typed, not pasted, for an agent whose composer is MEASURED to take M-Enter as a newline:
+    // Claude Code records a multi-line paste as <pasted_content>, which its model is told may not
+    // be the user's own words. Decided here from the agent id — never by a renderer-sent flag.
+    return typesChatInput(agentId) ? this.sendText(persistKey, text, { typedFor: agentId }) : this.sendText(persistKey, text)
   }
 
   /**
@@ -6111,6 +6245,10 @@ export class PtyManager {
    * (`buildEnvelope` can never return '', so this is a guard against a future caller, not a path.)
    */
   async sendEnvelope(persistKey: string, envelope: string, expected?: PaneOwner): Promise<boolean> {
+    return this.serializePaneWrite(persistKey, () => this.sendEnvelopeNow(persistKey, envelope, expected))
+  }
+
+  private async sendEnvelopeNow(persistKey: string, envelope: string, expected?: PaneOwner): Promise<boolean> {
     if (envelope.length === 0) return false
     const live = this.liveSessionForPersistKey(persistKey)
     if (this.isZellij(persistKey, live)) return false

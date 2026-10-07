@@ -1920,6 +1920,38 @@ session.
     one file. Guard on both dialects, construct in one.
   - **Mobile**: N/A — *nodeterm mobile* attaches to tmux sessions over the transport protocol and
     has no canvas or file-browsing concept; adding one means extending that protocol.
+- **Run node** (a `terminal` node carrying `data.runConfig`, NOT a new NodeKind;
+  `@shared/run-config`, `core/run-service.ts`, `nodes/RunBar.tsx`) — VS Code's "Run Without
+  Debugging" for any `.vscode/launch.json` configuration. The toolbar picks a folder (defaults to
+  the project's; sibling and `*.worktrees/*` folders with a launch.json or a Flutter pubspec are
+  offered), a configuration or compound (stored by NAME, re-read at every run) and, for Flutter, a
+  device. **launch.json runs nothing by itself** — each `type` belongs to an extension — so
+  `planLaunch` is the table of what each extension would run: dart (flutter run / flutter test /
+  dart run / dart test), node/pwa-node/node-terminal, python/debugpy, go, php, coreclr,
+  lldb/cppdbg, and chrome/msedge (a browser node). Everything else is REFUSED with a sentence,
+  never guessed: debugging itself, `"request": "attach"`, unknown types, PHP "listen for Xdebug",
+  and variables that need an editor or extension (`${file}`, `${input:}`, `${command:}` except the
+  Python interpreter one, `${config:}`). `preLaunchTask` (+ `dependsOn`, `${defaultBuildTask}`)
+  runs shell/process/npm/dart/flutter/typescript/cargo tasks first; a background (watch) task is
+  refused. Compounds run their first member in the node and open the rest beside it, started.
+  Rules a refactor must keep: (1) **nothing from a repo is ever typed into a shell** — the host
+  writes a POSIX launcher (`buildLauncher`, every token single-quoted, owner-only via
+  `writeFileAtomic`) and only `sh '<launcher>'` is typed; env and `envFile` values live in that
+  file, never in shell history; tested against injection and run for real under `/bin/sh`;
+  (2) the launcher records its pid and exit status, and traps INT/TERM with a HANDLER (`trap ':'`,
+  never `''`, which children would inherit as "ignore"); **Stop is SIGINT to the launcher's process
+  group** (Ctrl+C), SIGTERM if it will not go, and only the launcher + its children when it is not
+  a group leader — never a group that could hold the user's shell; (3) a pid is signalled only
+  while `ps` says it is still ours (the launcher's path, or flutter for hot reload/restart, which
+  are SIGUSR1/SIGUSR2 to `flutter run --pid-file`); (4) Flutter reload on save is a core
+  `fs.watch` of `<dir>/lib` that deliberately OUTLIVES the node's view; (5) the terminal is hidden
+  by default (`runConfig.showTerminal`, toggled by ⋯ with the extra-args field): collapse's
+  `display: none` path via `.term-node:has(.run-bar--compact)` and a node height fitted to the
+  rows; a run that ends without our Stop says where to look. No "bring simulator forward":
+  Simulator.app can only be activated as a whole (same-named simulators are told apart by id in
+  the dropdown). Add menus: **New view ▸ New run configuration**. Local projects only (disabled
+  with `RUN_SSH_HINT` in SSH projects; relay stub answers "managed on the host"); POSIX only
+  (refused on Windows). Server Edition: real. Kanban card modal: not yet. Mobile: N/A.
 - **dino** (`DinoNode.tsx`) — a small self-contained T-Rex-style runner on a canvas (no PTY);
   high score persists via `data.highScore`.
 - **trigger** (`TriggerNode.tsx`) — a canvas-owned schedule (cron / interval / once) that
@@ -2815,6 +2847,32 @@ else, and its context links must keep classifying across restarts).
   `launchCmd`/`args`/`env` in the mirror** — they carry API keys and the file lands on every SSH
   host. `binariesFor` resolves a BLANK launch command with a *builtin* `baseAgent` to the base's
   binaries (what `resolveAgentConfig` actually launches).
+- **Agent-integration consent (#744)** — `core/agent-integrations.ts` (booted by BOTH shells) is the
+  ONE writer of user-owned agent config; consent is `settings.agentIntegrations`
+  (`@shared/agent-integrations`, sanitized on every read). Per agent: **enabled** = hook + both skills
+  in the agent's own skills dir + strip older builds' AGENTS.md/GEMINI.md blocks (they were 17 KB of
+  codex's 32 KiB `project_doc_max_bytes`); **declined** = remove exactly what we wrote (hooks by exact
+  command, skills by exact-content receipt in `<userData>/integration-receipts.json` — a user-edited
+  file is KEPT and listed in Settings, bounded at 20 — legacy blocks, our hook scripts);
+  **undecided** = nothing either way. Server `installHooks: false` is a hard veto. Rules a refactor
+  must not undo:
+  - **Grandfathering is decided at boot from OUR files only** (non-empty `~/.nodeterm/agent-hooks/`
+    or the userData shims), before `settingsStore.registerIpc()` and before any install: an existing
+    install gets every agent + `hostDefault` enabled and a one-time notice; a new install gets NO
+    record and a banner (Enable all / Choose… / Not now — "Not now" declines all, so it asks once).
+  - **No caller reaches an installer by omission.** `installManagedAgentHooks(agents)` takes a
+    REQUIRED set; `RemoteHooks` takes a REQUIRED plan (`NO_REMOTE_INTEGRATION` = fail-closed);
+    account add/link asks `currentIntegrationLifecycle()` and writes nothing when none is registered.
+    `agent-integrations-wiring.test.ts` pins every call site of the global installers.
+  - **SSH consent is per HOST (`sshHostKey`, never identity file / port / args).** A host installs an
+    agent only when the host AND the agent are enabled; an unanswered host is not touched at all
+    (no clean-up, no ssh); removals run on connect and when the plan changes
+    (`SshProjectManager.onIntegrationConsentChanged`). A removal never creates a missing config
+    file (`stripRemoteSettingsFile`).
+  - **`$CLAUDE_CONFIG_DIR` decides the system Claude dir** (`claudeSystemConfigDir`), never a
+    hardcoded `~/.claude`; a decline also cleans the legacy `~/.claude` when they differ.
+  - The fullscreen-TUI write is part of the claude integration and follows its consent.
+  Measurements, the device checklist and the open product question: `docs/agent-integration-consent.md`.
 - **Hook installers** — `src/core/agents/hooks/` holds per-agent hook services + an installer
   registry `MANAGED_HOOK_INSTALLERS`. `managed-script.ts` builds the POSIX hook script that
   POSTs to the server (env-gated: a no-op in the user's normal terminals, active only in
@@ -2880,7 +2938,9 @@ else, and its context links must keep classifying across restarts).
   the validator refuses) settles at one attempt per 15 minutes instead of rewriting every agent's
   hook config every 45 s. A missing spec answers "not alive" rather than "unknown": nothing of ours
   is bound, which is a tunnel that cannot deliver.
-- **An SSH host's agent tools are CHECKED, not assumed** (`RemoteHooks.refreshAgentTools`,
+- **An SSH host's agent tools are CHECKED, not assumed** (since #744 the plan holds only what the
+  host's consent installs — shims + skills, no instruction blocks; an unanswered host is skipped)
+  (`RemoteHooks.refreshAgentTools`,
   `main/remote-ssh/agent-tools-freshness.ts`). The canvas/context shims, both SKILL.md files and our
   blocks in the codex/gemini/copilot/opencode instruction files used to be written only by the
   establish path, blind, and never looked at again, so a host could keep another build's text for
@@ -3479,6 +3539,20 @@ command-bearing opens; this does not add a human-confirm dialog or change mobile
   store at send time, not only at render. Same trap as the in-place restart's `/exit`. The bar's ↻
   reloads on demand (beside the empty state's Retry), since a session whose hooks never report
   `working` never takes the turn-finish reload.
+  **A chat prompt is TYPED for claude, never pasted** (`core/typed-input.ts`, `TYPED_INPUT_CAPABLE`).
+  Claude Code records a multi-line paste as `<pasted_content>`, which its model is told may not be
+  the user's words; typed text (lines joined by tmux's `M-Enter`, measured on 2.1.281) is recorded
+  as plain user text. Three rules: (1) **core decides it from the agent id** inside
+  `sendChatPrompt` (`typedFor`), never a renderer-sent flag — every other agent and every other
+  `sendText` caller keeps the paste; (2) **every write into a pane is serialized per pane**
+  (`PtyManager.serializePaneWrite`, wrapping `sendText` AND `sendEnvelope`): a typed send takes
+  seconds (one paste per line, then a settle wait before Enter), and an agent message, a reminder
+  or dictation arriving in that window would otherwise land between its lines and be submitted as
+  part of it; (3) **the screen is checked again right before the Enter** (`TypedSurface.canSubmit`):
+  the dialog check `sendChatPrompt` makes is seconds old by then, and an Enter into a dialog that
+  opened meanwhile would ANSWER it — the text stays in the composer and the caller hears
+  `pasted-not-submitted`. The panel ignores a second Enter while a send is in flight (the draft is
+  cleared only once it lands).
   **The agent's OWN dialogs are read off the screen** (`shared/agents/claude-screen.ts`, claude
   only — `SCREEN_DIALOG_READABLE`). The folder-trust prompt, `/model` and one-time setup questions
   fire NO hook, so the state gate above reads `done` while one owns the keyboard, and a paste into
@@ -3878,14 +3952,14 @@ command-bearing opens; this does not add a human-confirm dialog or change mobile
   escaping sh can be trusted with — `parseControlBody` reads both this and the JSON dialect) to
   the hook server's `/control/<verb>` routes; `Accept: text/plain` makes the server render the
   reply (sh has no JSON parser). Env-gated on `NODETERM_CANVAS_CONTROL` (set by
-  `buildPtyEnv`/`remoteHookEnvArgs` per `canControlCanvas`). Discovery: claude gets a
-  `skills/manage-nodeterm-canvas/SKILL.md` (system `~/.claude` + each managed account dir);
-  codex/gemini/opencode plus Copilot's `copilot-instructions.md` get a marker block
-  (`<!-- nodeterm:manage-canvas:start/end -->`); **grok needs
-  no installer at all** — it scans `~/.claude/skills` by default for Claude compat, so membership alone
-  (which sets `NODETERM_CANVAS_CONTROL`) is the whole wiring. That premise rests on grok's shipped
-  docs and is **unverified** (`grok inspect --json` never run); if it does not hold, grok takes the
-  marker-block route instead — see docs/grok-agent.md.
+  `buildPtyEnv`/`remoteHookEnvArgs` per `canControlCanvas`). Discovery (since #744): EVERY
+  consented agent gets `skills/manage-nodeterm-canvas/SKILL.md` in its OWN skills dir — claude's
+  config dir (+ each local managed/linked account dir), `$CODEX_HOME/skills`, `~/.gemini/skills`,
+  `$GROK_HOME/skills`, `$COPILOT_HOME/skills`, opencode's `<config>/skills`; on an SSH host claude's
+  dir and `~/.agents/skills` (read by codex, gemini, opencode, grok — measured — and copilot,
+  documented). The marker blocks (`<!-- nodeterm:manage-canvas:start/end -->`) in AGENTS.md /
+  GEMINI.md / copilot-instructions.md are no longer written and an older build's copy is STRIPPED;
+  see **Agent-integration consent** under Agent support.
   **Server creator ownership (2026-08 incident hardening):** enabled Server control accepts only
   verified node identity. `HeadlessNodeFactory` records which source node opened each new node in a
   process-local ledger; link/group/rename/color/sticky-update, message delivery, and close validate
@@ -3951,7 +4025,8 @@ command-bearing opens; this does not add a human-confirm dialog or change mobile
   **Keep the agent-facing text in sync with behaviour, in the SAME PR.** The verb help agents
   actually read is generated by `buildCanvasSkillBody` (the SKILL.md, rewritten into every config
   dir by `installCanvasSkillInto` on launch) and `buildCanvasControlInstructions` (the
-  codex/gemini/copilot/opencode marker block) — both in `canvas-control-core.ts`. When you add or
+  codex/gemini/copilot/opencode marker block — NOT INSTALLED since #744, its parity tests are what
+  keep it; every agent now reads the skill) — both in `canvas-control-core.ts`. When you add or
   rename a verb, change a flag, or change what an outcome MEANS (e.g. PR 7 turned a busy target's
   `targetBusy` refusal into a deliver-on-idle queue), update those two functions in the same change,
   or the docs describe a product that no longer exists and an orchestrating agent acts on the stale
@@ -5021,10 +5096,10 @@ command-bearing opens; this does not add a human-confirm dialog or change mobile
   the local locators for remote nodes (they'd resolve a stranger's local transcript). Server
   Edition IS wired (`src/server/context-link.ts` calls `initContextLink(ptyManager, {})`) but
   passes no remote deps → **local-only**, which is the complete answer there: that shell runs ON the
-  host whose transcripts and tmux it reads, and SSH projects are a desktop-only concept. Discovery is per-agent: claude installs a
-  `get-linked-context` skill; codex/gemini get an idempotent marker block
-  (`<!-- nodeterm:get-linked-context:start/end -->`) merged into `~/.codex/AGENTS.md` /
-  `~/.gemini/GEMINI.md`. On connect an idle-gated one-line note is injected into each endpoint
+  host whose transcripts and tmux it reads, and SSH projects are a desktop-only concept. Discovery is the `get-linked-context` skill in each consented
+  context-link-capable agent's own skills dir (since #744; the old marker block
+  `<!-- nodeterm:get-linked-context:start/end -->` in AGENTS.md / GEMINI.md is stripped — see
+  **Agent-integration consent**). On connect an idle-gated one-line note is injected into each endpoint
   (claude → skill pointer; codex/gemini → inline CLI command via `contextLink.info()`).
   (Replaced the earlier MCP-based bridge.)
   **One-way links (issue #852):** a context bridge may carry `reader` (`BridgeLink.reader`, the ONE

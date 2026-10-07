@@ -104,6 +104,7 @@ import { DinoNode } from '../nodes/DinoNode'
 import { TriggerNode } from '../nodes/TriggerNode'
 import BrowserNode from '../nodes/BrowserNode'
 import { FilesNode } from '../nodes/FilesNode'
+import type { RunNodeConfig } from '@shared/run-config'
 import { normalizeAddress } from '../nodes/browserUrl'
 import VideoNode from '../nodes/VideoNode'
 import WebNode from '../nodes/WebNode'
@@ -137,6 +138,7 @@ import {
   IconMinus,
   IconNote,
   IconPhone,
+  IconPlay,
   IconPlus,
   IconPower,
   IconProject,
@@ -415,9 +417,11 @@ import {
   clearEnvEligibility,
   restartEligibility,
   restartSessionId,
+  runBoundedBulkRestart,
   settleRestart,
   summarizeBulkRestart,
   type BulkRestartPlan,
+  type BulkRestartTask,
   type RestartOutcome
 } from '../terminal/agent-restart'
 import {
@@ -676,6 +680,7 @@ import {
   recentlyClosedProjects,
   stateToReopenSnapshot
 } from '../lib/closedHistory'
+import { projectSwitchHint } from '../lib/projectSwitchHint'
 import { uuid } from '../lib/uuid'
 import { CANVAS_LAYOUTS_CAP, findLayoutByName, type CanvasLayout } from '@shared/canvas-layout'
 import { applyLayout, captureLayout } from '../lib/canvasLayout'
@@ -703,6 +708,11 @@ import { useContextWindow } from '../state/contextWindow'
 import { useSessionNaming } from '../state/sessionNaming'
 import { useSshServers } from '../state/sshServers'
 import { useSshConn } from '../state/sshConn'
+import {
+  HostIntegrationBanner,
+  IntegrationGrandfatherNotice,
+  IntegrationPromptBanner
+} from '../components/settings/IntegrationConsent'
 import { scopeFromKey, usageScopeKey } from '../lib/usageScope'
 import { useSystemAccount } from '../state/systemAccount'
 import { useEntitlement } from '../state/entitlement'
@@ -847,6 +857,7 @@ import {
   createDinoNode,
   createTriggerNode,
   createFilesNode,
+  createRunNode,
   createDiffNode,
   createEditorNode,
   createGroupNode,
@@ -2080,6 +2091,12 @@ export function Canvas() {
   /** The active project runs on a remote host → every worktree affordance is off (see
    *  WORKTREE_SSH_HINT). Reactive, so the menus rebuild when the user switches projects. */
   const isSshProject = !!activeSshServer
+  /** The active SSH project's host, once it is CONNECTED — the host the consent banner asks about
+   *  (nothing is installed there until it is answered). */
+  const activeSshHostKey = useSshConn((c) => {
+    const id = useProjects.getState().activeProjectId
+    return activeSshServer && id && c.byProject[id] ? sshHostKey(activeSshServer) : null
+  })
   /**
    * ONE confirm dialog at a time — mirrored into a ref so the []-dep agent-control effect sees the
    * CURRENT dialogs (it closes over a stale `confirm`).
@@ -6211,6 +6228,53 @@ export function Canvas() {
     [setNodes, markDirty, activeProjectId, emptyNodePos, cwdForNewNodeIn, parentInto]
   )
 
+  /**
+   * A run node (see @shared/run-config and nodes/RunBar): a `.vscode/launch.json` configuration run
+   * in a terminal. Rooted in the frame's worktree or the project folder; the node's own folder
+   * picker can point it at any other checkout, so one project (say, the backend) can hold runs of
+   * several frontend checkouts. A cwd-less canvas asks for the folder up front. Local projects
+   * only — an SSH project's terminals run on the host, while the launcher, processes and
+   * simulators are this machine's.
+   */
+  const addRun = useCallback(
+    async (center?: { x: number; y: number }, groupId?: string) => {
+      const project = useProjects.getState().getProject(activeProjectId)
+      if (project?.ssh) {
+        setCopyError('Run configurations run on this machine — not in SSH projects yet.')
+        return
+      }
+      const dir = cwdForNewNodeIn(groupId) ?? project?.cwd ?? (await window.nodeTerminal.dialog.selectFolder())
+      if (!dir) return
+      setNodes((ns) => {
+        const node = createRunNode(ns.length, { projectDir: dir, reloadOnSave: true }, center ?? emptyNodePos())
+        return [...ns, groupId ? parentInto(node, groupId) : node]
+      })
+      markDirty()
+    },
+    [setNodes, markDirty, activeProjectId, emptyNodePos, cwdForNewNodeIn, parentInto]
+  )
+
+  // A compound's other members (RunBar's Run on a compound): one run node each, placed to the
+  // right of the node that ran it, in its frame, starting immediately — VS Code starts a compound's
+  // configurations together.
+  useEffect(() => {
+    const onOpenRun = (e: Event): void => {
+      const d = (e as CustomEvent<{ sourceNodeId?: string; configs?: RunNodeConfig[] }>).detail
+      const src = nodesRef.current.find((n) => n.id === d?.sourceNodeId)
+      if (!src || !Array.isArray(d?.configs) || d.configs.length === 0) return
+      const w = src.measured?.width ?? (src.width as number) ?? 640
+      const added = d.configs.slice(0, 8).map((cfg, i) => {
+        const node = createRunNode(nodesRef.current.length + i, cfg, undefined, { autoStart: true })
+        node.position = { x: src.position.x + (w + 40) * (i + 1), y: src.position.y }
+        return src.parentId ? { ...node, parentId: src.parentId, extent: 'parent' as const } : node
+      })
+      setNodes((ns) => [...ns, ...added])
+      markDirty()
+    }
+    window.addEventListener('nodeterm:open-run-config', onOpenRun)
+    return () => window.removeEventListener('nodeterm:open-run-config', onOpenRun)
+  }, [setNodes, markDirty])
+
   const addSticky = useCallback(
     (center?: { x: number; y: number }, groupId?: string) => {
       setNodes((ns) => {
@@ -8814,19 +8878,33 @@ export function Canvas() {
       onConfirm: () => {
         setConfirm(null)
         void (async () => {
-          const outcomes: RestartOutcome[] = []
-          // Sequential on purpose (spec): each restart types into its own pane and then verifies
-          // the echo of the resume line, and the whole canvas shares one PTY transport. The user
-          // gets ONE notice at the end rather than a progress UI — the run is a handful of nodes
-          // and each is visibly restarting in its own pane meanwhile.
-          for (const id of plan.runnable) {
-            const fn = agentRestartFn(id)
-            // Unmounted since the plan was made: 'not-eligible' is folded into the no-session
-            // skips by summarizeBulkRestart, so it is still counted. `settleRestart` turns a
-            // REJECTED restart into a counted failure — an escaping rejection here would abandon
-            // every node after it and swallow the summary the user confirmed this run for.
-            outcomes.push(fn ? await settleRestart(fn) : 'not-eligible')
-          }
+          const total = plan.runnable.length
+          setNotice({ kind: 'info', text: `Restarting 0/${total}…`, sticky: true })
+
+          const activeProject = useProjects.getState().getProject(useProjects.getState().activeProjectId)
+          const projectHostKey = activeProject?.ssh ? sshHostKey(activeProject.ssh.server) : undefined
+
+          const tasks: BulkRestartTask[] = plan.runnable.map((id) => {
+            const n = nodesRef.current.find((node) => node.id === id)
+            const nodeHostKey = n?.data.ssh ? sshHostKey(n.data.ssh as SshServer) : projectHostKey
+            return {
+              id,
+              hostKey: nodeHostKey,
+              run: async () => {
+                const fn = agentRestartFn(id)
+                return fn ? await settleRestart(fn) : 'not-eligible'
+              }
+            }
+          })
+
+          const outcomes = await runBoundedBulkRestart(tasks, {
+            onProgress: (completed, totalCount) => {
+              if (completed < totalCount) {
+                setNotice({ kind: 'info', text: `Restarting ${completed}/${totalCount}…`, sticky: true })
+              }
+            }
+          })
+
           // A line reporting failures must not fade itself out from under the user; a clean run
           // may. Same rule as the per-node notices above.
           setNotice({
@@ -11256,6 +11334,7 @@ export function Canvas() {
       web: (at) => void addWebView(at),
       sticky: (at) => addSticky(at),
       files: (at) => addFiles(at),
+      run: (at) => void addRun(at),
       dino: (at) => addDino(at),
       trigger: (at) => addTrigger(at),
       openFile: (at) => void openFileDialog(at),
@@ -11268,6 +11347,7 @@ export function Canvas() {
       openRemotePicker,
       addBrowser,
       addFiles,
+      addRun,
       addWebView,
       addSticky,
       addDino,
@@ -18429,6 +18509,9 @@ export function Canvas() {
             }
           ]
         : []),
+      ...(isSshProject
+        ? []
+        : [{ id: 'new-run', label: 'New run configuration', icon: <IconPlay />, run: () => void addRun() }]),
       { id: 'new-dino', label: 'New dino game', icon: <IconDino />, run: () => addDino() },
       { id: 'open-file', label: 'Open file…', icon: <IconEditor />, run: () => void openFileDialog() },
       // "New file…" needs a project folder to create into — hidden when the project has no cwd.
@@ -18669,19 +18752,23 @@ export function Canvas() {
     store.projects
       // Skip unavailable projects: activating one lets edits commit to the store but they're
       // dropped on save (the ref emits header-only), so switching there silently loses work.
-      // The TabBar already guards its own click; this covers the palette (⌘K) path.
-      .filter((p) => p.id !== store.activeProjectId && !p.unavailable)
-      .forEach((p) =>
+      // The TabBar already guards its own click; this covers the palette (⌘K) path. A closed team
+      // tab is skipped too (its reopen is refused), and the hint tells a team tab apart from the
+      // SSH project it was shared from, which carries the same name.
+      .filter((p) => p.id !== store.activeProjectId)
+      .forEach((p) => {
+        const hint = projectSwitchHint(p)
+        if (hint === null) return
         cmds.push({
           id: `proj-${p.id}`,
           label: `Switch to ${p.name}`,
-          hint: 'project',
+          hint,
           icon: <IconSwitch />,
           // A closed project is REOPENED (tab restored), never activated behind a hidden tab — and
           // the reopen is the guarded one, which asks first for a project handed to a hosted team.
           run: () => (p.closed ? void reopenProject(p.id) : switchProject(p.id))
         })
-      )
+      })
     const cs = useAgentStatus.getState()
     // Labels replaced free-text tags — search matches label NAMES now (unified system).
     const searchKanban = useProjects.getState().getProject(useProjects.getState().activeProjectId)?.kanban
@@ -18739,6 +18826,7 @@ export function Canvas() {
     addTerminal,
     addAgentNode,
     addSticky,
+    addRun,
     addDino,
     addWebView,
     addBrowser,
@@ -18832,6 +18920,21 @@ export function Canvas() {
 
       <div className="top-banners">
         <AnnouncementBanner />
+        {/* Agent-integration consent (issue #744): the first-run question, the grandfathered
+            install's one-time notice, and the active SSH host's own question. */}
+        <IntegrationPromptBanner
+          onChoose={() => {
+            setSettingsSection('agents')
+            setSettingsOpen(true)
+          }}
+        />
+        <IntegrationGrandfatherNotice
+          onOpenSettings={() => {
+            setSettingsSection('agents')
+            setSettingsOpen(true)
+          }}
+        />
+        <HostIntegrationBanner hostKey={activeSshHostKey} />
         {/* Discovery belongs to the local core; never run its installer on an SSH/relay host. */}
         <TmuxBanner
           onInstall={!isSshProject && session.id === localSession.id ? runInTerminal : undefined}
@@ -20054,6 +20157,7 @@ export function Canvas() {
         onAddDino={addDino}
         onAddTrigger={addTrigger}
         onAddFiles={() => addFiles()}
+        onAddRun={() => void addRun()}
         onAddAgent={(aid, accountId) => addAgentNode(aid, undefined, undefined, accountId)}
         onOpenFile={() => void openFileDialog()}
         onAddRemote={() => openRemotePicker({ x: window.innerWidth / 2, y: window.innerHeight / 2 })}
