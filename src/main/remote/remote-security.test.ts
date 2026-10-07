@@ -31,17 +31,30 @@ function makeHostFakes() {
     readBinary: async () => '',
     writeText: async () => true
   }
-  const pty = {
+  // The relay attach is decided in core (`prepareRelayAttach`); this fake composes it from the
+  // three steps it hands back, so the host-service tests below keep pinning the ORDER the host
+  // runs them in (probe → reply → snapshot → attach) without a real PtyManager.
+  const fake = {
     createDetached: vi.fn(() => 'sess'),
-    attachDetached: vi.fn(() => 'sess'),
-    captureSnapshot: vi.fn(async () => ''),
+    attachDetached: vi.fn((..._args: unknown[]) => 'sess'),
+    captureSnapshot: vi.fn(async (_nodeId?: string) => ''),
     // Asked before every attach so the client learns whether the session had to be created.
-    sessionExists: vi.fn(async () => true),
+    sessionExists: vi.fn(async (_nodeId?: string) => true),
     write: vi.fn(),
     resize: vi.fn(),
     setFlow: vi.fn(),
     kill: vi.fn()
-  } as unknown as HostPtyManager
+  }
+  const pty = {
+    ...fake,
+    prepareRelayAttach: vi.fn(async (nodeId: string, size: { cols: number; rows: number }) => ({
+      kind: 'ready' as const,
+      remote: false,
+      sessionExists: () => pty.sessionExists(nodeId),
+      snapshot: () => pty.captureSnapshot(nodeId),
+      attach: async (sinks: unknown) => pty.attachDetached(nodeId, sinks, size)
+    }))
+  } as unknown as HostPtyManager & typeof fake
   return { socket, responses, fs, reads, pty }
 }
 
@@ -263,6 +276,77 @@ describe('pty.attach reports whether it had to CREATE the session', () => {
     await vi.waitFor(() => expect(pty.attachDetached).toHaveBeenCalled())
     const attachedAt = (pty.attachDetached as ReturnType<typeof vi.fn>).mock.invocationCallOrder[0]
     expect(probedAt).toBeLessThan(attachedAt)
+  })
+})
+
+// A node that lives on a remote host the desktop cannot reach right now is REFUSED, with a sentence
+// the phone can show — never attached (the old bare `attachDetached` made it a LOCAL shell in this
+// machine's `$HOME` wearing the remote node's id). The refusal hands out no stream, so nothing may
+// be left reserved behind it.
+describe('pty.attach refused by core (remote node, no master)', () => {
+  it('answers ok:false with the reason, attaches nothing and releases the stream', async () => {
+    const { socket, responses, fs, pty } = makeHostFakes()
+    ;(pty.prepareRelayAttach as ReturnType<typeof vi.fn>).mockResolvedValue({
+      kind: 'refused',
+      reason: 'not-connected',
+      message: 'This session lives on deploy@box.test, which this computer is not connected to right now.'
+    })
+    const events: string[] = []
+    const handlers = createHostHandlers(
+      pty, socket, fs, () => ['/work'], async () => '', () => null,
+      undefined, undefined, undefined,
+      { attached: (id: string) => events.push(`+${id}`), detached: (id: string) => events.push(`-${id}`) }
+    )
+    handlers.onRpc({ id: 'a', method: 'pty.attach', params: { nodeId: 'node-ssh', cols: 80, rows: 24, projectId: 'p-ssh' } })
+    await vi.waitFor(() => expect(responses.length).toBeGreaterThan(0))
+    expect(responses.at(-1)).toEqual({
+      id: 'a',
+      ok: false,
+      body: { reason: 'not-connected', message: expect.stringContaining('deploy@box.test') }
+    })
+    expect(pty.attachDetached).not.toHaveBeenCalled()
+    expect(pty.sessionExists).not.toHaveBeenCalled()
+    expect(events).toEqual(['+node-ssh', '-node-ssh'])
+    // The phone's project hint reaches core, which may only use it to choose or refuse.
+    expect(pty.prepareRelayAttach).toHaveBeenCalledWith('node-ssh', { cols: 80, rows: 24 }, { projectId: 'p-ssh' })
+  })
+})
+
+// Issue #914: a session-host session follows its most recently active viewer, so the pty can run
+// at a size the phone did not ask for. The relay tells it with `OP.Resized` (same payload as
+// `OP.Resize`), and a phone that did not say it renders that frame is a ceiling for the session.
+describe('pty.attach forwards the real pty size as OP.Resized', () => {
+  function attachWith(params: Record<string, unknown>) {
+    const fakes = makeHostFakes()
+    const frames: Array<{ op: number; streamId: number; payload: Uint8Array }> = []
+    fakes.socket.sendFrame = (op, streamId, _seq, payload) => {
+      frames.push({ op, streamId, payload })
+      return true
+    }
+    const handlers = createHostHandlers(fakes.pty, fakes.socket, fakes.fs, () => ['/work'])
+    handlers.onRpc({ id: 'a', method: 'pty.attach', params: { nodeId: 'node-a', cols: 80, rows: 24, ...params } })
+    return { ...fakes, frames }
+  }
+  const sinksOf = async (pty: ReturnType<typeof makeHostFakes>['pty']) => {
+    await vi.waitFor(() => expect(pty.attachDetached).toHaveBeenCalled())
+    return (pty.attachDetached as ReturnType<typeof vi.fn>).mock.calls[0][1] as import('../../core/pty-manager').DetachedSinks
+  }
+
+  it('encodes the size as two little-endian uint16s on the stream', async () => {
+    const { pty, frames } = attachWith({})
+    const sinks = await sinksOf(pty)
+    sinks.onSize?.({ cols: 132, rows: 43 })
+    const resized = frames.filter((frame) => frame.op === OP.Resized)
+    expect(resized).toHaveLength(1)
+    expect(resized[0].streamId).toBe(1)
+    const view = new DataView(resized[0].payload.buffer)
+    expect([view.getUint16(0, true), view.getUint16(2, true)]).toEqual([132, 43])
+  })
+
+  it('treats a phone as able to adapt only when it says so', async () => {
+    expect((await sinksOf(attachWith({}).pty)).adaptsToSize).toBe(false)
+    expect((await sinksOf(attachWith({ resizedFrames: 'yes' }).pty)).adaptsToSize).toBe(false)
+    expect((await sinksOf(attachWith({ resizedFrames: true }).pty)).adaptsToSize).toBe(true)
   })
 })
 

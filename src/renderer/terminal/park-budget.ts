@@ -24,8 +24,10 @@ import type { AgentState } from '@shared/agents/normalize'
 export const PARK_MAX = 20
 
 /** Default park window in minutes (`settings.terminalParkMinutes`) — the historical
- *  `TERM_PARK_MS` of 5 minutes, unchanged for everyone who never touches the setting. */
-export const PARK_MINUTES_DEFAULT = 5
+ *  `TERM_PARK_MS` was 5 minutes; raised to 10 (issue #886) so a short detour through other
+ *  projects no longer lands an SSH project on the seconds-long reattach path. The memory it holds
+ *  is bounded by the count cap (`PARK_MAX`), not by the window. */
+export const PARK_MINUTES_DEFAULT = 10
 /** Settings UI ceilings. The window's `0` means "until the app quits", so the ceiling only
  *  bounds a typed number; the cap's is a sanity bound for a hand-edited settings.json. */
 export const PARK_MINUTES_MAX = 24 * 60
@@ -107,6 +109,13 @@ export interface ParkedEntryState {
   parkedAt?: number
   /** The node's agent state RIGHT NOW, read from that node's own agent-status store. */
   liveAgentState?: AgentState
+  /** An agent CLI was running in the pane AT PARK TIME (`agentProcessInPane`). Snapshotted for
+   *  the same reason as `parkedAgentState`: the parking unmount clears the node's status. */
+  agentProcess?: boolean
+  /** The node's CLI has announced its exit SINCE the park (`AgentNodeStatus.sessionEnded`, read
+   *  live). A veto over the `agentProcess` snapshot, which only says what was true at park time:
+   *  an unmounted pane keeps running, and its CLI can still exit (the kanban card modal). */
+  liveSessionEnded?: boolean
 }
 
 /** `canDisposePark` for a park entry: the live read, with the AGED park-time snapshot under it.
@@ -116,6 +125,7 @@ export interface ParkedEntryState {
 export function canDisposeParkedEntry(e: ParkedEntryState, now: number = Date.now()): boolean {
   return canDisposePark({
     tmuxBacked: e.tmuxBacked,
+    agentProcess: e.agentProcess === true && e.liveSessionEnded !== true,
     agentState: effectiveAgentState(
       e.liveAgentState,
       parkedStateFloor(e.parkedAgentState, e.parkedAt, now)

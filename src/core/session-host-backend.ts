@@ -1,17 +1,38 @@
+import type { TextDeliveryResult } from '../shared/text-delivery'
 // The thin facade `pty-manager.ts` talks to — owns the ONE process-wide `SessionHostClient` (one
 // long-lived connection per app process, matching how `PtyManager` itself keeps one `tmuxPath`
 // for the whole process) and exposes exactly the operations pty-manager's existing tmux/ssh call
 // sites need a session-host equivalent for. Nothing here is tmux-specific or Electron-specific;
 // see docs/windows-session-host.md for how each of these maps onto the underlying protocol.
 
+import fs from 'fs'
+import path from 'path'
 import { platform } from './platform'
 import {
   SessionHostClient,
-  SessionHostProtocolCompatibilityError
+  SessionHostProtocolCompatibilityError,
+  type HostShutdownOutcome,
+  type HostUpdateInspection
 } from './session-host-client'
 import { SessionHostPty } from './session-host-pty'
+import { ensureStagedHostRuntime } from './session-host-runtime'
 import type { ExecuteLaunchResult, SessionHostSpawnOptions } from '../session-host/protocol'
 import type { PreparedAgentLaunch } from './agent-launch'
+import type { PaneOwner } from '../shared/agents/pane-owner-predicate'
+
+export async function sessionHostMessageOwner(name: string): Promise<PaneOwner | null> {
+  return getClient().messageOwner(name)
+}
+
+export async function sessionHostMessagePasteReady(name: string): Promise<boolean> {
+  return getClient().messagePasteReady(name)
+}
+
+export async function sessionHostMessageEnvelope(
+  name: string, envelope: string, expected: PaneOwner
+): Promise<boolean> {
+  return getClient().messageEnvelope(name, envelope, expected)
+}
 
 let client: SessionHostClient | null = null
 
@@ -26,7 +47,31 @@ function getClient(): SessionHostClient {
       appPath: platform().appPath,
       // Dev-mode fallback, mirroring `findTmux`'s own `process.cwd()` use: under `electron-vite
       // dev` the cwd is the repo root, which is where `npm run host:build` writes its bundle.
-      repoRoot: process.cwd()
+      repoRoot: process.cwd(),
+      // Windows: run the host from a private copy of its runtime under %LOCALAPPDATA%, so the
+      // installer can replace the install directory while sessions keep running (issue #829).
+      // Packaged builds only — a dev checkout's host runs from the repo as before.
+      stageRuntime:
+        process.platform === 'win32' && platform().isPackaged
+          ? (script) =>
+              ensureStagedHostRuntime({
+                platform: process.platform,
+                execPath: process.execPath,
+                resourcesPath: platform().resourcesPath,
+                script,
+                appVersion: platform().appVersion,
+                localAppData: process.env.LOCALAPPDATA,
+                // Into the host's own log, so a device report carries why a host ran from where.
+                log: (line) => {
+                  void fs.promises
+                    .appendFile(
+                      path.join(platform().userDataDir, 'session-host.log'),
+                      `${new Date().toISOString()} [app] ${line}\n`
+                    )
+                    .catch(() => undefined)
+                }
+              })
+          : undefined
     })
   }
   return client
@@ -68,7 +113,7 @@ export function attachExistingSessionHostPty(name: string): SessionHostPty {
 
 /** Background write — works whether or not this process currently has a live client for `name`,
  *  exactly like `sendText`'s tmux `send-keys -t <name>` needs no attached client. */
-export async function sessionHostSendKeys(name: string, text: string, enter: boolean): Promise<boolean> {
+export async function sessionHostSendKeys(name: string, text: string, enter: boolean): Promise<TextDeliveryResult> {
   return getClient().sendKeys(name, text, enter)
 }
 
@@ -124,4 +169,14 @@ export async function sessionHostHasSession(name: string): Promise<boolean> {
  *  (`listNodetermSessions` — the relay host's session browser). */
 export async function sessionHostListSessions(): Promise<string[]> {
   return getClient().listSessions()
+}
+
+/** Prepare-for-update (issue #829): what the running host holds, without ever launching one. */
+export async function sessionHostInspectForUpdate(): Promise<HostUpdateInspection> {
+  return getClient().inspectForUpdate()
+}
+
+/** Prepare-for-update (issue #829): ask the running host to end every session and exit. */
+export async function sessionHostShutdownForUpdate(): Promise<HostShutdownOutcome> {
+  return getClient().shutdownForUpdate()
 }

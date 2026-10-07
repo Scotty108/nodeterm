@@ -357,6 +357,45 @@ export function initCodexAccounts(getSshManager?: () => SshProjectManager | unde
     }
   })
 
+  // ---- The SSH switch: one host-side exposure --------------------------------------------------
+  // A node on an SSH host keeps its conversation in that host's account homes, so the three-phase
+  // LOCAL reservation below has nothing to plan. The host primitive is already atomic and
+  // self-verifying (hardlink + discover-or-roll-back), and the credentials never move: only the
+  // rollout's directory entry does. Refused while this build is removing either account.
+  ipcMain.handle(
+    IPC.codexAccountsSwitchThreadRemote,
+    async (
+      _event,
+      threadId: string,
+      targetAccountId: string | undefined,
+      hostAccountIds: unknown,
+      ctx?: { projectId?: string }
+    ) => {
+      if (typeof threadId !== 'string' || !SAFE_THREAD_ID.test(threadId)) {
+        throw new Error('Invalid Codex account switch request')
+      }
+      if (targetAccountId) assertCodexAccountId(targetAccountId)
+      if (!Array.isArray(hostAccountIds) || hostAccountIds.some((id) => typeof id !== 'string')) {
+        throw new Error('Invalid Codex account switch request')
+      }
+      for (const id of hostAccountIds as string[]) assertCodexAccountId(id)
+      if (targetAccountId && !(hostAccountIds as string[]).includes(targetAccountId)) {
+        throw new Error('The target Codex account is not on this host')
+      }
+      if (targetAccountId && removingCodexAccounts.has(targetAccountId)) {
+        throw new Error('Codex account removal is in progress')
+      }
+      const remote = remoteFor(ctx)
+      if (!remote) throw new Error('An SSH project is required for a remote Codex switch')
+      await remote.mgr.remoteCodexSwitchThread(
+        remote.projectId,
+        threadId,
+        targetAccountId,
+        hostAccountIds as string[]
+      )
+    }
+  )
+
   // ---- The three-phase, owner-authorized, TTL-bounded switch (§4.1 / Properties 5, 10) ----------
 
   ipcMain.handle(

@@ -76,6 +76,7 @@ export type AgentMessageOutcome =
   | { kind: 'targetNotAgentPane'; observed: string }
   | { kind: 'targetNotPasteAware' }
   | { kind: 'targetGone' }
+  | { kind: 'targetNotStarted' } // launch held, never spawned yet — queued when a queue is wired. Retryable.
   | { kind: 'notPermitted'; reason: NotPermittedReason }
 
 export type AgentMessageOutcomeKind = AgentMessageOutcome['kind']
@@ -109,6 +110,7 @@ export const RETRYABLE: Record<AgentMessageOutcomeKind, boolean> = {
   targetNotAgentPane: false,
   targetNotPasteAware: false,
   targetGone: false,
+  targetNotStarted: true,
   notPermitted: false
 }
 
@@ -231,6 +233,12 @@ function idleRefusal(e: MirrorEntry | undefined): AgentMessageOutcome | null {
       kind: 'targetNotIdleUnknown',
       reason: 'the last known status was restored from disk at startup, not observed this run'
     }
+  // An identity-only entry: the mirror kept the session id past EXPIRE_MS but threw the state away.
+  if (e.stateExpired)
+    return {
+      kind: 'targetNotIdleUnknown',
+      reason: 'the last known status expired (no hook event for over 6 hours)'
+    }
   if (e.state === undefined)
     return { kind: 'targetNotIdleUnknown', reason: 'the node is between sessions (no current state)' }
   if (e.state !== 'done') return { kind: 'targetBusy', state: e.state }
@@ -294,7 +302,9 @@ function identityRefusal(
   // and a never-seen node carry no observation, so calling their script stale would be an
   // accusation we have no evidence for. They fall through to the token-file question, which is
   // answerable without an event.
-  const observed = !!e && e.restored !== true
+  // An identity-only entry (`stateExpired`) is not an observation either: its state and every
+  // piece of evidence about that state were stripped when it expired.
+  const observed = !!e && e.restored !== true && e.stateExpired !== true
   if (observed && !(typeof e.clientRevision === 'number' && e.clientRevision >= MIN_TOKEN_AWARE_REVISION))
     return {
       kind: 'targetHookScriptStale',
@@ -302,8 +312,18 @@ function identityRefusal(
       ...(typeof e.clientRevision === 'number' ? { observedRevision: e.clientRevision } : {})
     }
   if (!f.tokenFilePresent) return { kind: 'targetStatusUnverified', note: NO_TOKEN_FILE_NOTE }
+  // A node that HAS proven itself and whose CLI then crossed a session boundary (started, resumed,
+  // ended) is not "stale" — it is between sessions, which is `idleRefusal`'s fact. Reporting it as
+  // `targetStatusStale` told the caller the identity was the problem, while the real fact is that
+  // no turn has been reported since the boundary.
+  if (observed && e.state === undefined && typeof e.verifiedAt === 'number')
+    return { kind: 'targetNotIdleUnknown', reason: SESSION_BOUNDARY_REASON }
   return { kind: 'targetStatusStale' }
 }
+
+export const SESSION_BOUNDARY_REASON =
+  'the node crossed a session boundary (its CLI started, resumed or exited) and has not reported ' +
+  'a turn since'
 
 /**
  * The gates that cost NOTHING to evaluate — decided before any pane is touched.

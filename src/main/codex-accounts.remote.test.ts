@@ -33,7 +33,8 @@ const mgr = {
   remoteCodexAccountIdentity: vi.fn(async (): Promise<{ email: string | null } | null> => ({
     email: 'ops@example.com'
   })),
-  remoteCodexAccountRemove: vi.fn(async () => true)
+  remoteCodexAccountRemove: vi.fn(async () => true),
+  remoteCodexSwitchThread: vi.fn(async () => {})
 }
 const sender = { id: 1, isDestroyed: () => false, once: () => {}, removeListener: () => {} }
 const call = (channel: string, ...args: any[]) => h.handlers[channel]({ sender }, ...args)
@@ -102,5 +103,28 @@ describe('Codex account verbs over SSH', () => {
     expect(mgr.remoteCodexAccountRemove).toHaveBeenCalledWith('p1', 'acct1')
     mgr.remoteCodexAccountRemove.mockResolvedValueOnce(false)
     await expect(call(IPC.codexAccountsRemove, 'acct1', CTX)).rejects.toThrow(/SSH host/)
+  })
+})
+
+describe('Codex running-node switch over SSH', () => {
+  it('exposes the thread to the target on the host behind the project', async () => {
+    await call(IPC.codexAccountsSwitchThreadRemote, 'thread-1', 'acc2', ['acc1', 'acc2'], CTX)
+    expect(mgr.remoteCodexSwitchThread).toHaveBeenCalledWith('p1', 'thread-1', 'acc2', ['acc1', 'acc2'])
+    // To the host's system account (no id) too.
+    await call(IPC.codexAccountsSwitchThreadRemote, 'thread-1', undefined, ['acc1'], CTX)
+    expect(mgr.remoteCodexSwitchThread).toHaveBeenLastCalledWith('p1', 'thread-1', undefined, ['acc1'])
+  })
+
+  it('refuses a target that is not one of the host accounts, a bad id, and a missing ctx', async () => {
+    await expect(
+      call(IPC.codexAccountsSwitchThreadRemote, 'thread-1', 'elsewhere', ['acc1'], CTX)
+    ).rejects.toThrow(/not on this host/)
+    await expect(
+      call(IPC.codexAccountsSwitchThreadRemote, '../x', 'acc1', ['acc1'], CTX)
+    ).rejects.toThrow(/Invalid/)
+    await expect(
+      call(IPC.codexAccountsSwitchThreadRemote, 'thread-1', 'acc1', ['acc1'])
+    ).rejects.toThrow(/SSH project is required/)
+    expect(mgr.remoteCodexSwitchThread).not.toHaveBeenCalled()
   })
 })

@@ -14,6 +14,7 @@
 
 import fs from 'fs'
 import net from 'net'
+import { hostMessagePane } from './message-pane'
 import path from 'path'
 import crypto from 'crypto'
 import { sessionHostPaths, currentProtocolVersion, type SessionHostState } from './paths'
@@ -23,14 +24,17 @@ import {
   type SessionHostRequest,
   type SessionHostFrame,
   type AttachResult,
+  type HelloResult,
+  SESSION_HOST_FEATURES,
   type HasSessionResult,
   type PaneCommandResult,
   type CaptureResult,
   type KillSessionResult,
-  type ListSessionsResult
+  type ListSessionsResult,
+  type ShutdownResult
 } from './protocol'
 import { HostSession } from './session'
-import { sendKeysWrites } from './send-keys-delivery'
+import { sendTextWhenSettled } from '../core/settled-text'
 import { paneCommand as readPaneCommand } from './process-tree'
 import { terminateWindowsProcessTree } from './windows-process-tree'
 import { publishSessionHostState } from './state-file'
@@ -67,6 +71,11 @@ function tokenMatches(received: unknown, expected: string): boolean {
   const b = Buffer.from(expected)
   return a.length === b.length && crypto.timingSafeEqual(a, b)
 }
+
+/** How long a `shutdown` waits for any one session's kill to be CONFIRMED (node-pty's onExit)
+ *  before reporting it as not ended. Without a bound one wedged process would leave the host
+ *  refusing every new session for the rest of its life. */
+const SHUTDOWN_KILL_DEADLINE_MS = 20_000
 
 const COMPLETED_KILL_TTL_MS = 10 * 60_000
 const MAX_COMPLETED_KILLS = 1_024
@@ -326,6 +335,55 @@ async function main(): Promise<void> {
   }
   const generationCoordinator = new SessionGenerationCoordinator(sessions, cancelGraceExit)
 
+  /** Connections that negotiated the `geometry` feature at hello. Only these may ever receive a
+   *  `geometry` push: an older client reads any non-`data` push frame as an exit (issue #914). */
+  const geometrySockets = new WeakSet<net.Socket>()
+  /** Connections that negotiated the `shutdown` feature. Only these may ask the host to end every
+   *  session and exit (issue #829): the command is destructive, so an app build that never asked
+   *  for it can never trigger it by accident. */
+  const shutdownSockets = new WeakSet<net.Socket>()
+  /** Set while a `shutdown` is ending sessions. New sessions (attach / attachExisting / launches)
+   *  are refused for its duration; cleared again only if the shutdown could not end everything. */
+  let shuttingDown = false
+
+  /** Tell every geometry-aware subscriber the size the pty now actually runs at. */
+  function publishGeometry(session: HostSession, geometry: { cols: number; rows: number }): void {
+    const line = encodeFrame({
+      type: 'geometry',
+      name: session.name,
+      cols: geometry.cols,
+      rows: geometry.rows,
+      generation: session.generation
+    } satisfies SessionHostFrame)
+    for (const sub of session.subscribers) {
+      if (geometrySockets.has(sub)) writeSessionHostFrame(sub, line, sessions.values())
+    }
+  }
+
+  /** The attach reply, plus the pty's current size for a geometry-aware connection — the answer
+   *  that `geometry` pushes then keep current. */
+  function withGeometry(name: string, socket: net.Socket, result: AttachResult): AttachResult {
+    if (!geometrySockets.has(socket)) return result
+    const session = sessions.get(name)
+    if (!session || session.exited) return result
+    return { ...result, geometry: session.geometry }
+  }
+
+  /** A v2 hello's reply. Features are the intersection of what the client asked for and what this
+   *  host speaks; a client that asked for nothing gets nothing and is never sent a frame it did not
+   *  opt into. Only a v2 connection reaches here — a v1 hello's reply carries no result at all. */
+  function negotiateHello(req: SessionHostRequest, socket: net.Socket): HelloResult {
+    const requested = (req as { features?: unknown }).features
+    const features = Array.isArray(requested)
+      ? SESSION_HOST_FEATURES.filter((feature) => requested.includes(feature))
+      : []
+    if (features.includes('geometry')) geometrySockets.add(socket)
+    if (features.includes('shutdown')) shutdownSockets.add(socket)
+    return features.length > 0
+      ? { protocolVersion: currentProtocolVersion(), features }
+      : { protocolVersion: currentProtocolVersion() }
+  }
+
   function broadcast(session: HostSession, frame: SessionHostFrame): void {
     const line = encodeFrame(frame)
     for (const sub of session.subscribers) {
@@ -401,6 +459,7 @@ async function main(): Promise<void> {
   }
 
   function wireSession(session: HostSession): void {
+    session.onGeometryApplied = (geometry) => publishGeometry(session, geometry)
     session.proc.onData((data) => {
       // node-pty may flush a queued data callback after its exit callback. Once endSession has
       // disposed the emulator and broadcast exit, no data may touch or appear after that boundary.
@@ -764,19 +823,109 @@ async function main(): Promise<void> {
     return promise
   }
 
+  /** Prepare-for-update (issue #829). Ends every live session through the SAME kill path a single
+   *  `killSession` takes (taskkill of the process tree on Windows, then node-pty's real onExit as
+   *  the proof), so a shutdown claims nothing a kill would not. Persisted node metadata belongs to
+   *  the app and is untouched: the nodes stay on the canvas and cold-restore on the next launch.
+   *  If ANY session could not be confirmed ended, the shutdown fails, names them, and the host
+   *  keeps serving — the caller must not quit the app believing the install directory is free. */
+  async function handleShutdown(socket: net.Socket): Promise<ShutdownResult> {
+    if (!shutdownSockets.has(socket)) {
+      throw new Error('shutdown requires the shutdown feature negotiated at hello')
+    }
+    if (shuttingDown) throw new Error('session-host is already shutting down')
+    shuttingDown = true
+    cancelGraceExit()
+    const targets = [...sessions.values()]
+    const endOne = async (session: HostSession): Promise<string> => {
+      const inFlight = ending.get(session.name)
+      if (inFlight) await inFlight.promise
+      else if (session.exited || session.retiring) await session.ending
+      else await handleKill(session.name, crypto.randomUUID(), session.generation, false)
+      return session.name
+    }
+    const withDeadline = (p: Promise<string>): Promise<string> =>
+      new Promise<string>((resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error('kill not confirmed in time')),
+          SHUTDOWN_KILL_DEADLINE_MS
+        )
+        timer.unref?.()
+        p.then(
+          (v) => {
+            clearTimeout(timer)
+            resolve(v)
+          },
+          (e) => {
+            clearTimeout(timer)
+            reject(e)
+          }
+        )
+      })
+    const results = await Promise.allSettled(targets.map((session) => withDeadline(endOne(session))))
+    const failed: string[] = []
+    const ended: string[] = []
+    results.forEach((r, i) => {
+      if (r.status === 'fulfilled') ended.push(r.value)
+      else failed.push(targets[i].name)
+    })
+    // A session that slipped in through a path the guard does not cover would still be running.
+    for (const session of sessions.values()) {
+      if (!session.exited && !failed.includes(session.name)) failed.push(session.name)
+    }
+    if (failed.length > 0) {
+      shuttingDown = false
+      scheduleGraceExitIfEmpty()
+      log(`shutdown incomplete — still running: ${failed.join(', ')}`)
+      throw new Error(`session-host could not end: ${failed.join(', ')}`)
+    }
+    log(`shutdown: ended ${ended.length} session(s)`)
+    return { ended }
+  }
+
+  /** Exit after the shutdown reply has been FLUSHED to the requester — the reply is the caller's
+   *  only proof the sessions ended, so it must not be lost to process exit. Bounded: a peer that
+   *  never reads cannot hold the host up. */
+  function exitAfterShutdown(socket: net.Socket): void {
+    try {
+      server.close()
+    } catch {
+      /* already closed */
+    }
+    for (const other of liveSockets) if (other !== socket) other.destroy()
+    let done = false
+    const finish = (): void => {
+      if (done) return
+      done = true
+      cleanupFiles()
+      process.exit(0)
+    }
+    setTimeout(finish, 2_000).unref?.()
+    socket.end(finish)
+  }
+
   async function dispatch(
     req: SessionHostRequest,
     socket: net.Socket,
     clientProtocolVersion: 1 | 2
   ): Promise<{ ok: true; result?: unknown } | { ok: false; error: string }> {
+    if (
+      shuttingDown &&
+      (req.cmd === 'attach' || req.cmd === 'attachExisting' || req.cmd === 'executeLaunch')
+    ) {
+      return { ok: false, error: 'session-host is shutting down for an update' }
+    }
     switch (req.cmd) {
       case 'attach':
-        return { ok: true, result: await handleAttach(req, socket) }
+        return { ok: true, result: withGeometry(req.name, socket, await handleAttach(req, socket)) }
       case 'attachExisting':
         if (clientProtocolVersion === 1) {
           return { ok: false, error: 'attachExisting requires session-host protocol v2' }
         }
-        return { ok: true, result: await handleAttachExisting(req, socket) }
+        return {
+          ok: true,
+          result: withGeometry(req.name, socket, await handleAttachExisting(req, socket))
+        }
       case 'hasSession':
         {
           const session = sessions.get(req.name)
@@ -817,17 +966,17 @@ async function main(): Promise<void> {
         s.resumeFor(socket)
         return { ok: true }
       }
-      case 'sendKeys': {
+      case 'sendKeys':
+      case 'sendKeysV2': {
         const s = sessions.get(req.name)
         if (!s || s.exited) return { ok: false, error: 'no such session' }
-        // Framed from the pane's REAL bracketed-paste state, with the Enter as its own write —
-        // the session host's equivalent of tmux's `paste-buffer -p` + `send-keys Enter`. See
-        // send-keys-delivery.ts; the mode read crosses the emulator tail, so re-check liveness
-        // after it rather than writing into a session that exited meanwhile.
-        const bracketed = await s.bracketedPasteRequested()
-        if (s.exited || sessions.get(req.name) !== s) return { ok: false, error: 'no such session' }
-        for (const chunk of sendKeysWrites(req.text, req.enter, bracketed)) s.proc.write(chunk)
-        return { ok: true }
+        const ok = await sendTextWhenSettled(s, req.text, req.enter, {
+          current: () => !s.exited && sessions.get(req.name) === s,
+          bracketed: () => s.bracketedPasteRequested(),
+          capture: () => s.serialize(200),
+          write: (chunk) => s.proc.write(chunk)
+        })
+        return ok !== false ? { ok: true, result: { delivery: ok } } : { ok: false, error: 'session unavailable or delivery busy' }
       }
       case 'paneCommand': {
         const s = sessions.get(req.name)
@@ -835,6 +984,15 @@ async function main(): Promise<void> {
         const command = await readPaneCommand(s.proc.pid)
         return { ok: true, result: { command } satisfies PaneCommandResult }
       }
+      case 'messageOwnerV1':
+        return { ok: true, result: await hostMessagePane(() => sessions.get(req.name)).owner() }
+      case 'messagePasteReadyV1':
+        return { ok: true, result: await hostMessagePane(() => sessions.get(req.name)).pasteReady() }
+      case 'messageEnvelopeV1':
+        return {
+          ok: true,
+          result: await hostMessagePane(() => sessions.get(req.name)).send(req.envelope, req.expected)
+        }
       case 'capture': {
         const s = sessions.get(req.name)
         if (!s || s.exited) return { ok: true, result: { text: '' } satisfies CaptureResult }
@@ -899,6 +1057,8 @@ async function main(): Promise<void> {
         return { ok: true, result: { names: [...sessions.keys()] } satisfies ListSessionsResult }
       case 'ping':
         return { ok: true }
+      case 'shutdown':
+        return { ok: true, result: await handleShutdown(socket) }
       default:
         return { ok: false, error: `unknown command` }
     }
@@ -920,6 +1080,7 @@ async function main(): Promise<void> {
           encodeFrame({ id: req.id, ...res }),
           sessions.values()
         )
+        if (req.cmd === 'shutdown' && res.ok) exitAfterShutdown(socket)
       } catch (e) {
         writeSessionHostFrame(
           socket,
@@ -963,11 +1124,7 @@ async function main(): Promise<void> {
               encodeFrame(
                 clientProtocolVersion === 1
                   ? { id: req.id, ok: true }
-                  : {
-                      id: req.id,
-                      ok: true,
-                      result: { protocolVersion: currentProtocolVersion() }
-                    }
+                  : { id: req.id, ok: true, result: negotiateHello(req, socket) }
               ),
               sessions.values()
             )
@@ -991,11 +1148,7 @@ async function main(): Promise<void> {
             encodeFrame(
               clientProtocolVersion === 1
                 ? { id: req.id, ok: true }
-                : {
-                    id: req.id,
-                    ok: true,
-                    result: { protocolVersion: currentProtocolVersion() }
-                  }
+                : { id: req.id, ok: true, result: negotiateHello(req, socket) }
             ),
             sessions.values()
           )

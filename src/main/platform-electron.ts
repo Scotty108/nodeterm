@@ -182,7 +182,9 @@ export function electronPlatform(): ElectronPlatform {
       // fan out via broadcast, so a peer that only received sendTo would still see nothing.
       const peers = peerRegistry()
       if (peers.size === 0) return // solo desktop: no ids() array, no loop — allocation-free
-      for (const id of peers.ids()) {
+      // A quiet peer (a live link's viewer) is never broadcast to: canvas ops, presence and agent
+      // status are not its business. It is reached by an addressed sendTo only.
+      for (const id of peers.broadcastIds()) {
         // One peer must never break the fan-out. UiSinkRegistry.sendTo already contains a throwing
         // SINK (and evicts a dead one), so this only catches the rest of the path — the flow
         // controller it may call into. Either way the invariant is the same: an exception here
@@ -200,13 +202,20 @@ export function electronPlatform(): ElectronPlatform {
     },
     // Pop-outs are attached clients too (the pty manager's "attached" test reads this list — a
     // pop-out's sessions must not read as detached to the reaper).
-    clientIds: () => [...mainWindowClientIds(), ...popoutClientIds(), ...peerRegistry().ids()],
+    clientIds: () => [...mainWindowClientIds(), ...popoutClientIds(), ...peerRegistry().broadcastIds()],
+    // Quiet peers are absent from clientIds() (the canvas reflector, like broadcast, must skip
+    // them) but still watch the sessions they subscribe to — the pty reaper reads this.
+    quietClientIds: () => peerRegistry().quietIds(),
+    // The app's own windows (main and pop-outs) are owners; every relay peer (peerRegistry) is not.
+    isOwnerClient: (id) =>
+      !peerRegistry().has(id) && (mainWindowClientIds().includes(id) || popoutClientIds().includes(id)),
     openExternal: (url) => shell.openExternal(url),
     // Seal / unseal node secrets at rest with the OS keychain. Byte-in byte-out, mirroring #167's
     // codex-node-auth-key.json shape: encrypt the UTF-8 content of the passed buffer, decrypt back to
     // the same bytes. Both are supplied together (a shell must supply BOTH hooks or NEITHER — see
-    // CorePlatform). If the keychain is unavailable safeStorage throws, which node-auth-secret.ts
-    // surfaces as a rejected load; both shells catch that and run legacy (fail-open), never crash.
+    // CorePlatform). If the keychain is unavailable safeStorage throws: node-auth-secret.ts then stores
+    // a NEW secret raw at 0600 (issue #1088 — Linux with no keyring), and only a sealed key it cannot
+    // unseal rejects the load, which the shell catches into legacy (fail-open), never a crash.
     sealSecret: (b) => safeStorage.encryptString(b.toString('utf8')),
     unsealSecret: (b) => Buffer.from(safeStorage.decryptString(b), 'utf8'),
   }

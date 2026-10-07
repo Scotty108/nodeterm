@@ -7,7 +7,7 @@ import { Button } from '@renderer/ui/Button'
 import { Switch } from '@renderer/ui/Switch'
 import { useSettings } from '@renderer/state/settings'
 import { usePhonePairing } from '../usePhonePairing'
-import { IOS_APP_STORE_URL } from '@renderer/lib/links'
+import { mobileStoreLinks } from '@renderer/lib/links'
 import { hostOsFromNavigator, sshServerCopy } from '@shared/ssh-server'
 import {
   pairingEndedMessage,
@@ -16,6 +16,8 @@ import {
   relayOnlyExplanation
 } from '@shared/pairing-gate'
 import { thisMachine } from '../../../lib/machineName'
+import { isBrowserRuntime } from '@renderer/bridge/runtime'
+import { PushWebhookPanel } from './PushWebhookPanel'
 
 const ROWS = {
   remote: {
@@ -24,14 +26,22 @@ const ROWS = {
   },
   pair: {
     title: 'Pair phone',
-    keywords: ['phone', 'pair', 'qr', 'ios', 'mobile', 'ssh', 'scan', 'nodeterm']
+    keywords: ['phone', 'pair', 'qr', 'ios', 'android', 'mobile', 'ssh', 'scan', 'nodeterm']
   },
   devices: {
     title: 'Paired devices',
-    keywords: ['phone', 'device', 'devices', 'paired', 'revoke', 'ios', 'iphone', 'remove']
+    keywords: ['phone', 'device', 'devices', 'paired', 'revoke', 'ios', 'iphone', 'android', 'remove']
+  },
+  webhook: {
+    title: 'Push webhook',
+    keywords: ['webhook', 'push', 'notification', 'notify', 'ci', 'build', 'script', 'curl', 'token']
   }
 }
 const ENTRIES = Object.values(ROWS)
+// The webhook needs this machine's relay host key, which a browser tab on the Server Edition does
+// not have (its bridge answers E_UNSUPPORTED) — so the row and its search entry are desktop-only.
+// Asked at render, not at import: the boot switch marks the browser runtime after modules load.
+const BROWSER_ENTRIES = ENTRIES.filter((r) => r !== ROWS.webhook)
 
 /** Format an epoch-ms pairing time as a short local date. */
 function formatPairedAt(ms: number): string {
@@ -55,6 +65,7 @@ export function PhoneSection({ isActive }: { isActive: boolean }): React.JSX.Ele
   // in the warning colour would read as a failure.
   const [revokeNote, setRevokeNote] = useState<{ text: string; warn: boolean } | null>(null)
 
+  const showWebhook = !isBrowserRuntime()
   const phoneAccessEnabled = useSettings((s) => s.settings.phoneAccessEnabled)
   const updateSettings = useSettings((s) => s.update)
 
@@ -169,9 +180,9 @@ export function PhoneSection({ isActive }: { isActive: boolean }): React.JSX.Ele
     <SettingsSection
       id="phone"
       title="Phone"
-      description="Pair the nodeterm iOS app so it can connect to this machine over your local network — no terminal commands needed."
+      description="Pair the nodeterm mobile app so it can connect to this machine over your local network — no terminal commands needed."
       isActive={isActive}
-      searchEntries={ENTRIES}
+      searchEntries={showWebhook ? ENTRIES : BROWSER_ENTRIES}
     >
       <SearchableRow {...ROWS.remote}>
         <div className="space-y-3">
@@ -198,17 +209,22 @@ export function PhoneSection({ isActive }: { isActive: boolean }): React.JSX.Ele
         <div className="space-y-4">
           <h4 className="text-[13px] font-medium text-text">Pair phone</h4>
           <p className="text-sm text-muted">
-            Pair the nodeterm iOS app: scan this QR with your phone. Your phone generates its own
+            Pair the nodeterm mobile app: scan this QR with your phone. Your phone generates its own
             key on-device — nothing secret leaves this machine except a single-use pairing token.
           </p>
           <p className="text-sm text-muted">
             Don&apos;t have the app yet?{' '}
-            <button
-              className="cursor-pointer underline hover:text-text"
-              onClick={() => window.nodeTerminal.shell.openExternal(IOS_APP_STORE_URL)}
-            >
-              Get nodeterm for iOS on the App Store
-            </button>
+            {mobileStoreLinks().map((store, i) => (
+              <span key={store.id}>
+                {i > 0 ? ' · ' : null}
+                <button
+                  className="cursor-pointer underline hover:text-text"
+                  onClick={() => window.nodeTerminal.shell.openExternal(store.url)}
+                >
+                  {store.label}
+                </button>
+              </span>
+            ))}
           </p>
 
           {phase === 'idle' || phase === 'timeout' ? (
@@ -216,7 +232,7 @@ export function PhoneSection({ isActive }: { isActive: boolean }): React.JSX.Ele
               {phase === 'timeout' ? (
                 <p
                   className={ended?.reason === 'relay-failed' ? 'text-sm' : 'text-sm text-muted'}
-                  style={ended?.reason === 'relay-failed' ? { color: '#ff9f0a' } : undefined}
+                  style={ended?.reason === 'relay-failed' ? { color: 'var(--warn)' } : undefined}
                 >
                   {pairingEndedMessage({ ...ended, windows: !sshKey })}
                 </p>
@@ -232,7 +248,7 @@ export function PhoneSection({ isActive }: { isActive: boolean }): React.JSX.Ele
               {gate === 'relay-off' || gate === 'relay-dev' ? (
                 // Relay-only host (Windows): no key is installed, so the relay IS the connection
                 // and a code without it would pair the phone to nothing.
-                <p className="text-sm" style={{ color: '#ff9f0a' }}>
+                <p className="text-sm" style={{ color: 'var(--warn)' }}>
                   {relayGateMessage(gate, 'Remote access from your phone')}
                 </p>
               ) : gate === 'ssh-off' ? (
@@ -240,7 +256,7 @@ export function PhoneSection({ isActive }: { isActive: boolean }): React.JSX.Ele
                 // sshd installs a key the phone can never use — the scan must wait, not the fix.
                 // The live probe (usePhonePairing) flips sshOpen and the QR appears by itself.
                 <div className="space-y-2">
-                  <p className="text-sm" style={{ color: '#ff9f0a' }}>
+                  <p className="text-sm" style={{ color: 'var(--warn)' }}>
                     <strong>{sshServer.name}</strong> is off, so your phone wouldn&apos;t be able
                     to connect after pairing. Turn it on — the QR appears here the moment it is
                     (watching, no need to restart pairing).
@@ -291,20 +307,20 @@ export function PhoneSection({ isActive }: { isActive: boolean }): React.JSX.Ele
                   {!sshKey ? (
                     <p className="text-xs text-muted">{relayOnlyExplanation(windowsKeyFile)}</p>
                   ) : relayPlan === 'dev' ? (
-                    <p className="text-sm" style={{ color: '#ff9f0a' }}>
+                    <p className="text-sm" style={{ color: 'var(--warn)' }}>
                       Dev build: the relay is off regardless of the toggle, so this code pairs
                       LAN-only. Run a packaged build — or set NODETERM_RELAY_URL — for remote
                       access.
                     </p>
                   ) : !phoneAccessEnabled ? (
-                    <p className="text-sm" style={{ color: '#ff9f0a' }}>
+                    <p className="text-sm" style={{ color: 'var(--warn)' }}>
                       LAN-only code: the phone will reach this machine only on this network. Turn
                       on <strong>Remote access from your phone</strong> above first to also
                       connect from cellular — the QR refreshes by itself.
                     </p>
                   ) : null}
                   {sshHealed ? (
-                    <p className="text-sm" style={{ color: '#30d158' }}>
+                    <p className="text-sm" style={{ color: 'var(--success)' }}>
                       ✓ {sshServer.name} is on — scan away.
                     </p>
                   ) : null}
@@ -316,17 +332,17 @@ export function PhoneSection({ isActive }: { isActive: boolean }): React.JSX.Ele
 
           {phase === 'paired' ? (
             <div className="space-y-3">
-              <p className="text-sm font-medium" style={{ color: '#30d158' }}>
+              <p className="text-sm font-medium" style={{ color: 'var(--success)' }}>
                 {sshKey
                   ? '✓ Paired. Your phone can now connect with its own key.'
                   : '✓ Paired. Your phone connects to this computer through remote access.'}
               </p>
               {relayResult === 'ok' ? (
-                <p className="text-sm" style={{ color: '#30d158' }}>
+                <p className="text-sm" style={{ color: 'var(--success)' }}>
                   Remote access is set up — the phone can reach this machine from anywhere.
                 </p>
               ) : relayResult === 'failed' ? (
-                <p className="text-sm" style={{ color: '#ff9f0a' }}>
+                <p className="text-sm" style={{ color: 'var(--warn)' }}>
                   ⚠ Remote-access setup failed, so this pairing is LAN-only for now. Check this
                   machine&apos;s internet connection and pair again to retry — or the phone will
                   pick it up by itself next time it connects on this network.
@@ -347,7 +363,7 @@ export function PhoneSection({ isActive }: { isActive: boolean }): React.JSX.Ele
           ) : null}
 
           {error ? (
-            <p className="text-sm" style={{ color: '#ff9f0a' }}>
+            <p className="text-sm" style={{ color: 'var(--warn)' }}>
               {error}
             </p>
           ) : null}
@@ -382,13 +398,19 @@ export function PhoneSection({ isActive }: { isActive: boolean }): React.JSX.Ele
           {revokeNote ? (
             <p
               className={revokeNote.warn ? 'text-sm' : 'text-sm text-muted'}
-              style={revokeNote.warn ? { color: '#ff9f0a' } : undefined}
+              style={revokeNote.warn ? { color: 'var(--warn)' } : undefined}
             >
               {revokeNote.text}
             </p>
           ) : null}
         </div>
       </SearchableRow>
+
+      {showWebhook ? (
+        <SearchableRow {...ROWS.webhook}>
+          <PushWebhookPanel />
+        </SearchableRow>
+      ) : null}
 
       {pendingRevoke ? (
         <ConfirmDialog

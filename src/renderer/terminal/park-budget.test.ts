@@ -150,6 +150,21 @@ describe('a parked plain-shell agent survives the departure clear (#126)', () =>
       expect(canDisposeParkedEntry(working, parkedAt + WORKING_STALE_MS + 1)).toBe(true)
     })
 
+    it('protects a park whose pane held an idle agent CLI on a non-tmux pty', () => {
+      const idleAgent: ParkedEntryState = { tmuxBacked: false, parkedAgentState: 'done', parkedAt, agentProcess: true }
+      expect(canDisposeParkedEntry(idleAgent, parkedAt + 10 * WORKING_STALE_MS)).toBe(false)
+      expect(canDisposeParkedEntry({ ...idleAgent, tmuxBacked: true })).toBe(true)
+      expect(canDisposeParkedEntry({ ...idleAgent, agentProcess: false })).toBe(true)
+    })
+
+    it('releases that park once its CLI announces an exit AFTER parking', () => {
+      // The snapshot was taken while the CLI ran; the live read is what can say it has since left.
+      const idleAgent: ParkedEntryState = { tmuxBacked: false, parkedAgentState: 'done', parkedAt, agentProcess: true }
+      expect(canDisposeParkedEntry({ ...idleAgent, liveSessionEnded: true })).toBe(true)
+      // The veto never overrides a live turn: exited-then-relaunched-and-working stays protected.
+      expect(canDisposeParkedEntry({ ...idleAgent, liveSessionEnded: true, liveAgentState: 'working' })).toBe(false)
+    })
+
     it('keeps protecting a waiting snapshot past the same window', () => {
       const waiting: ParkedEntryState = { ...working, parkedAgentState: 'waiting' }
       expect(canDisposeParkedEntry(waiting, parkedAt + 10 * WORKING_STALE_MS)).toBe(false)
@@ -271,16 +286,17 @@ describe('planParkEviction — remote parks go last (issue #886)', () => {
 })
 
 describe('parkWindowMs', () => {
-  it('defaults to the historical 5 minutes', () => {
-    expect(parkWindowMs(PARK_MINUTES_DEFAULT)).toBe(5 * 60_000)
-    expect(parkWindowMs(undefined)).toBe(5 * 60_000)
+  it('defaults to 10 minutes', () => {
+    expect(PARK_MINUTES_DEFAULT).toBe(10)
+    expect(parkWindowMs(PARK_MINUTES_DEFAULT)).toBe(10 * 60_000)
+    expect(parkWindowMs(undefined)).toBe(10 * 60_000)
   })
   it('0 = no window at all (null), never Infinity', () => {
     // setTimeout clamps a delay above 2^31-1 ms to ~1 ms: an Infinity window would dispose at once.
     expect(parkWindowMs(0)).toBeNull()
   })
   it('a broken hand-edit falls back to the default, never to "keep forever"', () => {
-    for (const bad of [NaN, -1, Infinity, '30', null]) expect(parkWindowMs(bad)).toBe(5 * 60_000)
+    for (const bad of [NaN, -1, Infinity, '30', null]) expect(parkWindowMs(bad)).toBe(10 * 60_000)
   })
   it('clamps to the ceiling, which stays under the setTimeout overflow', () => {
     expect(parkWindowMs(1e9)).toBe(PARK_MINUTES_MAX * 60_000)

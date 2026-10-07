@@ -7,6 +7,7 @@ import { ConfirmDialog } from '../../ConfirmDialog'
 import { ProCompare } from './ProCompare'
 import { Button } from '@renderer/ui/Button'
 import { machineNoun, otherMachines, thisMachine } from '@renderer/lib/machineName'
+import { mobileStoreNames } from '@renderer/lib/links'
 import { isBrowserRuntime } from '@renderer/bridge/runtime'
 import type { SettingsSectionId } from '../nav'
 import { Input } from '@renderer/ui/Input'
@@ -42,6 +43,8 @@ const ROWS = {
       'copy key',
       'app store',
       'iphone',
+      'google play',
+      'android',
       'pairing'
     ]
   }
@@ -53,7 +56,7 @@ const ENTRIES = Object.values(ROWS)
 function AppStorePairingHint(): React.JSX.Element {
   return (
     <p className="text-sm text-muted">
-      Already have Pro from the App Store? Pairing the phone with that subscription can unlock Pro
+      Already have Pro from {mobileStoreNames()}? Pairing the phone with that subscription can unlock Pro
       in the desktop app without a license key.{' '}
       {isBrowserRuntime()
         ? 'In the desktop app, open Settings → Phone to pair. Server Edition does not support this activation route. '
@@ -184,7 +187,7 @@ export function LicenseSection({
                       {releasing ? 'Releasing…' : 'Release other devices'}
                     </Button>
                     {releaseNote ? (
-                      <p className="text-sm" style={{ color: '#ff9f0a' }}>
+                      <p className="text-sm" style={{ color: 'var(--warn)' }}>
                         {releaseNote}
                       </p>
                     ) : null}
@@ -241,7 +244,7 @@ export function LicenseSection({
                     exactly who this screen exists for, and `Could not activate (seat_limit).` is
                     a dead end: the word is unsearchable and names no way out. */}
                 {ent.status.error ? (
-                  <p className="text-sm" style={{ color: '#ff9f0a' }}>
+                  <p className="text-sm" style={{ color: 'var(--warn)' }}>
                     {activationErrorSentence(ent.status.error)}
                   </p>
                 ) : null}

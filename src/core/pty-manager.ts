@@ -1,3 +1,5 @@
+import type { ChatPromptBlocked, ChatPromptResult, TextDeliveryResult } from '../shared/text-delivery'
+import { claudeScreenBlocksInput, readClaudeScreen } from '../shared/agents/claude-screen'
 import os from 'os'
 import fs from 'fs'
 import path from 'path'
@@ -19,6 +21,7 @@ import {
 } from '../shared/types'
 import { bundledTmuxPath, findCommand, findFixedTmux, tmuxInstall } from './tmux-hint'
 import { hookServer, PERM_WAIT_SECS_DEFAULT } from './agents/hook-server'
+import { findAgy, pathWithAgyDir } from './agents/hooks/antigravity'
 import {
   probeSaysAbsent,
   remoteHookEnvArgs,
@@ -31,7 +34,11 @@ import {
   type RemoteSessionEnv,
   remotePasteDelivery,
   remoteCapturePaneArgs,
+  remoteCaptureVisibleArgs,
+  remoteTmuxWatcherArgs,
+  remoteWindowSizeArgs,
   remotePaneCommandArgs,
+  remotePaneCwdArgs,
   remoteSessionAgeArgs,
   parseSessionAge,
   remotePaneOwnerCombinedArgs,
@@ -44,13 +51,45 @@ import {
   type RemoteEndPlan,
   type RemoteNodeOwnerResolver
 } from './remote-end'
+import {
+  planRelayAttach,
+  placementIsRemote,
+  type RelayAttachRefusal,
+  type RelayNodePlacement,
+  type RelayRemoteRef
+} from './relay-attach-plan'
 import { RemoteSessionIndex, type SessionVerdict } from './remote-ssh/remote-session-index'
+import { isSshProgram, nativeExecFileAsync, nativeMux, useNativeSsh } from './remote-ssh/native/native-runtime'
+import { NativeSshPty } from './remote-ssh/native/native-pty'
 import { remotePtySpawnGate, type SpawnSlot } from './remote-ssh/pty-spawn-gate'
 import type { SshConnection } from '../shared/ssh'
 import { recordPendingRemoteKill, type PendingRemoteKill } from './pending-remote-kills'
 import { probeAgentSockToPin } from './remote-ssh/agent-probe'
 import { parsePaneCursor } from './pane-cursor'
 import { classifyPaneCwd } from './pane-cwd'
+import {
+  localCaptureVisibleArgs,
+  parseVisibleCapture,
+  unavailableCapture,
+  visibleCaptureRoute,
+  type VisibleCapture
+} from './watch-link/capture-route'
+import {
+  PANE_INPUT_DEADLINE_MS,
+  controlInputPlan,
+  remoteControlInputPlan,
+  type ControlInputChunk,
+  type WatcherInputRoute
+} from './watch-link/pane-input'
+import type { ControlSupport } from '../shared/watch-link-types'
+import { sanitizePasteText } from './paste-injection'
+import {
+  localWatcherAttachArgs,
+  localWindowSizeArgs,
+  parseTmuxVersion,
+  parseWindowSize,
+  supportsWatcherClient
+} from './watch-link/watcher-client'
 import {
   recordFreshSpawnOwner,
   forgetPaneOwner,
@@ -66,7 +105,7 @@ import {
   spawnFailureHint,
   type PtyDevices
 } from './pty-devices'
-import { REAP_SWEEP_MS, shouldReap } from './pty-reap'
+import { REAP_SWEEP_MS, liveClientIds, shouldReap } from './pty-reap'
 import { ControlModeClient, type ControlSpawn } from './tmux-control-client'
 import {
   TMUX_SOCKET,
@@ -76,13 +115,34 @@ import {
   runPasteDelivery
 } from './tmux-naming'
 import { encodeSendKeysHex } from './tmux-control'
+import {
+  ZELLIJ_NESTING_ENV,
+  zellijAttachArgs,
+  zellijCapture,
+  zellijConf,
+  zellijForegroundCommand,
+  zellijKillSession,
+  zellijSendText,
+  zellijSessionState,
+  zellijWriteChars,
+  zellijSocketFits,
+  zellijSocketPath,
+  TYPICAL_SESSION_NAME,
+  loginShellArgs,
+  parseZellijSessionList,
+  type ZellijRun,
+  type ZellijSessionState
+} from './zellij-backend'
+import { normalizeSessionBackend } from '../shared/session-backend'
 import { releasePty, type ReleasablePty } from './pty-release'
 import { terminateWindowsProcessTree } from '../session-host/windows-process-tree'
 import { effectiveSize, type PtySize } from './pty-size'
 import { machOArch, archMismatch } from './macho-arch'
 import { writeScrollback, readScrollback, deleteScrollback } from './scrollback-store'
+import { snapshotDue } from './scrollback-cadence'
+import { createHash } from 'node:crypto'
 import { claudeConfigDirFor } from './claude-config-dir'
-import { findExecutableSync, findInPathString, resolveShellPath, shellPathNow } from './exec-path'
+import { envPathKey, findExecutableSync, findInPathString, resolveShellPath, shellPathNow } from './exec-path'
 import {
   AUTH_ENV_STRIP,
   accountTmuxEnvArgs,
@@ -106,7 +166,14 @@ import {
 } from './codex-identity-proxy'
 import { ensureNodeToken, ensureRemoteNodeToken, sweepNodeToken } from './agents/node-token-service'
 import { clearNode as clearNodeAgentStatus } from './agent-status-mirror'
-import { hasSharedIdentity, setCustomAgentBaseResolver, vanillaEnvStripPattern, type AgentId } from '../shared/agents/config'
+import {
+  capabilityAgentId,
+  hasSharedIdentity,
+  readsScreenDialogs,
+  setCustomAgentBaseResolver,
+  vanillaEnvStripPattern,
+  type AgentId
+} from '../shared/agents/config'
 import { findCustomAgent } from '../shared/agents/custom-agent'
 import { applyCustomAgentEnv, customAgentEnvArgs } from './custom-agent-env'
 import {
@@ -135,11 +202,15 @@ import {
   sessionHostKillSession,
   sessionHostListSessions,
   sessionHostPaneCommand,
+  sessionHostMessageOwner,
+  sessionHostMessagePasteReady,
+  sessionHostMessageEnvelope,
   sessionHostSendKeys,
   sessionHostSupported,
   SessionHostProtocolCompatibilityError
 } from './session-host-backend'
 import type { SessionHostPty } from './session-host-pty'
+import { NativeWindowsPane } from './native-windows-pane'
 import type { ProjectSpawnOverrides, ProjectSpawnOverridesReader } from './project-spawn-overrides'
 
 // How often we snapshot a live tmux session's scrollback to disk, so a machine reboot (which
@@ -198,10 +269,17 @@ const PROBE_TIMEOUT_MS = 6_000
  * just as invisible. Callers may still pass their own `timeout` for the rare op that needs longer.
  */
 const runAsync = ((file: string, args: readonly string[], opts?: object) =>
-  execFileAsync(file, args as string[], {
-    timeout: PROC_TIMEOUT_MS,
-    ...(opts ?? {})
-  } as never)) as unknown as typeof execFileAsync
+  // An ssh side-call on the native transport (Windows; see remote-ssh/native/native-mux.ts) runs
+  // over the project's one connection instead of spawning an ssh that cannot multiplex there.
+  // Same result and error shape as execFile, so no caller below changes.
+  isSshProgram(file) && useNativeSsh()
+    ? nativeExecFileAsync(args, {
+        timeout: ((opts as { timeout?: number } | undefined)?.timeout ?? PROC_TIMEOUT_MS)
+      })
+    : execFileAsync(file, args as string[], {
+        timeout: PROC_TIMEOUT_MS,
+        ...(opts ?? {})
+      } as never)) as unknown as typeof execFileAsync
 
 /** Narrow child-process seam for strict tmux probes/confirmed teardown. Production delegates to
  * the same bounded runner above; focused tests inject a stateful fake so hidden dual-backend
@@ -226,6 +304,9 @@ type ConfirmedProcessRun = (
  * would take the main process down instead of failing this one call.
  */
 function runWithStdin(file: string, args: readonly string[], input: string): Promise<unknown> {
+  if (isSshProgram(file) && useNativeSsh()) {
+    return nativeExecFileAsync(args, { timeout: PROC_TIMEOUT_MS, input })
+  }
   const p = execFileAsync(file, args as string[], { timeout: PROC_TIMEOUT_MS } as never)
   const child = (p as unknown as { child: import('child_process').ChildProcess }).child
   const stdin = child.stdin
@@ -236,6 +317,24 @@ function runWithStdin(file: string, args: readonly string[], input: string): Pro
     stdin.end(input)
   }
   return p as unknown as Promise<unknown>
+}
+
+/** `p`'s answer, or false once `ms` passed (the timer never holds the process). A rejection is false. */
+function settleWithin(p: Promise<boolean>, ms: number): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), ms)
+    timer.unref?.()
+    p.then(
+      (v) => {
+        clearTimeout(timer)
+        resolve(v)
+      },
+      () => {
+        clearTimeout(timer)
+        resolve(false)
+      }
+    )
+  })
 }
 
 // Minimal tmux config so the user's ~/.tmux.conf never interferes. The tmux server
@@ -355,15 +454,13 @@ ${leadPaneHookLines(leadPaneWidth)}`
  * through the now-resolved tmux.
  */
 function findTmux(resourcesPath?: string): string | null {
-  // Windows has none of `tmuxCandidatePaths`' targets (Homebrew, MacPorts, Nix, the distro
-  // `/usr/bin` family — all POSIX filesystem layouts) and no bundled tmux (macOS-only, see
-  // `bundledTmuxPath`'s doc comment; `scripts/build-tmux.mjs` never runs for a Windows package).
-  // Walking either list would just be `existsSync` calls against paths that can never resolve on
-  // this platform — skip straight to the PATH probe, the one route that can find a real tmux a
-  // Windows user installed themselves (WSL's own tmux is a different filesystem entirely and is
-  // never on the Windows PATH; MSYS2/Cygwin tmux, if the user put it there, is).
+  // Windows has no native tmux. Even when a tmux-compatible executable is present on PATH (for
+  // example psmux, MSYS2, or Cygwin), it is not a safe persistence backend for this application:
+  // its process and console semantics differ from the Unix tmux contract used by the control
+  // client. The packaged session host owns the Windows PTY and provides the equivalent attach,
+  // capture, send, and restart behavior without opening helper consoles.
   if (os.platform() === 'win32') {
-    return findInPathString('tmux', shellPathNow() ?? process.env.PATH)
+    return null
   }
   // BOTH lookups inside the guard: `os.homedir()` throws the same SystemError as `userInfo()` when
   // there is no passwd entry and no $HOME (some containers), and a thrown probe here would take
@@ -515,6 +612,8 @@ export { findInLoginPath } from './exec-path'
 
 /** A UI client: an Electron webContents id or a ServerPlatform uiId. */
 type ClientId = number
+/** The synthetic subscriber of a spawn no viewer initiated (see createHeadless). */
+const HEADLESS_CLIENT: ClientId = 0
 
 /** A viewer id: which VIEW within one client. `PRIMARY_VIEWER` is the default view — the canvas
  *  node, and every legacy call that omits a viewerId. A second view in the SAME renderer (the
@@ -608,8 +707,21 @@ function releaseSpawnSlotOnOutput(session: Session | undefined, release: SpawnSl
   }
 }
 
+/**
+ * Marks a create as a live link WATCHER's (`joinAsWatcher`), and nothing else sets it. A symbol, not a
+ * `PtyCreateOptions` field: that type is the `pty:create` wire payload, and a symbol cannot arrive over
+ * IPC, the WS bridge or the relay — so no renderer, browser tab or peer can ask for a watcher client
+ * (or opt out of one). Object spread copies it, so it survives spawnNew's option rewrites.
+ */
+const WATCHER_CLIENT: unique symbol = Symbol('nodeterm.watcherClient')
+type WatcherCreateOptions = PtyCreateOptions & { readonly [WATCHER_CLIENT]?: true }
+function isWatcherCreate(options: PtyCreateOptions): boolean {
+  return (options as WatcherCreateOptions)[WATCHER_CLIENT] === true
+}
+
 interface Session {
   proc: pty.IPty
+  nativeWindowsPane?: NativeWindowsPane
   /** Every VIEW watching this session, keyed by the composite `(ClientId, viewerId)` (`SubKey`).
    *  Co-attach: ONE pty and ONE tmux client, N subscribers — a second client on the same persistKey
    *  (or the SAME client's second view, e.g. the kanban card modal) joins this set instead of
@@ -651,6 +763,17 @@ interface Session {
   /** Detached sinks: when set, output/exit ALSO go to these callbacks (relay host). */
   onData?: (data: string) => void
   onExit?: (exitCode: number) => void
+  onSinkSize?: (size: PtySize) => void
+  sinkAdapts?: boolean
+  /** The size the relay sink is believed to render (its own last report, or the last size we told
+   *  it). The sink analogue of `shown`. */
+  sinkShown?: PtySize
+  /** session-host only: the size the HOST says the shared pty runs at, which follows the most
+   *  recently active viewer across every `Session` of the node (issue #914). Undefined until the
+   *  backend has answered. */
+  backendSize?: PtySize
+  /** session-host only: whether `appliedSize` was pushed as a ceiling (see `DetachedSinks`). */
+  appliedBounding?: boolean
   /** Pending output chunks, coalesced into one IPC message per flush. */
   buf: string[]
   bufBytes: number
@@ -662,6 +785,12 @@ interface Session {
   sshRemote?: NonNullable<PtyCreateOptions['sshRemote']>
   /** Output arrived since the last scrollback snapshot — idle sessions skip the capture. */
   outputSinceSnapshot: boolean
+  /** Consecutive snapshot ticks this session was dirty — drives the busy cadence
+   *  (scrollback-cadence.ts). Reset by an idle tick. */
+  snapshotDirtyTicks: number
+  /** A periodic capture for this session is queued or running on `snapshotChain`; a tick that
+   *  lands meanwhile must not queue a second one. */
+  snapshotQueued: boolean
   /** A tmux session (local `nt-<id>`, or the remote one an SSH project attaches to) is holding this
    *  session's work, so the pty client here is expendable: detaching it loses nothing and the next
    *  create re-attaches with `new-session -A`. It is the precondition for the idle reap — see
@@ -704,14 +833,61 @@ interface Session {
    * `captureForResync`, the final kill in `destroySession`) branches on this the same way it
    * already branches on `sshRemote`.
    */
+  /** Held by a Zellij session (zellij-backend.ts) rather than tmux. `tmuxBacked` is ALSO true for it —
+   *  that field answers "does releasing this client destroy anything", and for Zellij it does not —
+   *  so every path that would talk to the tmux socket asks this first. */
+  zellij?: boolean
   sessionHost?: boolean
+  /**
+   * A live link watcher's OWN tmux client (`attach-session -E -f ignore-size,read-only`, spawned by
+   * `joinAsWatcher` when no Session was held). Never indexed, and invisible to the persistKey lookups
+   * (`sessionByPersistKey`, `liveSessionForNode`): it is read-only, so an owner joining it, or a
+   * background write going through it, would lose every keystroke. Only watchers ever reach it.
+   */
+  watcherClient?: boolean
 }
 
 /** Sinks for a detached session whose output is served somewhere other than the renderer
  * (the relay host). The PTY is otherwise identical to a normal session. */
+/** The machine-local records a relay attach is decided from (see `relay-attach-plan.ts`). */
+export interface RelayNodeResolver {
+  /** Every project holding this node id, as THIS machine recorded it. */
+  placements(nodeId: string): readonly RelayNodePlacement[]
+  /** The live ControlMaster (+ its connect-time setup facts) for a connection scope. */
+  refFor(scopeId: string): RelayRemoteRef | undefined
+  /** Is this project an SSH project, per the index (identity, not liveness)? */
+  projectIsRemote(projectId: string): boolean
+}
+
+export type RelayAttachPrep =
+  | {
+      kind: 'refused'
+      reason: RelayAttachRefusal | 'codex-account'
+      /** One sentence the phone can show as-is. */
+      message: string
+    }
+  | {
+      kind: 'ready'
+      remote: boolean
+      /** Does the session exist RIGHT NOW (fail-safe toward "exists")? Ask before `attach`. */
+      sessionExists(): Promise<boolean>
+      /** The current visible screen, '' when there is none. */
+      snapshot(): Promise<string>
+      /** Spawn the relay-served client; rejects when nothing could be started. */
+      attach(sinks: DetachedSinks): Promise<string>
+    }
+
 export interface DetachedSinks {
   onData(data: string): void
   onExit(exitCode: number): void
+  /** The size the pty actually runs at, when that is not what this sink reported. Only a
+   *  session-host session can disagree with its own viewer: it follows the most recently active
+   *  viewer of the session, which may be a desktop node in another `Session` (issue #914). */
+  onSize?(size: PtySize): void
+  /** The sink's viewer renders whatever size `onSize` reports (letterbox or clip). False — every
+   *  phone build today, which ignores the relay's `Resized` frame — makes the sink's own size a
+   *  CEILING for the shared session: a viewer that cannot adapt would wrap a wider pty's output. */
+  adaptsToSize?: boolean
 }
 
 /**
@@ -721,11 +897,13 @@ export interface DetachedSinks {
  * subscribes to the existing `Session` in this process — it does NOT start a second tmux client.
  * The app therefore always has exactly ONE tmux client per session, so tmux's own multi-client
  * size negotiation never engages and "smallest subscriber wins" is decided by us (pty-size.ts).
- * A relay-served (detached) pty is the one exception: the host's local client is already attached
- * to the same session and must be mirrored, not kicked off.
+ * A relay-served (detached) pty is one exception: the host's local client is already attached
+ * to the same session and must be mirrored, not kicked off. A JOIN-ONLY reattach (a hosted-relay
+ * viewer, `PtyCreateOptions.joinOnly`) is the other: a watch-only view must never detach the
+ * user's own `tmux attach`, another app on the same socket, or a relay-served pty.
  */
-export function tmuxAttachFlags(detached: boolean): string[] {
-  return detached ? ['-A'] : ['-A', '-D']
+export function tmuxAttachFlags(mirror: boolean): string[] {
+  return mirror ? ['-A'] : ['-A', '-D']
 }
 
 // Output coalescing: a fast producer (e.g. `yes`, a verbose build, tmux full-screen
@@ -807,12 +985,19 @@ export const SHADOW_CMD_TIMEOUT_MS = 5_000
  * It exists so a BURST — an agent pushing a multi-line prompt, a run of slash commands — costs one
  * `tmux -C` child instead of one per keystroke batch, and nothing more. Ten seconds is past any
  * plausible gap inside one such burst and far short of every lifecycle it must not interfere with:
- * the renderer's 5-minute park (`TERM_PARK_MS`), the 10-minute offscreen dispose
+ * the renderer's park (10 min by default), the 10-minute offscreen dispose
  * (`offscreen-policy.ts`) and the 10-minute idle reap (`REAP_IDLE_MS`). That ordering is the point
  * of picking a number this small: an idle client is a real tmux client on some session, and the
  * shorter it lives the smaller the window in which anything has to reason about it at all.
  */
 export const BACKGROUND_WRITE_LINGER_MS = 10_000
+
+/** The chat view's screen check for Claude (shared/agents/claude-screen.ts): a refusal, or null. */
+function screenGate(screen: string): ChatPromptBlocked | null {
+  const read = readClaudeScreen(screen)
+  if (!claudeScreenBlocksInput(read)) return null
+  return { blocked: 'screen', dialog: read.kind === 'dialog' ? read.text : null }
+}
 
 /**
  * Manages all live PTY processes and bridges them to the renderer over IPC.
@@ -860,6 +1045,8 @@ export class PtyManager {
   private unknownEnds = new Set<string>()
   /** Shell-owned cleanup runs after end processing and, for session host, its kill acknowledgement. */
   private sessionEndedListeners = new Set<(persistKey: string) => void>()
+  /** Per-node output taps for core consumers (the headless launcher's settle + echo, #925). */
+  private outputListeners = new Map<string, Set<(chunk: string) => void>>()
   /** persistKey (node id) → the co-viewers of a session that was RECYCLED (moved into a worktree),
    *  waiting to be told to restart onto the replacement session. Held — not sent — until that
    *  session is registered (`spawnSession`), so a co-viewer's restart can never win the race and
@@ -922,6 +1109,18 @@ export class PtyManager {
   private counter = 0
   private tmuxPath: string | null = null
   private confPath = ''
+  /** The optional Zellij backend (zellij-backend.ts). `undefined` = not looked up yet. */
+  private zellijPathMemo: string | null | undefined
+  private zellijConfPath = ''
+  private zellijConfWritten = ''
+  /**
+   * Node ids whose session this process knows to live in ZELLIJ — recorded when a create picked
+   * Zellij, or a probe (`sessionExists`, `listNodetermSessions`) found one. It is how the paths that
+   * start from a node id alone (capture, paste, the relay host's detached attach, a delete with no
+   * live client) route to the right backend. Never persisted: after a restart it refills from the
+   * renderer's creates and the probes, and a node absent from it is asked of tmux exactly as before.
+   */
+  private zellijKeys = new Set<string>()
   private getSettings: () => Settings = () => DEFAULT_SETTINGS
 
   /**
@@ -942,11 +1141,20 @@ export class PtyManager {
    * exactly as it did before it existed.
    */
   private readProjectSpawnOverrides: ProjectSpawnOverridesReader | null = null
+  /** In-flight project-settings reads, per project, joined by concurrent spawns. See
+   *  `projectSpawnOverrides`. Entries are removed when the read settles — this is not a cache. */
+  private overridesInFlight = new Map<string, Promise<ProjectSpawnOverrides | null>>()
   /** "Which SSH host owns this node?", from the persisted index — see `setRemoteNodeOwner`. */
   private remoteNodeOwner: RemoteNodeOwnerResolver | null = null
+  /** Machine-local records the relay host's attach is decided from — see `setRelayNodeResolver`. */
+  private relayNodes: RelayNodeResolver | null = null
   /** ONE shared snapshot interval for all persisted sessions — a per-session interval spawned
    *  one tmux/ssh capture subprocess per session per tick, forever, even for idle terminals. */
   private snapshotTimer: ReturnType<typeof setInterval> | null = null
+  /** The periodic captures, serialized: one tmux/ssh spawn + scrollback write at a time. */
+  private snapshotChain: Promise<unknown> = Promise.resolve()
+  /** persistKey → sha1 of the last snapshot WRITTEN, so an identical capture is not rewritten. */
+  private lastSnapshotDigest = new Map<string, string>()
   /** ONE shared sweep for the idle reap (see `reapTick` / pty-reap.ts), armed by the first
    *  tmux-backed session and cleared once no session is left. */
   private reapTimer: ReturnType<typeof setInterval> | null = null
@@ -984,7 +1192,10 @@ export class PtyManager {
    * persisted node this process has ever released: the same order as the session map itself, and
    * rewritten rather than appended on every subsequent release of the same node.
    */
-  private released = new Map<string, { sessionId: string; size?: PtySize; remote: boolean }>()
+  private released = new Map<
+    string,
+    { sessionId: string; size?: PtySize; remote: boolean; sessionHost?: boolean }
+  >()
   /**
    * The ONE control-mode client this manager keeps for background WRITES, plus the node whose tmux
    * session it is attached to (see `backgroundWrite` / `sharedClientFor`).
@@ -1013,8 +1224,11 @@ export class PtyManager {
       controlSpawn?: ControlSpawn
       confirmedProcessRun?: ConfirmedProcessRun
       runtimePlatform?: NodeJS.Platform
+      /** The Zellij binary (tests point this at a sandboxed release binary); absent = look it up. */
+      zellijBin?: string | null
     } = {}
   ) {
+    if (deps.zellijBin !== undefined) this.zellijPathMemo = deps.zellijBin
     this.controlSpawn = deps.controlSpawn
     this.confirmedProcessRun = deps.confirmedProcessRun ?? runAsync
     this.runtimePlatform = deps.runtimePlatform ?? os.platform()
@@ -1030,13 +1244,31 @@ export class PtyManager {
     for (const session of this.sessions.values()) {
       if (!session.persistKey) continue
       anyPersisted = true
-      if (!session.outputSinceSnapshot) continue // idle since the last capture — skip the spawn
+      if (!session.outputSinceSnapshot) {
+        session.snapshotDirtyTicks = 0 // idle since the last capture — skip the spawn
+        continue
+      }
+      session.snapshotDirtyTicks++
+      // Continuously busy: keep the dirty bit, capture on the cadence (scrollback-cadence.ts).
+      if (!snapshotDue(session.snapshotDirtyTicks) || session.snapshotQueued) continue
       session.outputSinceSnapshot = false
-      void this.snapshotScrollback(session.persistKey, session.sshRemote, !!session.sessionHost).then((ok) => {
-        // Transient capture failure (ssh blip, tmux busy): put the dirty bit back so the next
-        // tick retries — otherwise a quiet session would never be snapshotted again.
-        if (!ok) session.outputSinceSnapshot = true
-      })
+      session.snapshotQueued = true
+      const persistKey = session.persistKey
+      // ONE capture at a time: the old loop fired every busy session's tmux/ssh spawn and 256 KB
+      // write in the same instant.
+      this.snapshotChain = this.snapshotChain
+        .then(() => this.snapshotScrollback(persistKey, session.sshRemote, !!session.sessionHost))
+        .then((ok) => {
+          // Transient capture failure (ssh blip, tmux busy): put the dirty bit back so the next
+          // tick retries — otherwise a quiet session would never be snapshotted again.
+          if (!ok) session.outputSinceSnapshot = true
+        })
+        .catch(() => {
+          session.outputSinceSnapshot = true
+        })
+        .finally(() => {
+          session.snapshotQueued = false
+        })
     }
     if (!anyPersisted && this.snapshotTimer) {
       clearInterval(this.snapshotTimer)
@@ -1058,14 +1290,15 @@ export class PtyManager {
    * and its scrollback are untouched: this is the SAME detach the last subscriber's departure does,
    * and the next `pty:create` re-attaches to it. Read pty-reap.ts before changing any of it.
    *
-   * "Attached" is decided against `platform().clientIds()`, not against the subscriber set: the
-   * whole point is the subscriber whose window/tab/peer is GONE and which therefore can never send
+   * "Attached" is decided against the platform's live clients (`clientIds()` plus the quiet ones a
+   * live link's viewer attaches as — pty-reap.ts `liveClientIds`), not against the subscriber set:
+   * the whole point is the subscriber whose window/tab/peer is GONE and which therefore can never send
    * the `pty:kill` that would release the pty. A client id is never reused (Electron webContents
    * ids and the server's `nextUiId` both only go up), so a client that comes back comes back as a
    * new id and creates its sessions afresh — there is no returning client to strand.
    */
   private reapTick(): void {
-    const live = new Set(platform().clientIds())
+    const live = liveClientIds(platform())
     const now = Date.now()
     for (const [sessionId, session] of [...this.sessions]) {
       // A relay sink is a watcher (somebody's phone is mirroring this session); a parked terminal
@@ -1104,11 +1337,16 @@ export class PtyManager {
     // enforced (so the pane is not left to reflow), and whether this node's tmux was REMOTE (so it
     // is never shadowed against our local socket). The `Session` holding both goes with `forget`
     // below; this is the record that survives it.
-    if (session.persistKey)
+    // Not for a watcher's own client: its size is whatever it was spawned at, never the size an owner
+    // enforced, and a later shadow would push that size into the pane (`shadowAttach`).
+    if (session.persistKey && !session.watcherClient)
       this.released.set(session.persistKey, {
         sessionId,
         size: session.appliedSize,
-        remote: !!session.sshRemote
+        remote: !!session.sshRemote,
+        // Which backend still holds the session after this client goes. Agent messaging reaches a
+        // released session by NAME, and must ask the backend that owns it (`sessionHostOwns`).
+        sessionHost: !!session.sessionHost
       })
     releasePty(session.proc as ReleasablePty)
     this.forget(sessionId, session)
@@ -1135,9 +1373,9 @@ export class PtyManager {
    *    outstanding (see `shadowCommand`). This method never rejects; failure is always null.
    *
    * WHAT A SHADOW IS NOT: not a subscriber, not a `Session`, not a renderer client id. Nothing in
-   * this process that decides "is somebody watching" can see it — the reap sweep asks
-   * `platform().clientIds()` and walks `this.sessions`, and the renderer's park and offscreen
-   * dispose are per-node renderer state.
+   * this process that decides "is somebody watching" can see it — the reap sweep asks the
+   * platform's live clients (`liveClientIds`) and walks `this.sessions`, and the renderer's park
+   * and offscreen dispose are per-node renderer state.
    *
    * It IS a real tmux client, so anything that asks TMUX "is this session attached" does see it,
    * and must subtract it. There is one such consumer: the session budget (session-budget.ts) culls
@@ -1162,6 +1400,8 @@ export class PtyManager {
     // about, so a node that is never wanted again costs nothing.
     if (live) this.shadows.delete(persistKey)
     if (this.sessionByPersistKey(persistKey)) return null
+    // A control-mode client is a tmux client; a Zellij session has nothing of the kind to hold.
+    if (this.zellijKeys.has(persistKey)) return null
     const known = this.released.get(persistKey)
     // A remote (SSH-project) node's tmux server is on the FAR host, reached over that project's
     // ControlMaster on the `nodeterm-rmt` socket. A local `-C attach -t nt-<id>` here would find
@@ -1369,6 +1609,10 @@ export class PtyManager {
       return true
     }
     const settings = this.getSettings()
+    if (this.zellijKeys.has(persistKey)) {
+      const run = settings.tmuxEnabled ? this.zellijRun() : null
+      return run ? zellijWriteChars(run, sessionName(persistKey), data) : false
+    }
     if (!this.tmuxPath || !settings.tmuxEnabled) return false
     // The kill switch, and the reason it sits BELOW tier 1: the painter is the session's own pty,
     // which exists with or without this feature — gating it would turn "no control clients" into
@@ -1556,10 +1800,29 @@ export class PtyManager {
   ): Promise<ProjectSpawnOverrides | null> {
     const read = this.readProjectSpawnOverrides
     if (!read || !options.ownerProjectId) return null
+    const projectId = options.ownerProjectId
+    // COALESCE concurrent reads for one project. A project switch mounts every node in one tick,
+    // and for an SSH project each read is an ssh round trip for the host's settings.json, paced by
+    // the per-master child gate — MEASURED (41-terminal SSH project): those reads spread the
+    // terminals' arrival at the spawn gate over ~1.3 s, in node order, so the on-screen ones came
+    // last. Joining an IN-FLIGHT read only (nothing is cached past its settle) keeps every
+    // freshness property the per-spawn read had: a create that starts after it settles reads anew.
+    let shared = this.overridesInFlight.get(projectId)
+    if (!shared) {
+      const p = Promise.resolve()
+        .then(() => read(projectId))
+        .finally(() => {
+          if (this.overridesInFlight.get(projectId) === p) this.overridesInFlight.delete(projectId)
+        })
+      this.overridesInFlight.set(projectId, p)
+      shared = p
+    }
+    // Each spawn gets its own copy: the answer is shared, the object must not be.
+    const mine = shared.then((o) => (o ? { ...o, ...(o.env ? { env: { ...o.env } } : {}) } : o))
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
       return await Promise.race([
-        read(options.ownerProjectId),
+        mine,
         new Promise<null>((resolve) => {
           timer = setTimeout(() => resolve(null), PROJECT_OVERRIDES_TIMEOUT_MS)
           // Never hold the process open for a settings read nobody is waiting on any more.
@@ -1772,8 +2035,14 @@ export class PtyManager {
     platform().handle(IPC.ptySendText, (persistKey: string, text: string, enter?: boolean) =>
       this.sendText(persistKey, text, enter === undefined ? undefined : { enter })
     )
+    platform().handle(IPC.ptySendChatPrompt, (persistKey: string, text: string, agentId: unknown) =>
+      // `agentId` crosses a process boundary: it only picks the screen reader, and a non-string
+      // picks none (plain `sendText`), never a wrong one.
+      this.sendChatPrompt(persistKey, text, typeof agentId === 'string' ? agentId : '')
+    )
     platform().handle(IPC.ptyTmuxStatus, () => this.tmuxStatus())
     platform().handle(IPC.ptyPaneCommand, (persistKey: string) => this.paneCommand(persistKey))
+    platform().handle(IPC.ptyPaneCwd, (persistKey: string) => this.paneCwd(persistKey))
     // Registered HERE, beside its name-only sibling, rather than in either shell: core owns both
     // reads, so the desktop and the Server Edition are served by one line and cannot drift.
     platform().handle(IPC.ptyPaneOwner, (persistKey: string) => this.paneOwner(persistKey))
@@ -1787,6 +2056,8 @@ export class PtyManager {
     // Re-probe when unavailable: the banner polls this while its install command runs, and a
     // successful probe here is what makes new sessions tmux-backed without a restart.
     if (!this.tmuxPath) this.ensureTmux()
+    // Same re-probe promise for Zellij: installed while the app runs ⇒ picked up here.
+    if (this.zellijPathMemo === null) this.zellijPathMemo = undefined
     const available = !!this.tmuxPath
     const hint = available
       ? null
@@ -1799,10 +2070,22 @@ export class PtyManager {
       persistence: {
         enabled: this.getSettings().tmuxEnabled,
         backend:
-          this.runtimePlatform !== 'win32' && available
-            ? 'tmux'
-            : sessionHostSupported() ? 'session-host' : null
-      }
+          // Zellij when it is selected AND found: that is where a new local terminal goes.
+          this.zellijSelected() && this.zellijBin() && this.zellijSocketFitsFor(TYPICAL_SESSION_NAME)
+            ? 'zellij'
+            : this.runtimePlatform !== 'win32' && available
+              ? 'tmux'
+              : sessionHostSupported() ? 'session-host' : null
+      },
+      ...(this.runtimePlatform !== 'win32'
+        ? {
+            zellij: {
+              available: !!this.zellijBin(),
+              selected: normalizeSessionBackend(this.getSettings().sessionBackend) === 'zellij',
+              ...(this.zellijSocketFitsFor(TYPICAL_SESSION_NAME) ? {} : { socketTooLong: true })
+            }
+          }
+        : {})
     }
   }
 
@@ -1932,7 +2215,68 @@ export class PtyManager {
    * account scoping, project env and ownership recording still run through `create` unchanged.
    */
   createHeadless(options: PtyCreateOptions): Promise<PtyCreateResult> {
-    return this.create(0, options)
+    return this.create(HEADLESS_CLIENT, options)
+  }
+
+  /**
+   * Would a spawn right now outlive its client? The same test `spawnNew` applies: tmux found and
+   * enabled, or the session-host backend (Windows). The desktop headless launcher refuses without
+   * it: it releases its client after delivery, and releasing a plain shell kills it (#925).
+   */
+  persistentSpawnAvailable(): boolean {
+    if (this.tmuxPath && this.getSettings().tmuxEnabled) return true
+    // A machine with no tmux whose setting picks Zellij still creates a persistent session.
+    if (this.zellijSelected() && this.zellijBin() && this.zellijSocketFitsFor(TYPICAL_SESSION_NAME))
+      return true
+    return this.hostBackendEligible()
+  }
+
+  /** Subscribe to a node's output as core sees it (after buffering, before fan-out). */
+  onOutput(persistKey: string, cb: (chunk: string) => void): () => void {
+    let set = this.outputListeners.get(persistKey)
+    if (!set) {
+      set = new Set()
+      this.outputListeners.set(persistKey, set)
+    }
+    set.add(cb)
+    return () => {
+      const s = this.outputListeners.get(persistKey)
+      if (!s) return
+      s.delete(cb)
+      if (!s.size) this.outputListeners.delete(persistKey)
+    }
+  }
+
+  /** The live session a node id names: the persist index first, then any session spawned for it
+   *  (a plain shell carries the id only as `nodeId`). */
+  private liveSessionForNode(persistKey: string): [string, Session] | undefined {
+    const indexed = this.byPersistKey.get(persistKey)
+    const hit = indexed ? this.sessions.get(indexed) : undefined
+    if (indexed && hit) return [indexed, hit]
+    for (const [id, s] of this.sessions) {
+      if (s.watcherClient) continue
+      if (s.persistKey === persistKey || s.nodeId === persistKey) return [id, s]
+    }
+    return undefined
+  }
+
+  /**
+   * Type into a node's pane AS the headless client. False unless client 0 subscribes to a live
+   * session for that node, so a launch can never type into a pty it did not attach. Writes the
+   * process directly rather than through `write()`: the synthetic client is not a person, so it
+   * must not light the team typing badge.
+   */
+  writeHeadless(persistKey: string, data: string): boolean {
+    const live = this.liveSessionForNode(persistKey)
+    if (!live || !this.subscribes(HEADLESS_CLIENT, live[0])) return false
+    live[1].proc.write(data)
+    return true
+  }
+
+  /** Drop the headless client. The tmux session keeps running, exactly as `kill()` always leaves it. */
+  releaseHeadless(persistKey: string): void {
+    const live = this.liveSessionForNode(persistKey)
+    if (live) this.kill(HEADLESS_CLIENT, live[0])
   }
 
   private async create(clientId: ClientId, options: PtyCreateOptions): Promise<PtyCreateResult> {
@@ -2077,8 +2421,15 @@ export class PtyManager {
     options: PtyCreateOptions,
     persistKey: string
   ): Promise<PtyCreateResult> | undefined {
-    const existingId = this.byPersistKey.get(persistKey)
-    const existing = existingId ? this.sessions.get(existingId) : undefined
+    let existingId = this.byPersistKey.get(persistKey)
+    let existing = existingId ? this.sessions.get(existingId) : undefined
+    // A second live link viewer of a node no owner Session is held for shares the first viewer's own
+    // tmux client (unindexed, see `watcherClient`) rather than opening another — each one is a tmux
+    // client, and over SSH an ssh channel against the host's MaxSessions. Only a watcher may join it.
+    if ((!existingId || !existing) && isWatcherCreate(options)) {
+      existingId = this.watcherClientSessionId(persistKey)
+      existing = existingId ? this.sessions.get(existingId) : undefined
+    }
     if (!existingId || !existing) return undefined
     // The joining VIEW's composite key: a second client, OR the SAME client's second view (the
     // kanban card modal). Either way it is a distinct subscriber of the one shared session/pty.
@@ -2088,7 +2439,13 @@ export class PtyManager {
     // tell it otherwise. applySize() then either shrinks the pty to it (it is the new smallest) or
     // sends it the authoritative size to render + letterbox.
     const size = normalizeSize(options.cols, options.rows)
-    existing.sizes.set(sub, size)
+    // A non-voting view (`sizeVote: false`, a hosted-relay viewer) stays out of the min, exactly
+    // like a parked subscriber: it still gets output, and `shown` makes applySize tell it the
+    // authoritative size to render. The same key can arrive here already holding a vote (a
+    // renderer reload re-joins under the same ClientId, and so does a client whose role changed
+    // from editor to viewer), so a non-voting join WITHDRAWS it; applySize below re-derives the size.
+    if (options.sizeVote !== false) existing.sizes.set(sub, size)
+    else existing.sizes.delete(sub)
     existing.shown.set(sub, size)
     const before = existing.appliedSize
     this.applySize(existingId, existing)
@@ -2110,13 +2467,32 @@ export class PtyManager {
     // our tmux always runs `mouse on`, so enabling these unconditionally matches its client state.
     // Rides `base` so it reaches the renderer on BOTH the resized and screen-painted branches.
     const coAttachMouse = existing.persistKey ? true : undefined
+    // Alt-screen: tmux-backed ONLY, and `tmuxBacked` alone is not that gate — a session-host session
+    // is also recorded tmuxBacked (and carries a persistKey), and switching it (or a plain shell) to
+    // the alternate buffer would hide its only scrollback. See PtyCreateResult.coAttachAltScreen.
+    const coAttachAltScreen = existing.tmuxBacked && !existing.sessionHost ? true : undefined
     // Same source, different question (and different consumer): a joiner needs to know whether the
     // session it landed on survives losing a client, because its own unmount may park it.
     const persistent = !!existing.persistKey
+    // The resync repaint's question, asked of every session (PtyCreateResult.tmuxClient) — for a
+    // join it is the alt-screen gate verbatim.
+    const tmuxClient = coAttachAltScreen
     const base: PtyCreateResult = existing.accountFallback
-      ? { sessionId: existingId, fresh: false, accountFallback: true, coAttachMouse, persistent }
-      : { sessionId: existingId, fresh: false, coAttachMouse, persistent }
+      ? {
+          sessionId: existingId,
+          fresh: false,
+          accountFallback: true,
+          coAttachMouse,
+          coAttachAltScreen,
+          tmuxClient,
+          persistent
+        }
+      : { sessionId: existingId, fresh: false, coAttachMouse, coAttachAltScreen, tmuxClient, persistent }
     if (resized) return Promise.resolve(base) // tmux is redrawing this client — do not paint twice
+    // A live link's watcher never paints from this screen (its keyframe is a VISIBLE-only capture —
+    // this one is history on SSH and the session host), so it is not captured for one (R64/M4): on SSH
+    // that was a `-S -200` capture over the master on every viewer join and rejoin, thrown away.
+    if (isWatcherCreate(options)) return Promise.resolve(base)
     // An empty capture (plain shell — no tmux to capture; a tmux/ssh blip) is OMITTED, never sent
     // as '': the renderer must not reset a terminal for nothing. A plain-shell joiner therefore
     // still lands on a blank-but-live screen — there is no source of truth for its past output,
@@ -2134,21 +2510,26 @@ export class PtyManager {
     )
   }
 
-  /** Spawn a brand-new session for this client (the non-co-attach path). */
-  private async spawnNew(clientId: ClientId, options: PtyCreateOptions): Promise<PtyCreateResult> {
+  /**
+   * The refusals a NEW spawn owes before anything is spawned, shared by `spawnNew` and the relay
+   * host's attach (`prepareRelayAttach`) so the two can never disagree about when a remote node or
+   * an unscoped managed Codex account may start. `undefined` = may spawn.
+   */
+  private spawnRefusal(options: PtyCreateOptions): 'ssh' | 'codex-account' | undefined {
     // This node runs on a remote host and we cannot reach it: spawn NOTHING. Everything below
     // (and `spawnSession`'s program resolution) falls through to the LOCAL tmux/plain branches
     // when `sshRemote` is absent or `ssh` is missing — a silent local shell wearing a remote
     // node's identity, which is the one outcome a remote node must never have (see
     // `PtyCreateOptions.requireRemote`). Refuse instead; the renderer waits for the master.
     //
-    // Deliberately here in `spawnNew` and not in `create`: a co-attach JOIN to a live session for
+    // Deliberately on the SPAWN path (`spawnNew`, and the relay host's `prepareRelayAttach`) and
+    // not in `create`: a co-attach JOIN to a live session for
     // this node id is still correct (that session already runs wherever it runs), so only the
     // branch that would have created a new local session is refused. `findSsh()` is checked for
     // the same reason `spawnSession` checks it — without the executable the remote branch there
     // is skipped and the local one runs.
     if (options.requireRemote && !(options.sshRemote && options.persistKey && findSsh())) {
-      return { sessionId: '', fresh: false, unavailable: 'ssh' }
+      return 'ssh'
     }
     // A managed remote Codex account needs a known id and a safe resolved home so the
     // remote env builder can supply its private CODEX_HOME. Otherwise a fresh spawn would
@@ -2161,18 +2542,25 @@ export class PtyManager {
             !this.isCodexAccount(options.accountId) ||
             !isSafeRemoteHome(options.sshRemote.remoteHome))
         ) {
-          return { sessionId: '', fresh: false, unavailable: 'codex-account' }
+          return 'codex-account'
         }
         if (!options.persistKey || !findSsh()) {
-          return { sessionId: '', fresh: false, unavailable: 'ssh' }
+          return 'ssh'
         }
       } else {
         const scope = resolveCodexSessionScope(platform().userDataDir, options.accountId)
         if (isCodexScopeRefusal(scope)) {
-          return { sessionId: '', fresh: false, unavailable: 'codex-account' }
+          return 'codex-account'
         }
       }
     }
+    return undefined
+  }
+
+  /** Spawn a brand-new session for this client (the non-co-attach path). */
+  private async spawnNew(clientId: ClientId, options: PtyCreateOptions): Promise<PtyCreateResult> {
+    const refused = this.spawnRefusal(options)
+    if (refused) return { sessionId: '', fresh: false, unavailable: refused }
     // A tmux-backed session is "fresh" (cold start) when no live session exists to reattach to
     // — i.e. first open, or after a machine reboot killed the tmux server. Plain (non-tmux)
     // sessions are always fresh: they have no cross-restart continuity. The renderer uses this
@@ -2202,13 +2590,81 @@ export class PtyManager {
       ? await this.remoteSessionVerdict(options.sshRemote, sessionName(options.persistKey as string))
       : undefined
     const freshUnverified = remoteVerdict === 'unknown'
+    // A join-only create (hosted-relay viewer) asks the STRICT local question instead of the folded
+    // one: `tmuxSessionExists` answers "exists" when tmux could not be asked, which is the safe fold
+    // for an owner (never type a resume into a live pane) and the unsafe one for a viewer — it sends
+    // the create on to `new-session -A`, which CREATES the session if it was really gone, and the
+    // owner's next open then reads `fresh:false` and skips its cold restore.
+    const joinOnlyLocalVerdict =
+      options.joinOnly && !options.sshRemote && !warmWindowsBackend && tmuxBacked
+        ? await this.strictTmuxVerdict(options.persistKey as string)
+        : undefined
     let fresh = options.sshRemote
       ? remoteVerdict === 'absent'
       : warmWindowsBackend
         ? false
         : tmuxBacked
-        ? !(await this.tmuxSessionExists(options.persistKey as string))
+        ? joinOnlyLocalVerdict
+          ? joinOnlyLocalVerdict === 'absent'
+          : !(await this.tmuxSessionExists(options.persistKey as string))
         : true
+    // A join-only create must never start a session: only a reattach to one we POSITIVELY saw is
+    // allowed. Refused when there is nothing to reattach to (`fresh`) and when we could not tell
+    // (`freshUnverified` for SSH, an unanswered strict probe locally). For a node that would land
+    // on the session-host backend `fresh` is a placeholder `true` (that backend's attach-or-create
+    // IS its probe, see above), so it is refused there too rather than sent a round trip that could
+    // create. Fails closed: a viewer never starts anything. One refusal value for both reasons —
+    // the renderer's sentence claims only that no running terminal was found.
+    // The optional Zellij backend — see `decideZellij` for the rule ("the backend follows the
+    // session that exists"). Asked only for a LOCAL persistent node whose tmux session is not there:
+    // a warm tmux session is reattached exactly as before, and SSH projects keep the remote tmux.
+    const zellijChoice =
+      !options.sshRemote &&
+      options.persistKey &&
+      !warmWindowsBackend &&
+      this.runtimePlatform !== 'win32' &&
+      this.getSettings().tmuxEnabled &&
+      !(tmuxBacked && !fresh)
+        ? await this.decideZellij(options.persistKey)
+        : undefined
+    if (zellijChoice?.use) fresh = zellijChoice.fresh
+    // Zellij could not be asked about this node: it may be live there, so never COLD in tmux.
+    else if (zellijChoice?.state === 'unknown') fresh = false
+    // A join-only create on Zellij needs a session we SAW live; anything else could create one.
+    const joinRefused = zellijChoice?.use
+      ? zellijChoice.state !== 'live'
+      : fresh ||
+        freshUnverified ||
+        joinOnlyLocalVerdict === 'unknown' ||
+        zellijChoice?.state === 'unknown'
+    if (options.joinOnly && joinRefused)
+      return { sessionId: '', fresh: false, unavailable: 'join-only' }
+    // A watcher's own client is a read-only TMUX client (`attach-session -E -f ignore-size,read-only`),
+    // and a Zellij session has no such client to spawn: refused, never a Zellij attach (which would be
+    // a full, typing client). A watcher still co-attaches to a Zellij session this process holds (the
+    // `join` above); it just gets no keyframe (`visibleCaptureRoute`).
+    if (isWatcherCreate(options) && zellijChoice?.use)
+      return { sessionId: '', fresh: false, unavailable: 'join-only' }
+    // A watcher's own LOCAL client needs client flags (tmux >= 3.2). Without them it would either fail
+    // to attach or — worse, spelled without the flags — resize the owner's window. Refused the same
+    // way as a session that cannot be confirmed. Over SSH the host's version is unknown here: the
+    // flags are passed and an old remote tmux rejects them (see `remoteTmuxWatcherArgs`).
+    if (isWatcherCreate(options) && !options.sshRemote && !(await this.localTmuxSupportsWatcherClient()))
+      return { sessionId: '', fresh: false, unavailable: 'join-only' }
+    // A watcher's own client is spawned at the window's CURRENT size, read here, just before the spawn
+    // — never at a guessed one (the caller's, a remembered size, a default). `ignore-size` only holds
+    // while an unflagged client is attached somewhere on the server; if the watcher is ever the only
+    // one, tmux sizes the window to it, so a wrong spawn size is a wrong window size. Unknown ⇒ refused
+    // ("not now": the link host backs off and asks again).
+    // The read runs INSIDE the node's in-flight barrier (`create`), on purpose: a second viewer's join
+    // waits for this client and then shares it, instead of spawning another. The cost, accepted: an
+    // owner opening the same node in that instant waits for the read too — bounded by the probe and
+    // process timeouts (`runAsync`) — and then spawns its own client as usual.
+    if (isWatcherCreate(options)) {
+      const windowSize = await this.readWindowSize(options.persistKey as string, options.sshRemote)
+      if (!windowSize) return { sessionId: '', fresh: false, unavailable: 'join-only' }
+      options = { ...options, cols: windowSize.cols, rows: windowSize.rows }
+    }
     // Ensure the login-shell PATH is resolved (prewarmed in init(); usually already settled)
     // so the session env below picks it up — awaiting keeps the event loop free either way.
     await resolveShellPath()
@@ -2218,20 +2674,13 @@ export class PtyManager {
     if (options.agentId && hasSharedIdentity(options.agentId as AgentId) && !options.sshRemote) {
       installCodexLauncher()
     }
-    // Resolved HERE rather than inside `spawnSession` because that function is synchronous and two
-    // of its three callers (`createDetached`/`attachDetached`, the relay host's attach path) are
-    // synchronous public API.
-    //
-    // Those two are NOT merely attaches — `attachDetached` goes through `tmux new-session -A`, which
-    // CREATES when the host's session died (that is exactly what `sessionExists` is asked ahead of,
-    // and what `fresh` reports). What makes them override-less is narrower and true either way: the
-    // relay host passes only `{cols, rows}` (host-service.ts), so those spawns carry no
-    // `ownerProjectId` — and no cwd, agent, account or hook env either. A mirrored client that
-    // lands on a re-created session gets the same bare login shell it got before this feature.
+    // Resolved HERE rather than inside `spawnSession` because that function is synchronous. Its
+    // other callers resolve their own: the relay host's attach (`prepareRelayAttach`) awaits the
+    // same `projectSpawnOverrides` with the node's recorded owner, while `createDetached` /
+    // `attachDetached` pass none (no project owner ⇒ no overrides).
     const projectOverrides = await this.projectSpawnOverrides(options)
-    // Resolved HERE for the same synchronous-spawnSession reason as projectOverrides — and the
-    // relay host's detached callers pass no `sshRemote` at all, so this is the one path that needs
-    // it. Re-derive the login-agent pin for the endpoint (issue #427): same memoized `ssh -G`
+    // Resolved HERE for the same synchronous-spawnSession reason as projectOverrides (the relay
+    // host's remote attach runs the same probe in `spawnRelayRemote`). Re-derive the login-agent pin for the endpoint (issue #427): same memoized `ssh -G`
     // probe the ControlMaster's connect uses, and it OVERWRITES any inbound value — `sshRemote` is
     // renderer-built and its conn can descend from a shareable project file, so only the local
     // probe may decide which agent socket the argv builders pin. The annotated conn is what the
@@ -2259,11 +2708,20 @@ export class PtyManager {
     // trip. Local spawns are not gated: there is no connection to overrun.
     const spawnSlot =
       options.sshRemote && options.persistKey
-        ? await remotePtySpawnGate.acquire(options.sshRemote.controlPath)
+        ? await remotePtySpawnGate.acquire(options.sshRemote.controlPath, {
+            background: options.onScreen === false
+          })
         : null
     let sessionId: string
     try {
-      sessionId = this.spawnSession(options, clientId, undefined, warmWindowsBackend, projectOverrides)
+      sessionId = this.spawnSession(
+        options,
+        clientId,
+        undefined,
+        warmWindowsBackend,
+        projectOverrides,
+        zellijChoice?.use === true
+      )
     } catch (err) {
       // A spawn that never happened must not hold a slot until the settle deadline — the next node
       // in the queue is waiting on it.
@@ -2339,7 +2797,12 @@ export class PtyManager {
     // cwd lives on the host (its probe would need a remote round trip — deliberately out of v1).
     // Failure/unknowable ⇒ absent ⇒ no banner: the flag is only ever raised on tmux's own answer.
     const staleCwd =
-      !fresh && tmuxBacked && !options.sshRemote && !spawned?.sessionHost && options.persistKey
+      !fresh &&
+      tmuxBacked &&
+      !options.sshRemote &&
+      !spawned?.sessionHost &&
+      !spawned?.zellij &&
+      options.persistKey
         ? await this.paneCwdStale(options.persistKey)
         : false
     return {
@@ -2350,6 +2813,10 @@ export class PtyManager {
       // setting this on a confident `fresh:false` would spend a round trip per warm node.
       ...(freshUnverified && !fresh ? { freshUnverified: true as const } : {}),
       ...(accountFallback ? { accountFallback } : {}),
+      ...(spawned?.sessionHost ? { sessionHost: true as const } : {}),
+      // A tmux client (local or remote), so a resync's `term.reset()` must re-apply the modes
+      // tmux emitted at attach — see PtyCreateResult.tmuxClient. Same gate as the join's alt screen.
+      ...(spawned?.tmuxBacked && !spawned.sessionHost ? { tmuxClient: true as const } : {}),
       ...(staleCwd ? { staleCwd: true as const } : {}),
       ...(screen ? { screen } : {})
     }
@@ -2474,12 +2941,40 @@ export class PtyManager {
     }
   })
 
+  /** A live link watcher's own tmux client for this node, if one is running (see `watcherClient`). */
+  private watcherClientSessionId(persistKey: string): string | undefined {
+    for (const [id, session] of this.sessions) {
+      if (session.watcherClient && session.persistKey === persistKey) return id
+    }
+    return undefined
+  }
+
   /** Find the live session registered under a node id (persistKey), if any. */
   private sessionByPersistKey(persistKey: string): Session | undefined {
     for (const session of this.sessions.values()) {
-      if (session.persistKey === persistKey) return session
+      // A watcher's read-only client is not the node's session for anyone (see `watcherClient`).
+      if (session.persistKey === persistKey && !session.watcherClient) return session
     }
     return undefined
+  }
+
+  /**
+   * Does the Windows session host own this node's persistent session, whether or not a client of
+   * ours is attached to it right now?
+   *
+   * A live generation answers for itself. A RELEASED one (park expiry, offscreen release) has no
+   * `Session` left, but the host keeps the session running, so the release record answers. A node
+   * this process never attached (an app restart, a project not yet opened) mirrors `sendText`'s
+   * rule: with no local tmux, the session host is this machine's persistence backend.
+   *
+   * Without the released leg, every messaging probe of a released session-host node fell through
+   * to the POSIX tmux branch, which on Windows answers null: the agent was alive and unreachable.
+   */
+  private sessionHostOwns(persistKey: string, live: Session | undefined): boolean {
+    if (live) return !!live.sessionHost
+    const known = this.released.get(persistKey)
+    if (known) return known.sessionHost === true
+    return !this.tmuxPath && this.getSettings().tmuxEnabled && sessionHostSupported()
   }
 
   /** The exact live generation for a node id, including a non-persistent indexed plain shell. */
@@ -2531,9 +3026,198 @@ export class PtyManager {
     )
   }
 
+  /**
+   * The `zellij` binary, POSIX only (there is no Zellij backend on Windows: the session host owns
+   * persistence there). Same lookup shape as `findSsh`: the login-shell PATH, then the usual install
+   * locations a GUI app's minimal PATH misses (Homebrew, a cargo install). A miss is memoized only
+   * once the async PATH probe has settled, and `tmuxStatus` re-asks, so installing Zellij while the
+   * app runs reaches NEW terminals without a restart — the same promise the tmux probe makes.
+   */
+  private zellijBin(): string | null {
+    if (this.runtimePlatform === 'win32') return null
+    if (this.zellijPathMemo !== undefined) return this.zellijPathMemo
+    let home = ''
+    try {
+      home = os.homedir()
+    } catch {
+      // no home: the fixed paths are still checked
+    }
+    const found = findExecutableSync('zellij', [
+      '/opt/homebrew/bin/zellij',
+      '/usr/local/bin/zellij',
+      '/usr/bin/zellij',
+      ...(home ? [path.join(home, '.cargo', 'bin', 'zellij'), path.join(home, '.local', 'bin', 'zellij')] : [])
+    ])
+    if (found || shellPathNow() !== undefined) this.zellijPathMemo = found
+    return found
+  }
+
+  /** A bound, bounded runner for the Zellij CLI, or null when there is no binary. The nesting
+   *  variables are stripped so an app launched from inside Zellij never aims an action at the
+   *  session it was launched from. */
+  private zellijRun(): ZellijRun | null {
+    const bin = this.zellijBin()
+    if (!bin) return null
+    const env = { ...process.env } as Record<string, string>
+    for (const k of ZELLIJ_NESTING_ENV) delete env[k]
+    return async (args) => {
+      const { stdout, stderr } = await runAsync(bin, args, {
+        env,
+        encoding: 'utf-8',
+        maxBuffer: 50 * 1024 * 1024,
+        timeout: PROBE_TIMEOUT_MS
+      })
+      return { stdout: String(stdout), stderr: String(stderr) }
+    }
+  }
+
+  /** `#{pane_current_command}` for a Zellij session, from one `ps` read (zellijForegroundCommand
+   *  has the measurement). `ps -A -o pid=,ppid=,tpgid=,comm=,args=` is POSIX-shaped on Linux and
+   *  macOS alike. null on any failure — "not a shell yet", the refusing answer. */
+  private async zellijPaneCommand(name: string): Promise<string | null> {
+    if (!this.zellijBin()) return null
+    try {
+      const { stdout } = await runAsync('ps', ['-A', '-o', 'pid=,ppid=,tpgid=,comm=,args='], {
+        encoding: 'utf-8',
+        maxBuffer: 16 * 1024 * 1024,
+        timeout: PROBE_TIMEOUT_MS
+      })
+      return zellijForegroundCommand(String(stdout), name)
+    } catch {
+      return null
+    }
+  }
+
+  /** Whether this machine's setting asks for Zellij for NEW local sessions (persistence on, POSIX). */
+  private zellijSelected(): boolean {
+    const s = this.getSettings()
+    return (
+      this.runtimePlatform !== 'win32' &&
+      s.tmuxEnabled &&
+      normalizeSessionBackend(s.sessionBackend) === 'zellij'
+    )
+  }
+
+  /** Is this node's session a Zellij one? A LIVE session answers for itself; with none, the ids a
+   *  create or probe recorded (`zellijKeys`). */
+  private isZellij(persistKey: string, live?: Session): boolean {
+    return live ? live.zellij === true : this.zellijKeys.has(persistKey)
+  }
+
+  /** Write `<userData>/zellij.kdl` when its content changed (it is generated, like tmux.conf). */
+  private ensureZellijConf(): string {
+    if (!this.zellijConfPath) this.zellijConfPath = path.join(platform().userDataDir, 'zellij.kdl')
+    const conf = zellijConf()
+    if (this.zellijConfWritten !== conf) {
+      try {
+        fs.writeFileSync(this.zellijConfPath, conf)
+        this.zellijConfWritten = conf
+      } catch (error) {
+        console.warn('[pty] could not write zellij.kdl', error instanceof Error ? error.message : error)
+      }
+    }
+    return this.zellijConfPath
+  }
+
+  /**
+   * THE BACKEND FOLLOWS THE SESSION THAT EXISTS. Called for a local persistent node whose tmux
+   * session is NOT there (a warm tmux session always wins and never reaches here). A live Zellij
+   * session is reattached whatever the setting now says — switching the setting must not strand a
+   * running agent in one multiplexer while cold-restore relaunches it in the other — and only a
+   * node with NO session anywhere is created in the backend the setting picks.
+   *
+   *  - `live`    → Zellij, warm (`fresh: false`).
+   *  - `zombie`  → killed first (see `zellijSessionState`), then treated as absent.
+   *  - `unknown` → Zellij only if selected, and then WARM: Zellij could not be asked, and the
+   *                fail-safe direction is never to cold-restore into a pane that may be live.
+   *  - `absent`  → Zellij only if selected, cold.
+   */
+  private async decideZellij(
+    persistKey: string
+  ): Promise<{ use: boolean; fresh: boolean; state: ZellijSessionState }> {
+    const run = this.zellijProbeRun()
+    if (!run) {
+      this.zellijKeys.delete(persistKey)
+      return { use: false, fresh: true, state: 'absent' }
+    }
+    const name = sessionName(persistKey)
+    let state = await zellijSessionState(run, name)
+    if (state === 'zombie') {
+      await zellijKillSession(run, name)
+      state = 'absent'
+    }
+    // Creating needs a socket path Zellij will accept; over the limit it refuses with exit 1 and
+    // the node would open as an exited terminal. Fall back to tmux instead (Settings says so).
+    const canCreate = this.zellijSocketFitsFor(name)
+    const selected = this.zellijSelected() && canCreate
+    const use = state === 'live' || (selected && (state === 'absent' || state === 'unknown'))
+    if (use) this.zellijKeys.add(persistKey)
+    else this.zellijKeys.delete(persistKey)
+    // `unknown` is WARM whatever the setting says: a node that may be live in Zellij must never be
+    // cold-started — snapshot replayed, agent `--resume`d a second time — in a new tmux shell.
+    return { use, fresh: state === 'absent', state }
+  }
+
+  /** The Zellij runner for PROBES of nodes we know nothing about. Only when Zellij is in play on this
+   *  machine — selected now, or used before (our `zellij.kdl` exists: it is written only when a
+   *  Zellij painter is created) — so a tmux user who merely has Zellij installed pays nothing: no
+   *  `list-sessions` per cold create, no `kill-session` per delete. */
+  private zellijProbeRun(): ZellijRun | null {
+    if (!this.getSettings().tmuxEnabled) return null
+    if (!this.zellijSelected()) {
+      try {
+        if (!fs.existsSync(path.join(platform().userDataDir, 'zellij.kdl'))) return null
+      } catch {
+        return null
+      }
+    }
+    return this.zellijRun()
+  }
+
+  /** Would Zellij accept the IPC socket for `name` in this environment (zellijSocketPath)? */
+  private zellijSocketFitsFor(name: string): boolean {
+    const env = process.env as Record<string, string | undefined>
+    return zellijSocketFits(
+      zellijSocketPath(env, os.tmpdir(), process.getuid?.() ?? 0, name),
+      this.runtimePlatform
+    )
+  }
+
+  /**
+   * Live `nt-*` Zellij sessions on this machine (null = could not tell / Zellij not in play). The
+   * session-memory panel measures tmux only, so it says how many it could NOT measure rather than
+   * "no sessions are running" over a machine full of Zellij ones.
+   */
+  async zellijSessionCount(): Promise<number | null> {
+    const run = this.zellijProbeRun()
+    if (!run) return 0
+    try {
+      const listing = parseZellijSessionList((await run(['list-sessions', '-n'])).stdout)
+      return listing.ok ? [...listing.live].filter((n) => isSessionName(n)).length : null
+    } catch (error) {
+      const text = error && typeof error === 'object' ? String((error as { stdout?: unknown }).stdout ?? '') : ''
+      return text.includes('No active zellij sessions found') ? 0 : null
+    }
+  }
+
   async sessionExists(persistKey: string): Promise<boolean> {
     if (this.liveSessionForPersistKey(persistKey)) return true
     const probes: Promise<boolean>[] = []
+    // A Zellij session is a session: the relay host asks this before attaching a phone to a node,
+    // and a "no" there would CREATE a tmux session beside the running Zellij one. `unknown` folds
+    // Only a PARSED listing that shows the session live answers "yes": an `unknown` here would say
+    // every node on the machine exists (the phone's End session then always reports "still
+    // running", and a relay attach never cold-restores). A live answer records the id so the
+    // attach routes to Zellij.
+    const zellij = this.zellijProbeRun()
+    if (zellij) {
+      probes.push(
+        zellijSessionState(zellij, sessionName(persistKey)).then((state) => {
+          if (state === 'live') this.zellijKeys.add(persistKey)
+          return state === 'live'
+        })
+      )
+    }
     if (this.tmuxPath) probes.push(this.tmuxSessionExists(persistKey))
     // Same "would this machine ever choose the host backend" predicate the spawn path uses, and it
     // has to be here rather than only there: `hasSession` goes through `request()`, which
@@ -2564,6 +3248,41 @@ export class PtyManager {
       // the reboot case) is absence; a spawn failure (EAGAIN under a bulk project load) is
       // not, and cold-restoring on it would type into a live session.
       return !probeSaysAbsent(e)
+    }
+  }
+
+  /**
+   * Is the tmux session for `persistKey` running, by the EXACT target (`=nt-<id>`)? Public for
+   * `team resume`, which must never start a second agent on a conversation whose session exists.
+   * `sessionExists` cannot answer this: its tmux leg prefix-matches, and it folds "could not tell"
+   * into "exists". No tmux at all answers 'absent' (nothing can be running there).
+   */
+  sessionVerdict(persistKey: string): Promise<'present' | 'absent' | 'unknown'> {
+    return this.strictTmuxVerdict(persistKey)
+  }
+
+  /**
+   * The strict existence probe a JOIN-ONLY create needs, as a tri-state: `unknown` when tmux could
+   * not be asked (a spawn error, a timeout), which such a create must refuse rather than read as
+   * "exists" the way the warm/cold fold (`tmuxSessionExists`) does.
+   *
+   * The target is EXACT (`-t =nt-<id>`), unlike `confirmedTmuxSessionExists`'s bare name. Measured
+   * on tmux 3.4: with only `nt-term-abc-12` alive, `has-session -t nt-term-abc-1` exits 0 (a miss
+   * falls through to fnmatch then PREFIX matching), while `new-session -A -s nt-term-abc-1` matches
+   * exactly and CREATES `nt-term-abc-1`. App-minted ids share a prefix and differ in a trailing
+   * counter, so a bare probe would let a viewer start a session whenever a longer id is alive.
+   */
+  private async strictTmuxVerdict(persistKey: string): Promise<'present' | 'absent' | 'unknown'> {
+    if (!this.tmuxPath) return 'absent'
+    try {
+      await this.confirmedProcessRun(
+        this.tmuxPath,
+        ['-L', TMUX_SOCKET, 'has-session', '-t', `=${sessionName(persistKey)}`],
+        { timeout: PROBE_TIMEOUT_MS }
+      )
+      return 'present'
+    } catch (error) {
+      return probeSaysAbsent(error) ? 'absent' : 'unknown'
     }
   }
 
@@ -2619,12 +3338,190 @@ export class PtyManager {
   }
 
   /**
+   * Wire the machine-local records the relay host's attach is decided from — see
+   * `relay-attach-plan.ts`. The desktop wires the workspace index + the SSH-project manager; the
+   * Server Edition has no relay host and wires none, which leaves `prepareRelayAttach` on its
+   * pre-fix behaviour (a bare local attach).
+   */
+  setRelayNodeResolver(resolve: RelayNodeResolver | null): void {
+    this.relayNodes = resolve
+  }
+
+  /**
+   * Prepare a relay-served attach to the session for `nodeId` (the phone's `pty.attach`).
+   *
+   * Replaces the bare `attachDetached`, which ran `tmux new-session -A` on the LOCAL socket for
+   * whatever id the phone named — so a node of an SSH project, tapped on the phone before the
+   * desktop had mounted it, came up as a local shell in this machine's `$HOME` (the invariant
+   * `PtyCreateOptions.requireRemote` states, broken from the one path that never set it), and a
+   * local node the phone happened to create first was created with no agent / account / cwd env,
+   * which tmux then ignores on every later attach.
+   *
+   * WHERE and WITH WHAT come only from this machine's records (`planRelayAttach`); the phone's
+   * optional `projectId` may only choose among them, or refuse. A remote node runs over its
+   * project's live ControlMaster (`requireRemote`, so a master or `ssh` that disappears in between
+   * spawns nothing), or is REFUSED with a sentence the phone can show.
+   *
+   * Split in three because the host must answer `fresh` before it sends the snapshot, and the
+   * snapshot before any live output: `sessionExists` → reply → `snapshot` → `attach`.
+   */
+  async prepareRelayAttach(
+    nodeId: string,
+    size: { cols: number; rows: number },
+    hint: { projectId?: string } = {}
+  ): Promise<RelayAttachPrep> {
+    const resolver = this.relayNodes
+    const placements = resolver?.placements(nodeId) ?? []
+    const live = this.liveSessionForPersistKey(nodeId)
+    const liveRemote: RelayRemoteRef | undefined = live?.sshRemote
+      ? {
+          conn: live.sshRemote.conn,
+          controlPath: live.sshRemote.controlPath,
+          hookEndpointPath: live.sshRemote.hookEndpointPath,
+          tmuxConfPath: live.sshRemote.tmuxConfPath,
+          remoteHome: live.sshRemote.remoteHome
+        }
+      : undefined
+    // Asked only when the records disagree (one id in a local AND an SSH project): then whichever
+    // session already exists wins, and a LOCAL one must be really local — a live remote client
+    // held by this process says nothing about the local socket.
+    const mixed =
+      placements.some(placementIsRemote) && placements.some((p) => !placementIsRemote(p))
+    const localSessionExists =
+      mixed && !liveRemote ? await this.sessionExists(nodeId).catch(() => false) : undefined
+    const plan = planRelayAttach({
+      placements,
+      projectHint: hint.projectId,
+      hintIsRemoteProject: hint.projectId ? !!resolver?.projectIsRemote(hint.projectId) : false,
+      refFor: (scope) => resolver?.refFor(scope),
+      liveRemote,
+      sshAvailable: !!findSsh(),
+      localSessionExists
+    })
+    if (plan.kind === 'refuse') return { kind: 'refused', reason: plan.reason, message: plan.message }
+    const options: PtyCreateOptions = {
+      ...plan.options,
+      persistKey: nodeId,
+      cols: size.cols,
+      rows: size.rows
+    }
+    const refused = this.spawnRefusal(options)
+    if (refused) {
+      return {
+        kind: 'refused',
+        reason: refused === 'ssh' ? 'no-ssh' : 'codex-account',
+        message:
+          refused === 'ssh'
+            ? 'This session lives on a remote host this computer cannot reach right now. Nothing was started here.'
+            : "This session's Codex account is not available on this computer. Nothing was started here."
+      }
+    }
+    // A stray LOCAL `nt-<id>` for a node that only ever lived remotely is what the pre-fix relay
+    // attach left behind. It is never attached from here again, and never killed either (it may
+    // hold work someone typed into it): say so where an operator will find it.
+    if (plan.kind === 'remote' && !mixed && this.tmuxPath && !live) {
+      void this.strictTmuxVerdict(nodeId).then((v) => {
+        if (v === 'present')
+          console.warn(
+            `[relay] ${sessionName(nodeId)} exists on the LOCAL tmux socket but node ${nodeId} lives on ${plan.hostKey}; the phone was attached to the remote session and the local one was left untouched`
+          )
+      })
+    }
+    if (plan.kind === 'remote') {
+      const sshRemote = options.sshRemote as NonNullable<PtyCreateOptions['sshRemote']>
+      const name = sessionName(nodeId)
+      // A master whose connect is still setting up may JOIN a session the host positively lists
+      // (`new-session -A` on a live session only attaches), never CREATE one: a session created now
+      // would carry no hook/account env and no tmux.conf for life — the renderer's
+      // `waitForSshRemote` rule, applied here.
+      if (!plan.setupDone) {
+        const verdict = await this.remoteSessionVerdict(sshRemote, name).catch(() => 'unknown' as const)
+        if (verdict !== 'present') {
+          return {
+            kind: 'refused',
+            reason: 'still-connecting',
+            message: `This computer is still connecting to ${plan.hostKey}. Try again in a moment. Nothing was started here.`
+          }
+        }
+      }
+      return {
+        kind: 'ready',
+        remote: true,
+        sessionExists: async () =>
+          (await this.remoteSessionVerdict(sshRemote, name).catch(() => 'unknown' as const)) !== 'absent',
+        snapshot: async () => {
+          const ssh = findSsh()
+          if (!ssh) return ''
+          try {
+            const { stdout } = await runAsync(
+              ssh,
+              remoteCaptureVisibleArgs(sshRemote.conn, sshRemote.controlPath, name),
+              { encoding: 'utf-8', maxBuffer: 8 * 1024 * 1024 }
+            )
+            return parseVisibleCapture(stdout).screen
+          } catch {
+            return ''
+          }
+        },
+        attach: (sinks) => this.spawnRelayRemote(options, sinks)
+      }
+    }
+    return {
+      kind: 'ready',
+      remote: false,
+      sessionExists: () => this.sessionExists(nodeId),
+      snapshot: () => this.captureSnapshot(nodeId),
+      attach: async (sinks) => {
+        await resolveShellPath()
+        const overrides = await this.projectSpawnOverrides(options)
+        return this.spawnSession(options, null, sinks, undefined, overrides)
+      }
+    }
+  }
+
+  /** The remote half of `prepareRelayAttach`'s attach: the same pin / overrides / spawn-gate
+   *  sequence `spawnNew` runs for a remote node, then a co-attach (`sinks` ⇒ no `-D`). */
+  private async spawnRelayRemote(options: PtyCreateOptions, sinks: DetachedSinks): Promise<string> {
+    // Re-asked at spawn time: `spawnSession` falls through to the LOCAL branch without `ssh`.
+    if (this.spawnRefusal(options)) throw new Error('remote host unreachable — nothing was started')
+    const remote = options.sshRemote as NonNullable<PtyCreateOptions['sshRemote']>
+    const pinned: PtyCreateOptions = {
+      ...options,
+      sshRemote: {
+        ...remote,
+        conn: {
+          ...remote.conn,
+          identityAgentSock: await probeAgentSockToPin(remote.conn).catch(() => undefined)
+        }
+      }
+    }
+    const overrides = await this.projectSpawnOverrides(pinned)
+    const slot = await remotePtySpawnGate.acquire(remote.controlPath, { background: false })
+    let sessionId: string
+    try {
+      sessionId = this.spawnSession(pinned, null, sinks, undefined, overrides)
+    } catch (err) {
+      slot()
+      throw err
+    }
+    releaseSpawnSlotOnOutput(this.sessions.get(sessionId), slot)
+    return sessionId
+  }
+
+  /**
    * Capture the CURRENT visible pane of a node's tmux session (with colors, via `-e`). Returns
    * the screen text so the relay host can send it as a snapshot the mirrored client paints before
    * live output. Empty string if tmux is unavailable or the session doesn't exist yet.
    */
   async captureSnapshot(persistKey: string): Promise<string> {
     const live = this.liveSessionForPersistKey(persistKey)
+    if (this.isZellij(persistKey, live)) {
+      // The visible screen with its SGR, like `capture-pane -e` without `-S`.
+      const run = this.zellijRun()
+      return run
+        ? zellijCapture(run, sessionName(persistKey), { ansi: true, viewport: true })
+        : ''
+    }
     if (live?.sessionHost) {
       try {
         return await sessionHostCapture(sessionName(persistKey), false)
@@ -2700,7 +3597,11 @@ export class PtyManager {
     warmWindowsBackend?: 'session-host' | 'tmux',
     /** What the OWNING project contributes (see `projectSpawnOverrides`) — already resolved,
      *  because this function is synchronous. Null on every path with no proven project owner. */
-    overrides?: ProjectSpawnOverrides | null
+    overrides?: ProjectSpawnOverrides | null,
+    /** `create()`'s Zellij decision. Absent on the detached (relay host) paths, which fall back to
+     *  what this process knows about the node (`zellijKeys`) — a phone attaching to a Zellij node
+     *  must join that session, never create a tmux one beside it. */
+    zellijBackend?: boolean
   ): string {
     // PRE-FLIGHT — refuse before node-pty is touched, not after it fails.
     //
@@ -2768,7 +3669,9 @@ export class PtyManager {
     // pre-flight above is the one thing that CAN, which is exactly why it runs before this.)
     // The shared background-write client goes too, for the same reason, when it is this node's
     // session it happens to be attached to.
-    if (options.persistKey) {
+    // A watcher's own client is not a painter: read-only, it never types, and it is kept at the
+    // window's own size (`syncWatcherClientSize`), so a background-write client may stay beside it.
+    if (options.persistKey && !isWatcherCreate(options)) {
       // The other half of the swap log (see `shadowAttach`), and only when there is really
       // something to retire: a painter arriving at a session no control client held swapped
       // nothing, and a line per terminal anyone opens is noise in the report it exists for.
@@ -2802,6 +3705,16 @@ export class PtyManager {
     // advertise it — without this, zsh themes and TUIs quietly clamp to the 256 palette and
     // the canvas terminals never match the user's real terminal colors (issue #78).
     const env = { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' } as Record<string, string>
+    if (process.platform === 'win32') {
+      // `process.env` commonly exposes this as `Path`. The copied object is case-sensitive, so a
+      // later `env.PATH = ...` would leave BOTH names in node-pty's environment block. ConPTY uses
+      // the first case-insensitive match, which is then the stale `Path` value. Canonicalise once
+      // before any PATH layer is applied so every downstream writer replaces the same entry.
+      const pathKeys = Object.keys(env).filter((key) => key.toUpperCase() === 'PATH')
+      const inheritedPath = env.PATH ?? (pathKeys.length ? env[pathKeys[0]] : undefined)
+      for (const key of pathKeys) delete env[key]
+      if (inheritedPath !== undefined) env.PATH = inheritedPath
+    }
     // The Server Edition may receive a first-boot password through its own environment. That
     // bootstrap credential belongs to the server process, never to the interactive shells and
     // agent CLIs it launches; inheriting it here would expose it to every terminal node.
@@ -2817,6 +3730,22 @@ export class PtyManager {
     // paths spawn late enough that the init()-time prewarm has long since settled.
     const shellPath = shellPathNow() ?? null
     if (shellPath) env.PATH = shellPath
+
+    // The agy installer writes `%LOCALAPPDATA%\agy\bin` into a REG_SZ user PATH on Windows.
+    // Windows does not expand that nested variable during command lookup, so `agy` is absent even
+    // though our hook installer finds the executable through its vendor-location fallback. APPEND
+    // the directory that same lookup proved, and only when no entry already names it
+    // (`pathWithAgyDir`): prepending shadowed the user's own tools on macOS/Linux, where agy sits in
+    // a shared directory. Keep plain terminals and remote sessions untouched; on SSH the executable
+    // and PATH belong to the host.
+    if (
+      options.agentId &&
+      capabilityAgentId(options.agentId as AgentId) === 'antigravity' &&
+      !options.sshRemote
+    ) {
+      const agy = findAgy()
+      if (agy) env.PATH = pathWithAgyDir(env.PATH, path.dirname(agy))
+    }
 
     // Same GUI-launch gap for the locale: with no LANG/LC_* the shell's `locale` is "C" (non-UTF-8),
     // so Claude Code and other TUIs fall back to ASCII box-drawing (rounded borders render as `_`/`|`).
@@ -2853,7 +3782,13 @@ export class PtyManager {
     // terminal, and every other agent, sees the PATH it always saw. The launcher itself falls back
     // to the bare CLI, so a session that gets the PATH but no identity is still a working session.
     if (options.agentId && hasSharedIdentity(options.agentId as AgentId) && !options.sshRemote) {
-      env.PATH = `${codexLauncherDir()}${path.delimiter}${env.PATH ?? ''}`
+      // Windows exposes the inherited variable as `Path`; reading only the POSIX spelling
+      // silently drops the user's PATH and leaves the managed launcher unable to find `codex`.
+      // Prepend onto the key the environment ALREADY uses: a spread of Windows' `process.env` spells
+      // it `Path`, and adding a second `PATH` beside it hands the child two case-insensitively equal
+      // variables — which one it reads is up to the child's runtime.
+      const pathKey = envPathKey(env)
+      env[pathKey] = `${codexLauncherDir()}${path.delimiter}${env[pathKey] ?? ''}`
     }
 
     // Managed Claude account: the whole session runs under the account's private config
@@ -2995,6 +3930,16 @@ export class PtyManager {
     // Unlike the installed-binary probe, this records the backend selected for THIS generation.
     // A Windows profile may coexist with an MSYS/Cygwin tmux on PATH and must not inherit it.
     let useLocalTmux = false
+    // Set by the Zellij branch below; see zellij-backend.ts.
+    let useLocalZellij = false
+    const zellijBin =
+      !options.sshRemote &&
+      options.persistKey &&
+      warmWindowsBackend === undefined &&
+      settings.tmuxEnabled &&
+      (zellijBackend ?? this.zellijKeys.has(options.persistKey))
+        ? this.zellijBin()
+        : null
 
     // Resolve the session program. A bare 'ssh' is resolved to an absolute path because GUI
     // apps don't inherit the shell PATH; its args come from options.shellArgs.
@@ -3028,7 +3973,18 @@ export class PtyManager {
     // holds the ssh client. Only when BOTH sshRemote and persistKey are set and ssh resolves —
     // otherwise this falls through to the unchanged local-tmux / plain-shell branches below.
     const remoteSsh = options.sshRemote && options.persistKey ? findSsh() : null
-    if (options.sshRemote && options.persistKey && remoteSsh) {
+    if (isWatcherCreate(options) && options.sshRemote && options.persistKey && remoteSsh) {
+      // A live link watcher's own client on the host: attach-only, read-only, ignore-size, no env
+      // (see `remoteTmuxWatcherArgs`). Nothing the owner's branch below does — tokens, hook/account
+      // env, the session-env file, `markPresent` — belongs to a client that creates nothing.
+      file = remoteSsh
+      if (process.env.NODETERM_APP_AGENT_SOCK) env.SSH_AUTH_SOCK = process.env.NODETERM_APP_AGENT_SOCK
+      args = remoteTmuxWatcherArgs(
+        options.sshRemote.conn,
+        options.sshRemote.controlPath,
+        sessionName(options.persistKey)
+      )
+    } else if (options.sshRemote && options.persistKey && remoteSsh) {
       file = remoteSsh
       // The remote twin of the local `ensureNodeToken` above: materialise THIS node's token on the
       // host before the attach. The connect path writes one for every node the canvas had AT
@@ -3162,13 +4118,32 @@ export class PtyManager {
       attachExistingHost = true
       file = ''
       args = []
+    } else if (zellijBin && options.persistKey) {
+      // Zellij: the painter is a Zellij CLIENT that creates-or-attaches `nt-<id>`. No `-e` list:
+      // a Zellij session is its own server process forked by this client, so `env` — hook env,
+      // account scope, gateway, project and custom-agent values, all merged above — IS the
+      // session's environment, and no value ever sits on an argv (measured in zellij-backend.ts).
+      // The nesting variables go so an app launched from inside Zellij is not refused.
+      for (const k of ZELLIJ_NESTING_ENV) delete env[k]
+      file = zellijBin
+      args = zellijAttachArgs(
+        this.ensureZellijConf(),
+        sessionName(options.persistKey),
+        localSessionShell,
+        // tmux starts its own default shell as a LOGIN shell when neither the node nor the setting
+        // names a program; mirror that so the same rc files run under either backend.
+        program || settings.defaultShell ? localSessionArgs : loginShellArgs(localSessionShell)
+      )
+      useLocalZellij = true
+      this.zellijKeys.add(options.persistKey)
     } else if (this.tmuxPath && settings.tmuxEnabled && options.persistKey) {
       // attach-or-create the persistent session for this node.
       // `-A` = attach-or-create. `-D` = detach OTHER clients on attach. We use `-D` ONLY for the
       // local renderer client (a remount should take sole ownership of its session). A host-served
       // PTY (sinks set) MUST NOT detach others: the host's own local client is attached to the same
       // `nt-<id>` session, and a connecting client should MIRROR it (tmux co-attach), not kick it
-      // off — `-D` there is exactly what showed "[detached]" in every host window on connect.
+      // off — `-D` there is exactly what showed "[detached]" in every host window on connect. A
+      // join-only (watch-only) reattach mirrors for the same reason: see `tmuxAttachFlags`.
       // (tmux sizes a co-attached session to the smallest client — the accepted mirroring tradeoff.)
       // `-e` sets the session environment explicitly (the tmux server is shared, so relying
       // on the client's inherited env would leak the first session's values into later ones).
@@ -3184,10 +4159,15 @@ export class PtyManager {
           '-f',
           this.confPath,
           'attach-session',
-          ...(sinks ? [] : ['-d']),
+          // `-d` detaches other clients, so it follows `tmuxAttachFlags`' mirror rule.
+          ...(sinks || options.joinOnly ? [] : ['-d']),
           '-t',
           sessionName(options.persistKey)
         ]
+      } else if (isWatcherCreate(options)) {
+        // A live link watcher's own client: attach-only, `-E`, `ignore-size,read-only`, exact target
+        // (see `watch-link/watcher-client.ts`). No `-f <conf>`: attach never starts a server.
+        args = localWatcherAttachArgs(TMUX_SOCKET, sessionName(options.persistKey))
       } else {
       // The hook-server env (port/token/node id/agent id) is passed explicitly via `-e`
       // (one `-e KEY=VALUE` per key) since the shared tmux server can't rely on inherited env.
@@ -3225,7 +4205,7 @@ export class PtyManager {
         ...Object.keys(customEnvMerged),
         ...Object.keys(projectEnv ?? {})
       ])
-      const attachFlags = tmuxAttachFlags(!!sinks)
+      const attachFlags = tmuxAttachFlags(!!sinks || !!options.joinOnly)
       args = [
         '-L',
         TMUX_SOCKET,
@@ -3304,13 +4284,22 @@ export class PtyManager {
           )) as unknown as pty.IPty
     } else {
       try {
-        proc = pty.spawn(file, args, {
-          name: 'xterm-256color',
-          cols: options.cols,
-          rows: options.rows,
-          cwd,
-          env
-        })
+        proc =
+          !!(options.sshRemote && options.persistKey && remoteSsh) && useNativeSsh()
+            ? // The remote terminal as a pty CHANNEL on the project's one native connection: no ssh
+              // process (it could not multiplex on Windows). See remote-ssh/native/native-pty.ts.
+              (new NativeSshPty(nativeMux(), args, {
+                cols: options.cols,
+                rows: options.rows,
+                name: 'xterm-256color'
+              }) as unknown as pty.IPty)
+            : pty.spawn(file, args, {
+                name: 'xterm-256color',
+                cols: options.cols,
+                rows: options.rows,
+                cwd,
+                env
+              })
       } catch (err) {
         // node-pty surfaces the underlying failure as a bare "posix_spawnp failed." with no errno.
         // Two different field causes wear that same message, so BOTH are measured before anything is
@@ -3333,7 +4322,7 @@ export class PtyManager {
     // marked remote — otherwise destroy/capture would target a remote tmux that was never spawned
     // and silently leak the local session.
     const remote = options.sshRemote && options.persistKey && remoteSsh ? options.sshRemote : undefined
-    const tmuxBacked = useLocalTmux
+    const tmuxBacked = useLocalTmux || useLocalZellij
     // `useSessionHost` is exactly "did the branch selection above pick the session-host backend",
     // so it needs no re-derivation here — session-host-backed sessions survive losing their
     // client exactly like tmux-backed ones do, for the same reason: the underlying pty lives in a
@@ -3345,9 +4334,16 @@ export class PtyManager {
     const spawnSub = clientId === null ? null : subKey(clientId, options.viewerId ?? PRIMARY_VIEWER)
     const session: Session = {
       proc,
+      nativeWindowsPane: process.platform === 'win32' && !persisted
+        ? new NativeWindowsPane(proc, { ...options, scrollback: settings.tmuxScrollback })
+        : undefined,
       subscribers: spawnSub === null ? new Set<SubKey>() : new Set<SubKey>([spawnSub]),
+      // A non-voting view (`sizeVote: false`) that got here — a hosted-relay viewer's warm tmux
+      // reattach — spawns the client at its own grid (the pty needs SOME size) but seeds no vote,
+      // the same rule `join` applies: otherwise the owner co-attaching later would stay pinned at
+      // min(owner, viewer), i.e. the viewer's small window would still shrink everyone's terminal.
       sizes:
-        spawnSub === null
+        spawnSub === null || options.sizeVote === false
           ? new Map<SubKey | null, PtySize>()
           : new Map<SubKey | null, PtySize>([[spawnSub, spawnSize]]),
       shown:
@@ -3359,16 +4355,22 @@ export class PtyManager {
       // A detached (relay-served) pty is left unseeded: its first `resize` must reach the pty,
       // exactly as before, because its sink never reports a size at create time.
       appliedSize: clientId === null ? undefined : spawnSize,
+      // The spawn's claim went to the backend unbounded (a renderer view adapts to any size).
+      appliedBounding: false,
       nodeId: options.persistKey,
-      indexKey: options.persistKey && !sinks ? options.persistKey : undefined,
+      indexKey: options.persistKey && !sinks && !isWatcherCreate(options) ? options.persistKey : undefined,
       onData: sinks?.onData,
       onExit: sinks?.onExit,
+      onSinkSize: sinks?.onSize,
+      sinkAdapts: sinks?.adaptsToSize === true,
       buf: [],
       bufBytes: 0,
       flushTimer: null,
       persistKey: persisted ? options.persistKey : undefined,
       sshRemote: remote,
       outputSinceSnapshot: true, // capture the initial screen on the first tick
+      snapshotDirtyTicks: 0,
+      snapshotQueued: false,
       // `persisted` IS "a tmux session (local or remote) is holding this work" — the same condition
       // that gates the scrollback snapshots. Recorded under its own name because the reap decision
       // asks a different question of it: not "is it worth snapshotting" but "would releasing this
@@ -3377,7 +4379,9 @@ export class PtyManager {
       unwatchedSince: null,
       pausedBy: new Set<string>(),
       accountFallback,
-      sessionHost: useSessionHost
+      sessionHost: useSessionHost,
+      ...(isWatcherCreate(options) ? { watcherClient: true } : {}),
+      ...(useLocalZellij ? { zellij: true } : {})
     }
     // Both shared timers are armed by the first session that needs them: the scrollback snapshots
     // and the idle reap are both about tmux-backed sessions and nothing else.
@@ -3406,11 +4410,20 @@ export class PtyManager {
     if (session.indexKey && !session.sessionHost && this.pendingRecycle.has(session.indexKey))
       this.fireRecycled(session.indexKey, true)
 
+    const hostPty = useSessionHost ? (proc as unknown as Partial<SessionHostPty>) : null
+    if (typeof hostPty?.onSize === 'function') {
+      hostPty.onSize((size) => {
+        if (this.sessions.get(sessionId) !== session) return
+        this.applyBackendSize(sessionId, session, size)
+      })
+    }
+
     proc.onData((data) => {
       // A session-host attach can fail after the shim has already delivered startup bytes. Once
       // rollback removes this exact generation, late callbacks must not recreate its flush timer
       // or leak bytes into a replacement that happens to reuse the same node id.
       if (this.sessions.get(sessionId) !== session) return
+      session.nativeWindowsPane?.recordOutput(data)
       this.queueData(sessionId, session, data)
     })
 
@@ -3531,6 +4544,7 @@ export class PtyManager {
   /** Drop a dead/released session from both indexes. Keyed off `indexKey` (not `persistKey`,
    *  which is only set for tmux-PERSISTED sessions) so a plain-shell node is un-indexed too. */
   private forget(sessionId: string, session: Session): void {
+    session.nativeWindowsPane?.dispose()
     this.sessions.delete(sessionId)
     if (session.indexKey && this.byPersistKey.get(session.indexKey) === sessionId)
       this.byPersistKey.delete(session.indexKey)
@@ -3596,10 +4610,15 @@ export class PtyManager {
     // pty at whatever size it has. Resizing it to a default here would garble the parked xterms'
     // buffers and the tmux pane behind them for no viewer's benefit.
     if (!size) return
+    if (session.sessionHost) {
+      this.applySessionHostSize(sessionId, session, size)
+      return
+    }
     if (session.appliedSize?.cols !== size.cols || session.appliedSize?.rows !== size.rows) {
       session.appliedSize = size
       try {
         session.proc.resize(size.cols, size.rows)
+        session.nativeWindowsPane?.resize(size.cols, size.rows)
       } catch {
         // resize can throw if the proc already exited; ignore.
       }
@@ -3613,6 +4632,62 @@ export class PtyManager {
       // share it, so both xterms receive one send and each renders the authoritative size (and
       // letterboxes) — exactly the co-attach contract. (A solo user, min(one), is never sent at all.)
       this.send(subClient(sub), channel, size)
+    }
+  }
+
+  /**
+   * `applySize` for a session-host session, where the size this `Session` asks for is only one vote
+   * (issue #914): the host follows the most recently active viewer across every `Session` of the
+   * node — this app's canvas node, its relay-served phone, another app — and reports back what the
+   * pty really runs at through `applyBackendSize`. So here we only VOTE; telling our views what
+   * they are showing is left to that answer, which the backend sends after every vote, changed or
+   * not. Min-over-views still decides this Session's vote, because the canvas node and the card
+   * modal share one claim exactly as they share one tmux client.
+   */
+  private applySessionHostSize(sessionId: string, session: Session, size: PtySize): void {
+    const bounding = session.sizes.has(null) && !session.sinkAdapts
+    if (
+      session.appliedSize?.cols !== size.cols ||
+      session.appliedSize?.rows !== size.rows ||
+      session.appliedBounding !== bounding
+    ) {
+      session.appliedSize = size
+      session.appliedBounding = bounding
+      try {
+        ;(session.proc as unknown as SessionHostPty).resize(size.cols, size.rows, bounding)
+      } catch {
+        // resize can throw if the proc already exited; ignore.
+      }
+      return
+    }
+    // Our vote did not move, so no answer is coming — but the view that reported may have just
+    // fitted itself to a size the pty is not running at. Correct it from the last answer we have.
+    if (session.backendSize) this.applyBackendSize(sessionId, session, session.backendSize)
+  }
+
+  /**
+   * The backend's answer: render exactly this. Every view whose xterm is not already at it is told
+   * over `pty:size` (it letterboxes a smaller grid and clips a larger one, as a tmux client does),
+   * and so is the relay sink, which forwards it to the phone as `OP.Resized`.
+   */
+  private applyBackendSize(sessionId: string, session: Session, size: PtySize): void {
+    session.backendSize = { cols: size.cols, rows: size.rows }
+    const channel = IPC.ptySize(sessionId)
+    for (const sub of session.subscribers) {
+      const shown = session.shown.get(sub)
+      if (shown && shown.cols === size.cols && shown.rows === size.rows) continue
+      session.shown.set(sub, session.backendSize)
+      this.send(subClient(sub), channel, session.backendSize)
+    }
+    if (session.onSinkSize && session.sizes.has(null)) {
+      const shown = session.sinkShown
+      if (shown && shown.cols === size.cols && shown.rows === size.rows) return
+      session.sinkShown = session.backendSize
+      try {
+        session.onSinkSize(session.backendSize)
+      } catch {
+        // A relay stream that has gone away must not break the desktop views' answer.
+      }
     }
   }
 
@@ -3639,6 +4714,17 @@ export class PtyManager {
     session.buf = []
     session.bufBytes = 0
     session.onData?.(data) // relay host sink (unchanged)
+    const tapKey = session.persistKey ?? session.nodeId
+    const taps = tapKey ? this.outputListeners.get(tapKey) : undefined
+    if (taps) {
+      for (const cb of [...taps]) {
+        try {
+          cb(data)
+        } catch (error) {
+          console.warn('[pty] output tap failed', error instanceof Error ? error.message : String(error))
+        }
+      }
+    }
     const channel = IPC.ptyData(sessionId)
     // One send per distinct client — a client's views share the per-client `pty:data:<id>` channel.
     for (const client of this.clientsOf(session)) this.send(client, channel, data)
@@ -3850,6 +4936,12 @@ export class PtyManager {
     } else {
       const size = normalizeSize(cols, rows)
       session.sizes.set(sub, size)
+      // A sink that reports a size is owed an ANSWER to that report, even an unchanged one: the
+      // phone clears its "sized to another screen" hint whenever it sends a size (it cannot tell
+      // on its own whether it just became the active viewer), and a `Resized` that was already in
+      // flight would otherwise re-raise the hint with nothing coming to correct it. So forget what
+      // the sink was last told; the backend's next answer is forwarded unconditionally.
+      if (sub === null) session.sinkShown = undefined
       // The view's own xterm fits itself locally (as it always has), so its fit — not the last
       // authoritative size we sent it — is what it is rendering right now. If that fit isn't the
       // effective size, applySize() below corrects it straight back.
@@ -3959,6 +5051,11 @@ export class PtyManager {
    */
   async captureSession(persistKey: string, full = false): Promise<string> {
     const live = this.liveSessionForPersistKey(persistKey)
+    if (live?.nativeWindowsPane) return live.nativeWindowsPane.capture(full)
+    if (this.isZellij(persistKey, live)) {
+      const run = this.zellijRun()
+      return run ? zellijCapture(run, sessionName(persistKey), { full, tailLines: 200 }) : ''
+    }
     // Remote (ssh-project) node: there is no local tmux session — capture from the REMOTE tmux
     // over the project's ControlMaster (mirrors snapshotScrollback / destroySession).
     const sshRemote = live?.sshRemote
@@ -3996,6 +5093,25 @@ export class PtyManager {
   }
 
   /**
+   * The canvas node a live session runs (its unconditional `nodeId`, see `Session`), or undefined
+   * when the session is unknown: never created, or already ended. Read-only. The hosted team relay
+   * judges each terminal frame it sends a Viewer by it, so `team unshare` stops a stream the viewer
+   * joined earlier (docs/hosted-team-relay.md).
+   */
+  nodeOfSession(sessionId: string): string | undefined {
+    return this.sessions.get(sessionId)?.nodeId
+  }
+
+  /**
+   * Is this session known to the manager — created and not yet ended? Read-only. A live link's host
+   * asks it after a join and after every keyframe capture (controller rulings R30/R38): the session's
+   * exit can race either, and its `pty:exit` was delivered before the viewer knew the session id.
+   */
+  hasSession(sessionId: string): boolean {
+    return this.sessions.has(sessionId)
+  }
+
+  /**
    * The CURRENT screen of a live session, by sessionId — the redraw sent to a client that fell so
    * far behind that its socket backlog was discarded (see ServerPlatform's WS_DROP_WATER). Reuses
    * the existing `tmux capture-pane -e` paths (`captureSnapshot`, which the relay host already
@@ -4015,6 +5131,426 @@ export class PtyManager {
     if (session.sessionHost) return sessionHostCapture(sessionName(key), true)
     if (session.sshRemote) return this.captureSession(key)
     return this.captureSnapshot(key)
+  }
+
+  /**
+   * A live link's keyframe: the VISIBLE screen of a session, with the cursor read in the same tmux
+   * invocation — never history. The keyframe's `altScreen` is the caller's, from the join (a
+   * tmux-backed client paints on the alternate screen; see `VisibleCapture`). Which backends get
+   * one, the exact target and the parse are `watch-link/capture-route.ts`. The session host
+   * (scrollback only), a direct Windows pane and a plain shell get `unavailableCapture()`, as does
+   * any failure — a dead ControlMaster, tmux's own "can't find session" for an exact-target miss.
+   */
+  async captureVisible(sessionId: string): Promise<VisibleCapture> {
+    const session = this.sessions.get(sessionId)
+    const key = session ? session.persistKey ?? session.indexKey : undefined
+    if (!session || !key) return unavailableCapture()
+    const route = visibleCaptureRoute(session, !!this.tmuxPath)
+    const target = sessionName(key)
+    try {
+      if (route === 'ssh' && session.sshRemote) {
+        // A remote node is captured on its HOST or not at all: never falls through to local tmux.
+        const ssh = findSsh()
+        if (!ssh) return unavailableCapture()
+        const { stdout } = await runAsync(
+          ssh,
+          remoteCaptureVisibleArgs(session.sshRemote.conn, session.sshRemote.controlPath, target),
+          { encoding: 'utf-8', maxBuffer: 8 * 1024 * 1024 }
+        )
+        return parseVisibleCapture(stdout)
+      }
+      if (route === 'tmux' && this.tmuxPath) {
+        const { stdout } = await runAsync(this.tmuxPath, localCaptureVisibleArgs(TMUX_SOCKET, target), {
+          encoding: 'utf-8',
+          maxBuffer: 8 * 1024 * 1024
+        })
+        return parseVisibleCapture(stdout)
+      }
+    } catch {
+      return unavailableCapture()
+    }
+    return unavailableCapture()
+  }
+
+  /**
+   * How a live-link controller's input reaches this session's PANE (watch-link/pane-input.ts).
+   *
+   * Never through a tmux CLIENT: a byte written into a client's pty is that client's KEYBOARD, so
+   * the prefix would reach tmux (`C-b s` opens the session chooser) — and a watcher's own client is
+   * read-only besides. A tmux-backed session (local, or on the SSH host) is typed into with
+   * `send-keys -H` on the pane. The Windows session host, a direct Windows pane and the plain-shell
+   * fallback take PtyManager's ordinary write: there is no tmux client in between, so no key table.
+   * Zellij is refused: its key bindings are session-wide (zellij-backend.ts).
+   */
+  watcherInputRoute(sessionId: string): WatcherInputRoute {
+    const s = this.sessions.get(sessionId)
+    if (!s) return 'none'
+    if (s.zellij) return 'none' // session-wide key bindings: refused
+    if (s.sshRemote) return s.tmuxBacked ? 'ssh' : 'none'
+    if (s.sessionHost || s.nativeWindowsPane) return 'write'
+    if (s.tmuxBacked) return this.tmuxPath ? 'tmux' : 'none'
+    // A watcher's own client is read-only and always tmux-backed; were one ever not, writing into it
+    // would drop every byte, so it is refused rather than reported delivered.
+    if (s.watcherClient) return 'none'
+    return 'write' // the plain-shell fallback: the pty IS the shell
+  }
+
+  /**
+   * Deliver one chunk of a controller's input to the session's pane. Resolves whether it was
+   * delivered; never rejects. Serialized per session id: a second chunk starts only after the first
+   * settled, so keys and pastes reach the pane in the order they were typed. The Session is re-read
+   * inside each step (it can be gone by then → false), and the tmux name is resolved from it, never
+   * from the caller. A false is never retried here (a timed-out delivery may well have run).
+   *
+   * BOUNDED on every route, by a deadline PANE_INPUT_DEADLINE_MS after the chunk was HANDED OVER —
+   * the link host's own deadline, which runs from the same moment. The tmux and SSH routes are bounded
+   * already (`runWithStdin`: PROC_TIMEOUT_MS), the session host's request by its own timeout once
+   * connected — but its reconnect can wait on a host that is still starting, and a step that never
+   * settled would hold every later chunk behind it, to land long after the link host told its
+   * controller it was dropped. So a step gets only what is LEFT of its chunk's deadline (a chunk that
+   * waited 15 s behind a slow one has 5 s), answers false when it runs out (a late delivery may still
+   * land, as with any timed-out one), and a chunk with nothing left when its turn comes is dropped
+   * undelivered: whoever handed it over has given up on it.
+   *
+   * `isCurrent` (the link host's: its sender still controls, in the period it typed in) is asked right
+   * before the step runs — after any wait behind a slow step, immediately before the spawn or the
+   * write, nothing awaited in between: false (or a throw) and the chunk is never delivered (false).
+   * A chunk handed over while its sender controlled must not land after a stop or a demotion.
+   */
+  controlInput(sessionId: string, chunk: ControlInputChunk, isCurrent?: () => boolean): Promise<boolean> {
+    const handedAt = Date.now()
+    const prev = this.controlInputChains.get(sessionId) ?? Promise.resolve(true)
+    const step = prev
+      .then(() => {
+        const left = PANE_INPUT_DEADLINE_MS - (Date.now() - handedAt)
+        return left <= 0 ? false : settleWithin(this.deliverControlInput(sessionId, chunk, isCurrent), left)
+      })
+      .catch(() => false)
+    this.controlInputChains.set(sessionId, step)
+    void step.then(() => {
+      if (this.controlInputChains.get(sessionId) === step) this.controlInputChains.delete(sessionId)
+    })
+    return step
+  }
+
+  /** The tail of each session's `controlInput` chain; deleted when the tail settles. */
+  private readonly controlInputChains = new Map<string, Promise<boolean>>()
+
+  private async deliverControlInput(
+    sessionId: string,
+    chunk: ControlInputChunk,
+    isCurrent?: () => boolean
+  ): Promise<boolean> {
+    // The chunk arrives from a viewer over the network: its shape is checked, not assumed.
+    const c = chunk as { kind?: unknown; data?: unknown; text?: unknown } | null
+    const keys = c?.kind === 'keys' && typeof c.data === 'string'
+    const paste = c?.kind === 'paste' && typeof c.text === 'string'
+    if (!keys && !paste) return false
+    const s = this.sessions.get(sessionId)
+    const route = this.watcherInputRoute(sessionId)
+    if (!s || route === 'none') return false
+    // An empty key chunk is refused on every route (the tmux builder would have no bytes to type);
+    // a paste that sanitizes to nothing has nothing to do.
+    if (keys && (c.data as string).length === 0) return false
+    if (paste && sanitizePasteText(c.text as string).length === 0) return true
+    // Right before the spawn or the write (synchronous from here to it, on every route): a sender that
+    // stopped controlling while this chunk waited never gets it delivered. A throw reads as not current.
+    if (isCurrent) {
+      let current = false
+      try {
+        current = isCurrent() === true
+      } catch {
+        current = false
+      }
+      if (!current) return false
+    }
+    try {
+      switch (route) {
+        case 'tmux': {
+          const tmuxPath = this.tmuxPath
+          if (!tmuxPath || !s.persistKey) return false
+          const plan = controlInputPlan(TMUX_SOCKET, sessionName(s.persistKey), chunk)
+          if (!plan) return true
+          return await runPasteDelivery(plan, (args, input) => runWithStdin(tmuxPath, args, input))
+        }
+        case 'ssh': {
+          const ssh = findSsh()
+          if (!ssh || !s.sshRemote || !s.persistKey) return false
+          const { conn, controlPath } = s.sshRemote
+          const plan = remoteControlInputPlan(conn, controlPath, sessionName(s.persistKey), chunk)
+          if (!plan) return true
+          return await runPasteDelivery(plan, (args, input) => runWithStdin(ssh, args, input))
+        }
+        case 'write': {
+          if (chunk.kind === 'keys') {
+            this.write(null, sessionId, chunk.data)
+            return true
+          }
+          // A paste: framed only when the pane's app asked for bracketed paste, never with an Enter.
+          // The session host's and a direct Windows pane's no-Enter text path (core/settled-text.ts)
+          // writes at once — the screen-settle wait runs only before an Enter — and frames by the
+          // emulator's own `?2004h` state, which is `paste-buffer -p`'s contract.
+          if (s.nativeWindowsPane) return (await s.nativeWindowsPane.sendText(chunk.text, false)) === true
+          const name = s.persistKey ?? s.indexKey
+          if (s.sessionHost && name) return (await sessionHostSendKeys(sessionName(name), chunk.text, false)) === true
+          // A plain shell: no emulator here knows what the app asked for, so unframed (markers at an
+          // app that never asked would arrive as literal `[200~`).
+          this.write(null, sessionId, sanitizePasteText(chunk.text))
+          return true
+        }
+      }
+    } catch {
+      // A builder refusing a name it did not generate, or a pty that threw on write (it exited).
+      return false
+    }
+  }
+
+  /**
+   * Can a live link offer Control on this node? `unsupported` for a Zellij node (session-wide key
+   * bindings), or a node with no session on a machine whose new sessions are Zellij; `ok` when a
+   * session for it is live or released (its pane can be reached), or when a new node would be
+   * tmux-backed here; `unknown` otherwise (nothing to tell from yet).
+   */
+  nodeControlSupport(persistKey: string): ControlSupport {
+    const live = this.liveSessionForPersistKey(persistKey)
+    if (this.zellijKeys.has(persistKey) || live?.zellij) return 'unsupported'
+    if (live || this.released.has(persistKey)) return 'ok'
+    // No session here: a new one would be created in the SELECTED backend, and a Zellij one refuses
+    // control. (A node whose tmux session is warm but not held by this process reads the same way
+    // until it is mounted; the live branch above answers it then.)
+    if (this.zellijSelected()) return 'unsupported'
+    if (this.tmuxPath && this.getSettings().tmuxEnabled) return 'ok'
+    return 'unknown'
+  }
+
+  /**
+   * Join a node's RUNNING session as a live link's viewer. It never starts one (`joinOnly`: a session
+   * that cannot be confirmed is refused `unavailable: 'join-only'`), and it never votes on its size:
+   *  - joining a Session held in this process casts no size vote (`sizeVote: false`) — the pty stays
+   *    at its owners' size;
+   *  - when no Session is held it spawns its OWN tmux client (shared by later viewers of the node):
+   *    `attach-session -E -f ignore-size,read-only` on the exact target (`watch-link/watcher-client.ts`)
+   *    — never creating, never stripping the session env, unable to type.
+   * `ignore-size` is NOT unconditional (measured, tmux 3.4): tmux honours it only while at least one
+   * client WITHOUT the flag is attached to some session on the same server. When the watcher's client
+   * is the only one, tmux's `window-size latest` sizes the window to it. So the client is spawned at
+   * the window's CURRENT size, read immediately before the spawn and REFUSED when it cannot be read
+   * (`spawnNew`), and `syncWatcherClientSize` keeps it there while the link host has viewers. Residual:
+   * when the watcher becomes the only client, the window stays at the last-synced size until another
+   * client sizes it, and a read can race an owner resizing or leaving (the window then keeps the size
+   * read a moment before).
+   * A local tmux older than 3.2 has no client flags: refused. Only the named fields are forwarded, and
+   * the watcher rules are set after them. A remote node is never watched through the local tmux
+   * (`requireRemote` whenever `sshRemote` is given).
+   */
+  async joinAsWatcher(
+    clientId: ClientId,
+    opts: {
+      persistKey: string
+      viewerId: string
+      cols?: number
+      rows?: number
+      sshRemote?: PtyCreateOptions['sshRemote']
+      requireRemote?: boolean
+    }
+  ): Promise<PtyCreateResult> {
+    const { persistKey, viewerId, sshRemote } = opts
+    // The Session a watcher create would JOIN (`join` reads the index).
+    const indexedId = this.byPersistKey.get(persistKey)
+    const held = indexedId ? this.sessions.get(indexedId) : undefined
+    const given =
+      Number.isInteger(opts.cols) && Number.isInteger(opts.rows) && opts.cols! > 0 && opts.rows! > 0
+        ? { cols: opts.cols!, rows: opts.rows! }
+        : undefined
+    // The size this view starts at when it JOINS a client that already exists (it is told the
+    // authoritative size right after). It is never a spawn size: a watcher's own client is spawned only
+    // at the window size `spawnNew` reads itself, or not at all. For a HELD session that is the
+    // session's own size — no tmux read (R64/M4): the read took the CALLER's `sshRemote`, which is
+    // absent for a remote node whose master is down, and so asked the LOCAL tmux about a remote node.
+    const size =
+      given ??
+      (held && indexedId ? this.sessionSize(indexedId) : null) ??
+      this.watchSizeFor(persistKey) ?? { cols: 80, rows: 24 }
+    const options: WatcherCreateOptions = {
+      persistKey,
+      viewerId,
+      cols: size.cols,
+      rows: size.rows,
+      ...(sshRemote ? { sshRemote } : {}),
+      ...(opts.requireRemote || sshRemote ? { requireRemote: true } : {}),
+      joinOnly: true,
+      sizeVote: false,
+      [WATCHER_CLIENT]: true
+    }
+    return this.create(clientId, options)
+  }
+
+  /**
+   * Keep a watcher's OWN tmux client at the window's current size, so that if it becomes the only
+   * client on the server (when tmux stops honouring `ignore-size`) the window keeps its latest size
+   * instead of snapping to the size the client was spawned at. The link host calls it on every
+   * keyframe and on a timer while the node has viewers.
+   *
+   * Reads the window size by exact target (locally, or over the ControlMaster) and resizes THIS
+   * client's pty to exactly that — not a size vote (`sizes` is untouched), never a viewer-supplied
+   * size — then tells the viewers the size they render, as `applySize` does. A no-op answering false
+   * for anything that is not a watcher's own client, an unreadable size, or a session that went away
+   * during the read. With the production conf (`status off`) the window IS the client size, so a
+   * client of the window's size leaves the window where it is.
+   *
+   * SERIALIZED per session (controller ruling R24): the link host calls it before every keyframe and
+   * on a timer, and two links can watch one node, so calls overlap — and two reads racing each other
+   * could be applied out of order, leaving the client at the OLDER size. So one read is in flight per
+   * session, and every caller that arrives meanwhile shares ONE queued rerun that reads after it: the
+   * latest read is the one applied last. Never rejects.
+   */
+  syncWatcherClientSize(sessionId: string): Promise<boolean> {
+    const slot = this.watcherSizeSyncs.get(sessionId)
+    if (!slot) return this.startWatcherSizeSync(sessionId)
+    // Starts only once the read in flight settled, so its answer can never land after this one.
+    slot.rerun ??= slot.current.then(() => this.startWatcherSizeSync(sessionId))
+    return slot.rerun
+  }
+
+  /** One `syncWatcherClientSize` read per session at a time; `rerun` is the one queued behind it. */
+  private readonly watcherSizeSyncs = new Map<string, { current: Promise<boolean>; rerun: Promise<boolean> | null }>()
+
+  private startWatcherSizeSync(sessionId: string): Promise<boolean> {
+    const current = this.syncWatcherClientSizeOnce(sessionId)
+    const slot = { current, rerun: null as Promise<boolean> | null }
+    this.watcherSizeSyncs.set(sessionId, slot)
+    // Registered BEFORE any rerun's `.then`, so it runs first: with a rerun queued the slot stays until
+    // the rerun replaces it; with none, the session has no sync in flight any more.
+    void current.finally(() => {
+      if (this.watcherSizeSyncs.get(sessionId) === slot && !slot.rerun) this.watcherSizeSyncs.delete(sessionId)
+    })
+    return current
+  }
+
+  private async syncWatcherClientSizeOnce(sessionId: string): Promise<boolean> {
+    try {
+      const session = this.sessions.get(sessionId)
+      if (!session?.watcherClient || !session.persistKey) return false
+      const size = await this.readWindowSize(session.persistKey, session.sshRemote)
+      if (!size || this.sessions.get(sessionId) !== session) return false
+      if (session.appliedSize?.cols !== size.cols || session.appliedSize?.rows !== size.rows) {
+        try {
+          session.proc.resize(size.cols, size.rows)
+        } catch {
+          return false // the client already exited
+        }
+        session.appliedSize = size
+      }
+      // The same per-subscriber `pty:size` applySize sends (a live link's viewer renders exactly this).
+      const channel = IPC.ptySize(sessionId)
+      for (const sub of session.subscribers) {
+        const shown = session.shown.get(sub)
+        if (shown && shown.cols === size.cols && shown.rows === size.rows) continue
+        session.shown.set(sub, size)
+        this.send(subClient(sub), channel, size)
+      }
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * The size a session runs at NOW: the backend's authoritative size (the session host's answer),
+   * else the size pushed into its pty. What a live link's `watch:meta` reports for the session a viewer
+   * just joined (controller ruling R25): for a co-attached watcher that is the owner's pty size; for a
+   * watcher's OWN client it is the window size the client was spawned at and `syncWatcherClientSize`
+   * keeps it at — a client `watchSizeFor` cannot see (it is hidden from every persistKey lookup). A
+   * copy; null for a session this manager does not know, or one that has no size yet.
+   */
+  sessionSize(sessionId: string): { cols: number; rows: number } | null {
+    const session = this.sessions.get(sessionId)
+    const size = session?.backendSize ?? session?.appliedSize
+    return size ? { cols: size.cols, rows: size.rows } : null
+  }
+
+  /**
+   * The CURRENT size a client of a node's tmux window has, read from tmux rather than from memory:
+   * with no Session held there is nothing to remember it from. One `display-message` by exact target
+   * reads `#{window_width} #{window_height} #{status}`, and the status lines are ADDED to the height
+   * (`parseWindowSize`): a client is window + status rows tall, so a client spawned at the bare window
+   * height would make tmux shrink the window. With the production conf (`status off`) the two agree.
+   * Local, or over the ControlMaster for an SSH node (never the local tmux for a remote node: the
+   * caller passes the node's `sshRemote`, and a remote node with no master is not read at all).
+   * undefined on any failure, an exact-target miss (tmux answers exit 0 with empty formats) or a
+   * status value it does not know.
+   */
+  async readWindowSize(
+    persistKey: string,
+    sshRemote?: PtyCreateOptions['sshRemote']
+  ): Promise<{ cols: number; rows: number } | undefined> {
+    const target = sessionName(persistKey)
+    try {
+      if (sshRemote) {
+        const ssh = findSsh()
+        if (!ssh) return undefined
+        const { stdout } = await runAsync(ssh, remoteWindowSizeArgs(sshRemote.conn, sshRemote.controlPath, target), {
+          encoding: 'utf-8'
+        })
+        return parseWindowSize(stdout)
+      }
+      if (!this.tmuxPath) return undefined
+      const { stdout } = await runAsync(this.tmuxPath, localWindowSizeArgs(TMUX_SOCKET, target), {
+        encoding: 'utf-8',
+        timeout: PROBE_TIMEOUT_MS
+      })
+      return parseWindowSize(stdout)
+    } catch {
+      return undefined
+    }
+  }
+
+  /** `tmux -V` for the LOCAL binary, per binary path (a watcher client needs >= 3.2). Only a DEFINITE
+   *  answer — tmux printed a version, supported or not — is kept; a probe that failed (spawn error,
+   *  timeout) is dropped, so the next watcher join asks again. Concurrent joins share one probe. */
+  private watcherTmuxProbe: { path: string; ok: Promise<boolean> } | null = null
+  /** The refusal is logged once per app run, not once per viewer. */
+  private watcherTmuxRefusalLogged = false
+
+  private localTmuxSupportsWatcherClient(): Promise<boolean> {
+    const tmuxPath = this.tmuxPath
+    if (!tmuxPath) return Promise.resolve(false)
+    if (this.watcherTmuxProbe?.path === tmuxPath) return this.watcherTmuxProbe.ok
+    const probe: { path: string; ok: Promise<boolean> } = {
+      path: tmuxPath,
+      ok: this.confirmedProcessRun(tmuxPath, ['-V'], { timeout: PROBE_TIMEOUT_MS, encoding: 'utf-8' }).then(
+        (res) => {
+          const stdout = String((res as { stdout?: unknown })?.stdout ?? '')
+          const supported = supportsWatcherClient(parseTmuxVersion(stdout))
+          if (!supported && !this.watcherTmuxRefusalLogged) {
+            this.watcherTmuxRefusalLogged = true
+            const seen = stdout.trim().slice(0, 40) || 'unknown'
+            console.warn(
+              `[pty] live link watchers refused: the local tmux (${seen}) has no client flags; tmux 3.2 or newer is needed`
+            )
+          }
+          return supported
+        },
+        () => {
+          // Not an answer: forget this probe (unless a newer one replaced it) and refuse this join.
+          if (this.watcherTmuxProbe === probe) this.watcherTmuxProbe = null
+          return false
+        }
+      )
+    }
+    this.watcherTmuxProbe = probe
+    return probe.ok
+  }
+
+  /**
+   * The size a live link should report for a node: what its pty runs at now (the session host's
+   * authoritative size first, else the size pushed into the pty), or what it ran at when its last
+   * client was released. A copy; undefined when this process never ran the node.
+   */
+  watchSizeFor(persistKey: string): { cols: number; rows: number } | undefined {
+    const live = this.liveSessionForPersistKey(persistKey)
+    const size = live?.backendSize ?? live?.appliedSize ?? this.released.get(persistKey)?.size
+    return size ? { cols: size.cols, rows: size.rows } : undefined
   }
 
   /**
@@ -4044,7 +5580,7 @@ export class PtyManager {
         )
         return parsePaneCursor(stdout)
       }
-      if (session.sessionHost) return undefined
+      if (session.sessionHost || session.zellij) return undefined
       if (!this.tmuxPath) return undefined
       const { stdout } = await runAsync(this.tmuxPath, [
         '-L',
@@ -4062,16 +5598,40 @@ export class PtyManager {
   }
 
   /**
+   * Skip rewriting an identical snapshot (a quiet-but-dirty pane, a cursor-only change). Returns
+   * whether the disk now holds this text: true when written OR skipped as unchanged, false when the
+   * write failed — so the tick can re-mark the session dirty and retry.
+   */
+  private async writeScrollbackIfChanged(persistKey: string, text: string): Promise<boolean> {
+    const digest = createHash('sha1').update(text).digest('hex')
+    if (this.lastSnapshotDigest.get(persistKey) === digest) return true
+    // Only a write that LANDED may be remembered: recording the digest of a failed one (ENOSPC, a
+    // rename that exhausted its retries on Windows) would skip every later identical capture —
+    // detach/quit's final ones included — for the rest of the run.
+    const written = await writeScrollback(persistKey, text)
+    if (written) this.lastSnapshotDigest.set(persistKey, digest)
+    return written
+  }
+
+  /**
    * Snapshot a node's recent scrollback (with colors, `-e`) to disk for cold-restart replay.
    * Best-effort: a missing session / unavailable tmux just leaves the prior snapshot in place.
-   * Returns false when the capture failed, so the periodic tick can re-mark the session dirty
-   * and retry (the dirty bit is cleared optimistically before the capture starts).
+   * Returns false when the capture OR its disk write failed, so the periodic tick can re-mark the
+   * session dirty and retry (the dirty bit is cleared optimistically before the capture starts).
+   * An empty capture writes nothing and counts as done.
    */
   private async snapshotScrollback(
     persistKey: string,
     sshRemote?: NonNullable<PtyCreateOptions['sshRemote']>,
     sessionHost = false
   ): Promise<boolean> {
+    if (!sshRemote && this.zellijKeys.has(persistKey)) {
+      const run = this.zellijRun()
+      if (!run) return false
+      const text = await zellijCapture(run, sessionName(persistKey), { ansi: true, tailLines: 1500 })
+      // '' is "no capture" (session gone, Zellij unreachable): keep the last good snapshot.
+      return text ? await this.writeScrollbackIfChanged(persistKey, text) : false
+    }
     if (sshRemote) {
       // Remote (ssh-project) node: capture from the REMOTE tmux over the project's ControlMaster.
       const ssh = findSsh()
@@ -4082,8 +5642,7 @@ export class PtyManager {
           remoteCapturePaneArgs(sshRemote.conn, sshRemote.controlPath, sessionName(persistKey), false),
           { encoding: 'utf-8', maxBuffer: 50 * 1024 * 1024 }
         )
-        if (stdout) await writeScrollback(persistKey, stdout)
-        return true
+        return stdout ? await this.writeScrollbackIfChanged(persistKey, stdout) : true
       } catch {
         // remote session gone / master down — keep the last good snapshot
         return false
@@ -4098,8 +5657,7 @@ export class PtyManager {
       if (!this.getSettings().tmuxEnabled || !sessionHostSupported()) return false
       try {
         const text = await sessionHostCapture(sessionName(persistKey), true)
-        if (text) await writeScrollback(persistKey, text)
-        return true
+        return text ? await this.writeScrollbackIfChanged(persistKey, text) : true
       } catch {
         return false
       }
@@ -4110,8 +5668,7 @@ export class PtyManager {
         ['-L', TMUX_SOCKET, 'capture-pane', '-p', '-e', '-t', sessionName(persistKey), '-S', '-1500'],
         { encoding: 'utf-8', maxBuffer: 50 * 1024 * 1024 }
       )
-      if (stdout) await writeScrollback(persistKey, stdout)
-      return true
+      return stdout ? await this.writeScrollbackIfChanged(persistKey, stdout) : true
     } catch {
       // session gone / tmux unavailable — keep the last good snapshot
       return false
@@ -4157,10 +5714,19 @@ export class PtyManager {
    * composition is exported, both callers use it, and the only thing left in this method is which
    * transport runs it.
    */
-  async sendText(persistKey: string, text: string, opts?: { enter?: boolean }): Promise<boolean> {
+  async sendText(persistKey: string, text: string, opts?: { enter?: boolean }): Promise<TextDeliveryResult> {
     const enter = opts?.enter ?? true
     const target = sessionName(persistKey)
     const live = this.liveSessionForPersistKey(persistKey)
+    // A direct (non-persistent) Windows PTY has no session-host entry and no tmux: it is typed
+    // into through the pane itself. Routing it to the session host below failed every time.
+    if (live?.nativeWindowsPane) return live.nativeWindowsPane.sendText(text, enter)
+    if (this.isZellij(persistKey, live)) {
+      // `action paste` applies the pane's own bracketed-paste state — the `paste-buffer -p`
+      // contract — then Enter as a second write. See zellijSendText.
+      const run = this.zellijRun()
+      return run ? zellijSendText(run, target, text, enter) : false
+    }
     const sshRemote = live?.sshRemote
     try {
       if (sshRemote) {
@@ -4190,6 +5756,24 @@ export class PtyManager {
   }
 
   /**
+   * A prompt from the ⌘M chat view. For an agent whose screen we can read (`readsScreenDialogs`),
+   * refused before anything is written when the agent's own UI owns the keyboard: such dialogs
+   * (the folder-trust prompt, `/model`, one-time setup questions) fire no hook, so the chat view's
+   * state gate cannot see them, and a paste into one swallowed the text while its Enter answered
+   * the dialog. An empty capture (no session, a failed read) is not evidence of a dialog: the
+   * prompt is sent exactly as before. There is no second look before the Enter — `sendText`
+   * submits in the same step. Everything else is `sendText`, unchanged.
+   */
+  async sendChatPrompt(persistKey: string, text: string, agentId: string): Promise<ChatPromptResult> {
+    if (readsScreenDialogs(agentId)) {
+      const screen = await this.captureSession(persistKey)
+      const refused = screen === '' ? null : screenGate(screen)
+      if (refused !== null) return refused
+    }
+    return this.sendText(persistKey, text)
+  }
+
+  /**
    * The command currently in the foreground of a node's tmux pane (e.g. 'claude', 'zsh') — how
    * the in-place agent restart observes that the CLI has exited and a shell owns the pane again.
    * null when it is unknown: no live session, tmux unavailable, or the query failed. Unknown is
@@ -4203,6 +5787,7 @@ export class PtyManager {
   async paneCommand(persistKey: string): Promise<string | null> {
     const target = sessionName(persistKey)
     const live = this.liveSessionForPersistKey(persistKey)
+    if (this.isZellij(persistKey, live)) return this.zellijPaneCommand(target)
     const sshRemote = live?.sshRemote
     if (sshRemote) {
       const ssh = findSsh()
@@ -4241,6 +5826,53 @@ export class PtyManager {
   }
 
   /**
+   * The live working directory of a node's pane (`#{pane_current_path}` — the cwd of the pane's
+   * foreground process, e.g. the agent CLI), by persistKey. File links resolve a relative path
+   * against the node's LAUNCH cwd first; this is the second candidate, for output printed relative
+   * to wherever the pane has since moved (`cd`, or an agent started from another directory).
+   *
+   * Same dispatch and failure contract as `paneCommand`: the SSH branch asks the REMOTE tmux over
+   * the project's ControlMaster, and every unknown — no live session, no tmux, the session-host
+   * backend (it tracks no cwd), a failed query — is null, never a throw.
+   */
+  async paneCwd(persistKey: string): Promise<string | null> {
+    const target = sessionName(persistKey)
+    const live = this.liveSessionForPersistKey(persistKey)
+    // No Zellij equivalent of `#{pane_current_path}` is used: unknown, and file links fall back to
+    // the launch cwd (ZELLIJ_BACKEND_GAPS). Never asked of the tmux socket, which would be a guess.
+    if (this.isZellij(persistKey, live)) return null
+    const sshRemote = live?.sshRemote
+    if (sshRemote) {
+      const ssh = findSsh()
+      if (!ssh) return null
+      try {
+        const { stdout } = await runAsync(
+          ssh,
+          remotePaneCwdArgs(sshRemote.conn, sshRemote.controlPath, target)
+        )
+        return stdout.trim() || null
+      } catch {
+        return null
+      }
+    }
+    if (live?.sessionHost || !this.tmuxPath) return null
+    try {
+      const { stdout } = await runAsync(this.tmuxPath, [
+        '-L',
+        TMUX_SOCKET,
+        'display-message',
+        '-p',
+        '-t',
+        target,
+        '#{pane_current_path}'
+      ])
+      return stdout.trim() || null
+    } catch {
+      return null
+    }
+  }
+
+  /**
    * How many SECONDS ago was this node's tmux session created — on the machine that holds it?
    *
    * The late cold-start check (`PtyCreateResult.freshUnverified`). When the freshness read could
@@ -4261,6 +5893,7 @@ export class PtyManager {
   async sessionAgeSeconds(persistKey: string): Promise<number | null> {
     const target = sessionName(persistKey)
     const live = this.liveSessionForPersistKey(persistKey)
+    if (this.isZellij(persistKey, live)) return null
     const sshRemote = live?.sshRemote
     if (sshRemote) {
       const ssh = findSsh()
@@ -4307,6 +5940,9 @@ export class PtyManager {
    */
   async terminateForeground(persistKey: string, expectedAgentId?: string): Promise<boolean> {
     if (typeof persistKey !== 'string' || !persistKey || persistKey.length > REF_MAX_LEN) return false
+    // Refused on Zellij (ZELLIJ_BACKEND_GAPS): a signal aimed at a process group read off `ps`
+    // without the pane-owner proof the tmux leg has would be a guess at which process to kill.
+    if (this.isZellij(persistKey, this.liveSessionForPersistKey(persistKey))) return false
     // Identity gate: prove the expected harness owns the foreground group before signalling it.
     // `paneOwner` reads the full argv (local or over the project's ControlMaster) and is null on
     // any uncertainty, which `isAgentPane` maps to `unknown` → refuse.
@@ -4398,6 +6034,10 @@ export class PtyManager {
   async paneOwner(persistKey: string): Promise<PaneOwner | null> {
     const target = sessionName(persistKey)
     const live = this.liveSessionForPersistKey(persistKey)
+    // Agent messaging is refused into a Zellij pane (ZELLIJ_BACKEND_GAPS): null = "could not
+    // prove the owner", which every messaging gate already reads as a refusal.
+    if (this.isZellij(persistKey, live)) return null
+    if (live?.nativeWindowsPane) return live.nativeWindowsPane.owner()
     const sshRemote = live?.sshRemote
     try {
       if (sshRemote) {
@@ -4414,9 +6054,10 @@ export class PtyManager {
         )
         return parseCombinedPaneOwner(out.stdout)
       }
-      // The session host has no tty/tmux identity surface. Do not query an unrelated POSIX tmux
-      // merely because one is installed beside this native Windows generation.
-      if (live?.sessionHost || !this.tmuxPath) return null
+      // Only the owning host may attest this generation. An older live host rejects the
+      // extension; that refusal must never fall through to an unrelated POSIX tmux.
+      if (this.sessionHostOwns(persistKey, live)) return sessionHostMessageOwner(target)
+      if (!this.tmuxPath) return null
       const first = await runAsync(this.tmuxPath, [
         '-L',
         TMUX_SOCKET,
@@ -4469,9 +6110,15 @@ export class PtyManager {
    * accidental submit a messaging delivery must never perform — an empty envelope refuses here.
    * (`buildEnvelope` can never return '', so this is a guard against a future caller, not a path.)
    */
-  async sendEnvelope(persistKey: string, envelope: string): Promise<boolean> {
+  async sendEnvelope(persistKey: string, envelope: string, expected?: PaneOwner): Promise<boolean> {
     if (envelope.length === 0) return false
+    const live = this.liveSessionForPersistKey(persistKey)
+    if (this.isZellij(persistKey, live)) return false
+    if (live?.nativeWindowsPane) return live.nativeWindowsPane.sendEnvelope(envelope, expected)
     const target = sessionName(persistKey)
+    if (this.sessionHostOwns(persistKey, live)) {
+      return expected ? sessionHostMessageEnvelope(target, envelope, expected) : false
+    }
     const sshRemote = this.sessionByPersistKey(persistKey)?.sshRemote
     try {
       if (sshRemote) {
@@ -4499,7 +6146,16 @@ export class PtyManager {
    * only "no session is registered" may be reported as "the node is gone".
    */
   hasLiveSession(persistKey: string): boolean {
-    return !!this.sessionByPersistKey(persistKey)
+    return !!this.liveSessionForPersistKey(persistKey)
+  }
+
+  async envelopePasteReady(persistKey: string): Promise<boolean> {
+    const live = this.liveSessionForPersistKey(persistKey)
+    if (this.isZellij(persistKey, live)) return false
+    if (live?.nativeWindowsPane) return live.nativeWindowsPane.pasteAware()
+    if (this.sessionHostOwns(persistKey, live)) return sessionHostMessagePasteReady(sessionName(persistKey))
+    // Existing tmux path frames in paste-buffer -p.
+    return !!(live?.sshRemote || this.tmuxPath)
   }
 
   /**
@@ -4534,8 +6190,22 @@ export class PtyManager {
     const hostSessions = this.hostBackendEligible()
       ? sessionHostListSessions().catch(() => [] as string[])
       : Promise.resolve([] as string[])
-    const [tmux, host] = await Promise.all([tmuxSessions, hostSessions])
-    return [...new Set([...tmux, ...host])]
+    const zellijRun = this.zellijProbeRun()
+    const zellijSessions = zellijRun
+      ? zellijRun(['list-sessions', '-n'])
+          .then(({ stdout }) => {
+            const listing = parseZellijSessionList(stdout)
+            if (!listing.ok) return [] as string[]
+            const ours = [...listing.live].filter((name) => isSessionName(name))
+            // Remembered so the relay host's attach for one of these joins the Zellij session
+            // instead of creating a tmux one beside it.
+            for (const name of ours) this.zellijKeys.add(name.slice('nt-'.length))
+            return ours
+          })
+          .catch(() => [] as string[])
+      : Promise.resolve([] as string[])
+    const [tmux, host, zellij] = await Promise.all([tmuxSessions, hostSessions, zellijSessions])
+    return [...new Set([...tmux, ...host, ...zellij])]
   }
 
   /**
@@ -4708,8 +6378,9 @@ export class PtyManager {
     // let the renderer apply the new profile. Legacy fire-and-forget recycle keeps its historical
     // cleanup-first behavior through endSession's default parameter.
     const sourceSessionHost = !!live?.sessionHost || confirmedSessionHost
+    const sourceZellij = !!live?.zellij || (!live && this.zellijKeys.has(persistKey))
     const sourceTmux =
-      confirmedTmux || (!!live?.tmuxBacked && !live.sessionHost && !live.sshRemote)
+      confirmedTmux || (!!live?.tmuxBacked && !live.sessionHost && !live.zellij && !live.sshRemote)
     // These flags describe independent old backends, not one preferred winner. In particular, a
     // discovered hidden host/tmux generation must not make an indexed direct PTY stop being plain:
     // dropping that local mapping without taskkill/onExit proof leaks the silent process.
@@ -4811,6 +6482,18 @@ export class PtyManager {
           abandonConfirmedRecycle(probeError)
         }
         if (tmuxStillExists) abandonConfirmedRecycle(error)
+      }
+    }
+
+    // Zellij, independently, with the same proof rule as tmux: the kill's acknowledgement or a
+    // re-probe that no longer finds a LIVE session. `unknown` is not proof and abandons.
+    if (sourceZellij) {
+      const run = this.zellijRun()
+      if (!run) abandonConfirmedRecycle(new Error('Zellij is not available to end this session.'))
+      else if (!(await zellijKillSession(run, hostName))) {
+        const state = await zellijSessionState(run, hostName)
+        if (state === 'live' || state === 'unknown')
+          abandonConfirmedRecycle(new Error('Could not end the Zellij session before restarting it.'))
       }
     }
 
@@ -5116,6 +6799,9 @@ export class PtyManager {
     // OLD cwd's session, and the respawn is a cold start (`fresh`), so replaying it would paint the
     // pre-move terminal into the new one.
     await deleteScrollback(persistKey)
+    // The file is gone, so the digest no longer describes anything on disk: a recreated node must
+    // write its first snapshot even if the pane text happens to match.
+    this.lastSnapshotDigest.delete(persistKey)
     // Same hook, same reason as the snapshot above: this node's Codex thread records go with the
     // session. Left behind they accumulate one file per thread forever, and the hook prelude keeps
     // re-exporting a DELETED node's id into any tool shell that still carries that thread id.
@@ -5185,7 +6871,17 @@ export class PtyManager {
           }
         }
       }
+      // Zellij too, by exact name, whenever Zellij is in play here — not only for a node this process
+      // knows to be Zellij-backed: a delete after an app restart, for a node never mounted since,
+      // holds no live session and no record, and skipping it would leave the session running with
+      // nothing on screen. `kill-session` matches exactly and answers "no such session" for a tmux
+      // node, so the extra call ends nothing it should not. Remote nodes never have one.
+      if (remoteEnd.kind === 'none') {
+        const run = this.isZellij(persistKey, dying) ? this.zellijRun() : this.zellijProbeRun()
+        if (run) await zellijKillSession(run, sessionName(persistKey))
+      }
     }
+    this.zellijKeys.delete(persistKey)
     for (const listener of this.sessionEndedListeners) {
       try {
         listener(persistKey)
@@ -5218,8 +6914,10 @@ export class PtyManager {
     for (const session of this.sessions.values()) {
       if (session.flushTimer) clearTimeout(session.flushTimer)
       // Final scrollback snapshot on quit so a reboot can replay it. Skipped for sessions with
-      // no output since the last periodic capture (unchanged pane content).
-      if (session.persistKey && session.outputSinceSnapshot)
+      // no output since the last periodic capture (unchanged pane content) — but NOT for one whose
+      // periodic capture is still queued on `snapshotChain`: the tick cleared the dirty bit when it
+      // QUEUED, the chain is not awaited here, and the process may exit before that link runs.
+      if (session.persistKey && (session.outputSinceSnapshot || session.snapshotQueued))
         finals.push(
           this.snapshotScrollback(session.persistKey, session.sshRemote, !!session.sessionHost)
         )
