@@ -508,6 +508,9 @@ describe('TabBar Share with team', () => {
           onRemoteAccess={vi.fn()}
           onSetDefaultAccount={vi.fn()}
           onSetDefaultPermissionMode={vi.fn()}
+          onPopOut={vi.fn()}
+          onClosePopout={vi.fn()}
+          onReturnToMain={vi.fn()}
           onOpenProjectSettings={vi.fn()}
           {...(props.share === false ? {} : { onShareWithTeam })}
           shareBlockedReason={props.blocked}

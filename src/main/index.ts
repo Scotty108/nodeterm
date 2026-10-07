@@ -1162,6 +1162,8 @@ function linuxWindowIcon(): string | undefined {
 
 /** Lock every window to the app's own origin: external links go to the system browser, a
  *  top-level navigation away from the app is refused (defense in depth), popups are denied. */
+const rendererIndexPath = join(__dirname, '../renderer/index.html')
+
 function lockNavigationToApp(win: BrowserWindow): void {
   // Open external links in the system browser — only safe schemes (no file://, no custom
   // protocol handlers). Reachable from remotely-fetched announcement URLs and rendered
@@ -1175,7 +1177,6 @@ function lockNavigationToApp(win: BrowserWindow): void {
   // external URL goes to the OS; everything else is blocked. "Any file://" used to be allowed, and
   // a relative link in rendered markdown resolved to another file:// path and wiped the canvas —
   // policy + reasoning in navigation-guard.ts.
-  const rendererIndexPath = join(__dirname, '../renderer/index.html')
   const appEntryUrl = appEntryUrlFor(process.env['ELECTRON_RENDERER_URL'], rendererIndexPath)
   win.webContents.on('will-navigate', (e, url) => {
     const decision = decideMainFrameNavigation(url, appEntryUrl)
@@ -1297,7 +1298,7 @@ function createPopoutWindow(projectId: string): BrowserWindow {
     win.loadURL(process.env['ELECTRON_RENDERER_URL'] + popoutHash(projectId))
   } else {
     // `hash` is appended by Electron with its own '#'.
-    win.loadFile(join(__dirname, '../renderer/index.html'), { hash: popoutHash(projectId).slice(1) })
+    win.loadFile(rendererIndexPath, { hash: popoutHash(projectId).slice(1) })
   }
   return win
 }
