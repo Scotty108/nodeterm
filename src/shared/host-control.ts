@@ -68,7 +68,15 @@ export const HOST_ONLY_CHANNEL_PREFIXES: readonly string[] = [
   'watchLink:',
   // Agent-integration consent status: paths in the host's home it kept or wrote. The consent itself
   // is in settings (already host-only).
-  'integrations:'
+  'integrations:',
+  // Simulator node: the host's iOS simulators / Android emulators — boot, erase, install, input.
+  // A relay tab never offers the node (relay-api keeps the namespace local), so a peer sending one
+  // of these is asking to drive the host's devices.
+  'simulator:',
+  // `nodeterm://` links: a link clicked on THIS machine opens a node here after THIS machine's user
+  // approves it. Raw ipcMain handlers (no peer reaches them); listed so a move onto the platform
+  // table cannot quietly open them.
+  'open-link:'
 ]
 
 export const HOST_ONLY_CHANNELS: ReadonlySet<string> = new Set([
@@ -77,6 +85,14 @@ export const HOST_ONLY_CHANNELS: ReadonlySet<string> = new Set([
   IPC.projectSetupConsentSubmit,
   IPC.projectSetupRequestTrust,
   IPC.ptyLaunchHeadless,
+  // A relay peer never delivers a held launch (commitOwnedLaunchAttempt), and a peer that could
+  // claim one would make every viewer of the host stand down from it (#1173).
+  IPC.workspaceClaimLaunch,
+  // Executes an agent launch on the host and reads a host-local `--prompt-file` into it. A relay
+  // tab never sends it (its pty bridge omits the member); this holds the refusal host-side too.
+  IPC.ptyExecuteLaunch,
+  // Types into a pane of THIS machine (or its SSH host); a relay peer must never reach it.
+  IPC.ptySendPaneKeys,
   // Prepare-for-update ends EVERY session on this machine's session host and quits the app. Only
   // the host's own user may do that. Raw ipcMain handlers (no peer reaches them); listed here too
   // so moving them onto the platform table later cannot quietly open them.

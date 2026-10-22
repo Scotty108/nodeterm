@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { ISSUE_BRANCH_SLUG_MAX } from '../shared/issue-worktree'
 import {
   GITHUB_READ_LIMIT_DEFAULT as GH_READ_LIMIT_DEFAULT,
@@ -9,6 +11,7 @@ import {
 } from '../core/github/control-read'
 import {
   parseControlRequest,
+  browserFlagRefusal,
   isDestructiveVerb,
   mergeCanvasControlBlock,
   buildCanvasControlInstructions,
@@ -21,6 +24,7 @@ import {
   CODEX_SANDBOX_BLOCKED_LINE,
   CODEX_SANDBOX_RETRY_LINE
 } from '../core/agents/hook-sandbox-hint-sh'
+import { AGENT_CONFIG, MODEL_SWITCH_CAPABLE } from '../shared/agents/config'
 import { RETRYABLE } from '../core/agents/agent-message-decide'
 import {
   REQUEST_ID_HINT_LEAD,
@@ -597,6 +601,9 @@ describe('parseControlRequest', () => {
       expect(body.toLowerCase()).toContain('ignore')
       // Per-role model is what lets ONE spawn-team call mix tiers; the JSON example must show it.
       expect(body).toContain('"model"')
+      // The honoured-by list is MODEL_SWITCH_CAPABLE, by label (it once named three of five).
+      const honoured = /Honoured by ([^(]+)\(/.exec(body.replace(/\s+/g, ' '))?.[1] ?? ''
+      for (const id of MODEL_SWITCH_CAPABLE) expect(honoured, id).toContain(AGENT_CONFIG[id].label)
     }
   })
 
@@ -1669,6 +1676,24 @@ describe('the read-only GitHub lane verbs (issues, prs) in both agent-facing bod
   })
 })
 
+describe('board --project (issue #1179)', () => {
+  const bodies: [string, string][] = [
+    ['skill', buildCanvasSkillBody('/x/shim.sh')],
+    ['instructions', buildCanvasControlInstructions('/x/shim.sh')]
+  ]
+
+  it('board is --project-targetable, so main gates the id (own or granted)', () => {
+    expect(PROJECT_TARGETABLE_VERBS.has('board')).toBe(true)
+  })
+
+  it('no body still claims board acts on the CURRENTLY OPEN project', () => {
+    for (const [name, body] of bodies) {
+      expect(body, name).not.toMatch(/CURRENTLY OPEN project/)
+      expect(body, name).toContain('`board [--project <id>]`')
+    }
+  })
+})
+
 describe('open-project --name limit in the agent-facing text (issue #940)', () => {
   it('both bodies name the limit, rendered from PROJECT_NAME_MAX', () => {
     const sentence = `\`--name\` over ${PROJECT_NAME_MAX} characters`
@@ -1682,5 +1707,65 @@ describe('one-way context links (issue #852) — agent-facing docs', () => {
   it('both canvas-control surfaces document link --one-way', () => {
     expect(buildCanvasControlInstructions('/x/nodeterm.sh')).toContain('--one-way')
     expect(buildCanvasSkillBody('/x/nodeterm.sh')).toContain('--one-way')
+  })
+})
+
+// Windows (`windows-cmd` dialect): what a PowerShell-run agent reads. The POSIX default is pinned
+// byte-for-byte, because every SSH-host skill is built without a dialect.
+describe('buildCanvasSkillBody — shim invocation dialect', () => {
+  it('the default is the historical `sh` block, unchanged', () => {
+    const body = buildCanvasSkillBody('/x/nodeterm.sh')
+    expect(body).toContain('```sh\nsh "/x/nodeterm.sh" <verb> [args]\n```\n\nFlags take a value')
+    expect(body).toBe(buildCanvasSkillBody('/x/nodeterm.sh', 'posix'))
+    expect(body).not.toContain('nodeterm.cmd')
+  })
+
+  it('windows-cmd: PowerShell call of the .cmd launcher, plus the cmd/Git Bash spellings and the batch limit', () => {
+    const body = buildCanvasSkillBody('C:\\d\\nodeterm.sh', 'windows-cmd')
+    expect(body).toContain('```powershell\n& "C:\\d\\nodeterm.cmd" <verb> [args]\n```')
+    expect(body).toContain('Git for Windows')
+    expect(body).toContain('In cmd.exe drop the leading `& `')
+    expect(body).toContain('`sh "C:\\d\\nodeterm.sh"`')
+    expect(body).toContain('`--prompt-file`')
+    // Only the invocation block changes: the verb reference after it is the same text.
+    const tail = (b: string) => b.slice(b.indexOf('Flags take a value'))
+    expect(tail(body)).toBe(tail(buildCanvasSkillBody('C:\\d\\nodeterm.sh')))
+  })
+})
+
+describe('browser control unknown flags (#539)', () => {
+  it.each(['width', 'height', 'viewport', 'size', 'preset'])('refuses open-browser --%s before creating anything', (key) => {
+    expect(parseControlRequest('open-browser', { url: 'https://example.test', [key]: '375' })).toEqual({ error: `open-browser: unknown flag --${key}` })
+  })
+  it('refuses a browser typo at the shared Desktop/Server boundary', () => {
+    expect(parseControlRequest('browser', { node: 'b1', screenshot: 'x.png', ful: 'true' })).toEqual({ error: 'browser: unknown flag --ful' })
+  })
+})
+
+describe('browserFlagRefusal is the one gate both shells run (#539)', () => {
+  it('names the unknown flag on both browser verbs and passes known ones', () => {
+    expect(browserFlagRefusal('open-browser', { url: 'https://x.test', width: '375' })).toBe('open-browser: unknown flag --width')
+    expect(browserFlagRefusal('open-browser', { url: 'https://x.test', project: 'p1', 'dry-run': 'true' })).toBeNull()
+    expect(browserFlagRefusal('browser', { node: 'b1', screenshot: 'a.png', full: 'true' })).toBeNull()
+    expect(browserFlagRefusal('show-web', { url: 'https://x.test', width: '1' })).toBeNull()
+  })
+  it('desktop main runs it before forwarding or driving (it never runs parseControlRequest)', () => {
+    const src = readFileSync(join(__dirname, 'index.ts'), 'utf8')
+    const gate = src.indexOf('const browserRefusal = browserFlagRefusal(verb, args)')
+    expect(gate).toBeGreaterThan(0)
+    expect(gate).toBeLessThan(src.indexOf("if (verb === 'browser') return handleBrowserVerb("))
+  })
+})
+
+describe('the browser verb text matches #539 behaviour, in both bodies', () => {
+  it.each([
+    ['skill body', buildCanvasSkillBody('/x/nodeterm.sh')],
+    ['instructions block', buildCanvasControlInstructions('/x/nodeterm.sh')]
+  ])('%s', (_name, body) => {
+    const flat = body.replace(/\s+/g, ' ')
+    expect(flat).toContain('`+200` or `-200`')
+    expect(flat).toContain('MEASURED once the page stopped moving')
+    expect(flat).toContain('an unknown flag (on `browser` or `open-browser`) is refused by name, never ignored')
+    expect(flat).toContain('sizes the page\'s viewport to the full content height')
   })
 })

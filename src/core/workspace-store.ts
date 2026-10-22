@@ -2,7 +2,7 @@ import type { SshConnection } from '../shared/ssh'
 import { promises as fs } from 'fs'
 import { createHash, randomUUID } from 'node:crypto'
 import path from 'path'
-import { renameAtomic, writeFileAtomic } from './fs-atomic'
+import { renameAtomic, sweepForeignTempFiles, writeFileAtomic } from './fs-atomic'
 import { IPC } from '../shared/ipc'
 import { platform } from './platform'
 import {
@@ -41,9 +41,11 @@ import { ownsProject, scopeIndex, type SaveScope } from './workspace-scope'
 import { editProjectCardLabels, ensureProjectBoard, setProjectCardColumn, type CardLabelEdit } from './project-kanban-write'
 import { boardLabels, cardMeta } from '../shared/kanban-labels'
 import { localizeAdoptedNode } from '../shared/adopt-cwd'
+import { routeSshProjectNode, routeSshProjectNodes } from '../shared/ssh-project-nodes'
 import { clampProjectName, folderName } from '../shared/project-name'
 import { SYSTEM_NODE_COLORS } from '../shared/node-colors'
 import { codedError } from './relay/admin-error'
+import { createLaunchClaimLedger } from './launch-claim-ledger'
 
 /** What `WorkspaceStore.adoptFolder` did: the project now holding the folder, and whether this call
  *  added it (`created: false` = an existing project already held the same real directory). */
@@ -228,26 +230,6 @@ export async function writeAtomic(filePath: string, content: string): Promise<vo
   await writeFileAtomic(filePath, content)
 }
 
-/** Remove tmp litter next to `target` left by writers that died mid-write: the legacy fixed
- *  `<file>.tmp` name and any `<file>.<pid>.<seq>[.<uuid>].tmp` from another (dead) pid. Our own
- *  pid's temps are in-flight writes and stay. Same family rule as provider-cookie's sweep. */
-async function sweepStaleTmp(target: string): Promise<void> {
-  try {
-    const dir = path.dirname(target)
-    const base = path.basename(target)
-    for (const entry of await fs.readdir(dir)) {
-      if (!entry.startsWith(base) || !entry.endsWith('.tmp')) continue
-      const middle = entry.slice(base.length, -'.tmp'.length) // '' or '.<pid>.<seq>[.<uuid>]'
-      const owner = /^\.(\d+)\.\d+(?:\.[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})?$/.exec(middle)?.[1]
-      if (middle === '' || (owner && owner !== String(process.pid))) {
-        await fs.rm(path.join(dir, entry), { force: true }).catch(() => undefined)
-      }
-    }
-  } catch {
-    // A dir we cannot read is not a reason to fail the load.
-  }
-}
-
 /**
  * Whether `real` (already a real path) is the filesystem root, the real home directory, or a folder
  * that contains it. A shared folder is readable by every teammate, Viewers included, and a home
@@ -402,6 +384,8 @@ export class WorkspaceStore {
    * hands it out (a client that cannot save cannot be the one whose save would drop it).
    */
   private pendingAdoptions = new Set<string>()
+  /** Exactly-once claim of renderer-delivered held launches across viewers (#1173). */
+  private readonly launchClaims = createLaunchClaimLedger()
   /** The content authority, when this process runs one (Server Edition hosting a team). */
   private contentAuthority: ContentAuthorityHooks | null = null
 
@@ -434,6 +418,9 @@ export class WorkspaceStore {
     })
     platform().handleWithSender(IPC.workspaceSave, (senderId: number, workspace: Workspace, opts?: WorkspaceSaveOptions) =>
       this.saveFromRenderer(workspace, opts?.localOnly === true, this.saveScopeFor?.(senderId)))
+    platform().handleWithSender(IPC.workspaceClaimLaunch,
+      (senderId: number, nodeId: unknown, command: unknown, manual: unknown) =>
+        this.launchClaims.claim(nodeId as string, command as string, manual === true, senderId))
     platform().handle(IPC.workspaceProbeFolder, (folder: string) => this.probeFolder(folder))
     platform().handle(IPC.workspaceProjectFileState, (cwd: unknown) =>
       typeof cwd === 'string' && cwd ? this.projectFileState(cwd) : 'unreadable')
@@ -518,7 +505,7 @@ export class WorkspaceStore {
   private async loadInner(sideline: boolean): Promise<Workspace> {
     // Read-only loads (sideline: false — the relay blob path) must not mutate the disk, so the
     // litter sweep rides the same flag as the corrupt-file sideline.
-    if (sideline) await sweepStaleTmp(this.indexPath)
+    if (sideline) await sweepForeignTempFiles(this.indexPath)
     let raw: string
     try {
       raw = await fs.readFile(this.indexPath, 'utf-8')
@@ -672,7 +659,7 @@ export class WorkspaceStore {
         }
       }
     } else if (e.cwd) {
-      if (sideline) await sweepStaleTmp(projectFilePath(e.cwd))
+      if (sideline) await sweepForeignTempFiles(projectFilePath(e.cwd))
       const read = await this.readProjectFile(e.cwd, sideline)
       if (read) {
         const p = read.file
@@ -1190,7 +1177,7 @@ export class WorkspaceStore {
   private async loadDataFileEntry(e: IndexEntryV3, sideline: boolean): Promise<LoadedEntry | null> {
     if (!isInlineProjectFileId(e.id)) return null
     const file = inlineFilePath(e.id)
-    if (sideline) await sweepStaleTmp(file)
+    if (sideline) await sweepForeignTempFiles(file)
     const read = await this.readDataFile(e.id, sideline)
     if (!read) return null
     this.revs.set(e.id, read.file.rev)
@@ -2042,6 +2029,23 @@ export class WorkspaceStore {
       .map((e) => ({ id: e.id, ssh: e.ssh as NonNullable<Project['ssh']> }))
   }
 
+  /** Every project in the loaded index as a `nodeterm://open` link may name it (main/open-link.ts):
+   *  id, name, folder, closed, and the two kinds a link never offers (SSH, handed to a hosted team).
+   *  Undefined before the index is loaded. Sync, like `localCwdForProject`. */
+  linkProjectEntries():
+    | { id: string; name: string; cwd?: string; closed?: boolean; ssh?: boolean; handedOff?: boolean }[]
+    | undefined {
+    if (!this.index) return undefined
+    return this.index.entries.map((e) => ({
+      id: e.id,
+      name: e.name,
+      ...(e.cwd ? { cwd: e.cwd } : {}),
+      ...(e.closed ? { closed: true } : {}),
+      ...(e.ssh ? { ssh: true } : {}),
+      ...(e.handedOffTo ? { handedOff: true } : {})
+    }))
+  }
+
   /** The local folder cwd of a project by id (index lookup), or undefined for ssh/inline/unknown
    *  projects. Sync (reads the in-memory index): the board-log router's local-vs-unsupported call. */
   localCwdForProject(projectId: string): string | undefined {
@@ -2130,15 +2134,19 @@ export class WorkspaceStore {
    * cwds portable (`./sub`), and this resolves them against the project root exactly as
    * `fileToProject` / `persistedCanvases` do. For callers that hand the cwd to a resolver keyed on
    * the absolute path (the phone Chat verbs' transcript read). `getNode` keeps the stored form so
-   * its existing callers are unchanged.
+   * its existing callers are unchanged. An SSH project's node comes back ROUTED (its host, its
+   * remote cwd — `routeSshProjectNode`, issue #1186), since its cache holds the neutral shared form.
    */
   getNodeResolved(nodeId: string): CanvasNodeState | undefined {
     const hit = this.findNode(nodeId)
     if (!hit) return undefined
+    if (hit.ssh) return routeSshProjectNode(hit.node, hit.ssh)
     return hit.root ? resolveNodes([hit.node], hit.root)[0] : hit.node
   }
 
-  private findNode(nodeId: string): { node: CanvasNodeState; root?: string } | undefined {
+  private findNode(
+    nodeId: string
+  ): { node: CanvasNodeState; root?: string; ssh?: Project['ssh'] } | undefined {
     for (const e of this.index?.entries ?? []) {
       let nodes: CanvasNodeState[] | undefined
       if (e.project) nodes = e.project.nodes
@@ -2155,7 +2163,12 @@ export class WorkspaceStore {
       }
       const node = nodes?.find((n) => n.id === nodeId)
       // Only a local ref's nodes come off the shared file in portable form.
-      if (node) return { node, root: !e.project && !e.cache && e.cwd ? e.cwd : undefined }
+      if (node)
+        return {
+          node,
+          root: !e.project && !e.cache && e.cwd ? e.cwd : undefined,
+          ...(!e.project && e.cache && e.ssh ? { ssh: e.ssh } : {})
+        }
     }
     return undefined
   }
@@ -2325,7 +2338,9 @@ export class WorkspaceStore {
       } else if (e.cache) {
         out.push({
           id: e.id,
-          nodes: e.cache.nodes,
+          // Routed exactly as `fileToProject` routes them (issue #1186): the cache is the shared
+          // file's neutral form, and callers decide where a node runs from what this returns.
+          nodes: routeSshProjectNodes(e.cache.nodes, e.ssh),
           bridges: sanitizeLinks(e.cache.bridges),
           ropes: sanitizeLinks(e.cache.ropes)
         })

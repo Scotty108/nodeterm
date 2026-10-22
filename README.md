@@ -16,12 +16,11 @@ hidden tabs.
 [![License](https://img.shields.io/badge/license-BUSL--1.1-blue)](./LICENSE)
 [![GitHub stars](https://img.shields.io/github/stars/eneskirca/nodeterm?style=flat)](https://github.com/eneskirca/nodeterm/stargazers)
 [![Latest release](https://img.shields.io/github/v/release/eneskirca/nodeterm?include_prereleases&sort=semver)](https://github.com/eneskirca/nodeterm/releases)
-<!-- Installer downloads: .dmg + .AppImage + .deb + .rpm + Setup .exe across every release, hand-written on purpose.
-     shields' github/downloads/…/total reads ~12× higher because electron-updater's own traffic
-     (latest-*.yml polls, mac .zip deltas, blockmaps) is counted as downloads there. Recount with:
-     gh api --paginate repos/eneskirca/nodeterm/releases --jq \
-       '[.[].assets[] | select(.name|test("\\.(dmg|AppImage|deb|rpm|exe)$")) | .download_count] | add' -->
-[![Downloads](https://img.shields.io/badge/downloads-1.2k-brightgreen)](https://github.com/eneskirca/nodeterm/releases)
+<!-- Installer downloads only (.dmg + .AppImage + .deb + .rpm + .exe across every release), kept live by
+     .github/workflows/download-badge.yml, which writes a shields endpoint JSON to the `badges` branch.
+     shields' github/downloads/…/total reads ~14× higher because electron-updater's own traffic
+     (latest-*.yml polls, mac .zip deltas, blockmaps) is counted as downloads there. -->
+[![Downloads](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2Feneskirca%2Fnodeterm%2Fbadges%2Fdownloads.json)](https://github.com/eneskirca/nodeterm/releases)
 
 <a href="https://trendshift.io/repositories/103825?utm_source=repository-badge&amp;utm_medium=badge&amp;utm_campaign=badge-repository-103825" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/103825" alt="eneskirca%2Fnodeterm | Trendshift" width="250" height="55"/></a>
 
@@ -124,7 +123,7 @@ never leaves the machine.
 ### Node kinds
 
 🖥 **Terminal** (xterm + tmux, AI naming) · 🤖 **Agent** (Claude Code / Codex / Antigravity /
-Gemini / GitHub Copilot / opencode / Grok / custom) · 📝 **Sticky note** (link to an agent as context) · 🗂 **Group**
+Gemini / GitHub Copilot / opencode / Grok / Cursor / custom) · 📝 **Sticky note** (link to an agent as context) · 🗂 **Group**
 (bind to a **git worktree** for agent-per-branch) · ✏️ **Editor** (Monaco, ⌘S) ·
 🔀 **Diff** · 🌐 **Web / Video**
 
@@ -153,7 +152,9 @@ Gemini / GitHub Copilot / opencode / Grok / custom) · 📝 **Sticky note** (lin
   from your phone — plus push notifications and a mobile board view.
 - **Power & sleep** — while an agent is working, nodeterm keeps the machine from
   idle-sleeping, and lets go the moment it finishes (on by default; toggle in the setup
-  tour or Settings → Behavior). No app can hold a machine awake through a closed lid —
+  tour or Settings → Behavior). It lets the machine sleep anyway on battery below 5% or
+  when the machine runs critically hot. No app can hold a machine awake through a closed lid
+  (a Mac with the lid closed stays awake only while plugged in with an external display) —
   for overnight runs keep the laptop open and plugged in, or run the agents on a box
   that doesn't sleep via the [Server Edition](./docs/SERVER.md).
 - **Command palette** (⌘K), **file explorer** (⌘⇧E), **markdown view** (⌘M),
@@ -200,15 +201,13 @@ detects your platform. Everything is also listed at
 - **macOS** — `.dmg` for Apple Silicon and Intel (auto-updates), or **Homebrew**:
 
   ```bash
-  brew tap nodeterm/tap
-  brew trust nodeterm/tap        # Homebrew ≥6 refuses to load an untrusted tap
   brew install --cask nodeterm
   ```
 
-  Both first lines are required. On its own, `brew install --cask nodeterm` only searches
-  `homebrew/cask` and reports the cask as not found; without the trust grant, Homebrew ≥6
-  fails rather than prompting. The cask tracks each promoted release, and the app updates
-  itself (electron-updater), so `brew upgrade` is rarely needed for it.
+  The cask is in the official `homebrew/cask`, so no tap is needed. The app updates itself
+  (electron-updater), so `brew upgrade` is rarely needed for it. If you installed from the
+  old `nodeterm/tap`, you can drop it with `brew untap nodeterm/tap`: the short name
+  `nodeterm` already resolves to the official cask.
 - **Linux (x64)** — self-updating **AppImage**, a `.deb` for Debian/Ubuntu
   (`sudo apt install ./node-terminal_*.deb`), or an `.rpm` for Fedora/RHEL
   (`sudo dnf install ./node-terminal-*.rpm`). Updates are manual for both packages: the app
@@ -218,7 +217,7 @@ detects your platform. Everything is also listed at
 - **Windows (x64) — beta** — `nodeterm-Setup-<version>.exe` (per-user installer) or a
   portable `-win.zip`. Early support, so know what you are getting: the installer is
   **unsigned** (SmartScreen will ask — *More info → Run anyway*), **updates are manual**
-  for now (grab the next build from the same page), and **session continuity across
+  for now (the app tells you when a new version is out and links the download), and **session continuity across
   restarts is still landing** — Windows has no tmux, so the standalone session host that
   replaces it is being packaged in [#579](https://github.com/eneskirca/nodeterm/pull/579).
   Everything else — canvas, agents, kanban, hooks — is the same app. Please

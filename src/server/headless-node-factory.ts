@@ -38,6 +38,7 @@ import {
 import { assembleLaunchCommand } from '../shared/agents/launch'
 import type { AgentState, NormalizedAgentEvent } from '../shared/agents/normalize'
 import { oneLine } from '../shared/one-line'
+import { rootPositionWith } from '../shared/root-position'
 import { RUN_NOW_AFTER_REFUSAL, runNowRequested } from '../shared/control-verbs'
 import {
   RUN_NOW_AFTER_SUCCESS_REFUSAL,
@@ -301,32 +302,16 @@ function sourceCanControl(
   return !!agentId && canControlCanvas(agentId)
 }
 
-function absolutePosition(project: Project, node: CanvasNodeState): { x: number; y: number } {
-  let x = node.position.x
-  let y = node.position.y
-  let parent = node.parentId
-  const seen = new Set<string>()
-  while (parent && !seen.has(parent)) {
-    seen.add(parent)
-    const p = project.nodes.find((candidate) => candidate.id === parent)
-    if (!p) break
-    x += p.position.x
-    y += p.position.y
-    parent = p.parentId
-  }
-  return { x, y }
-}
-
 function placeRight(
   project: Project,
   source: CanvasNodeState,
   size: { width: number; height: number },
   reserved: readonly CanvasNodeState[] = []
 ): { x: number; y: number } {
-  const origin = absolutePosition(project, source)
+  const origin = rootPosition(project.nodes, source)
   const sourceWidth = source.size?.width || TERMINAL_SIZE.width
   const occupied = [...project.nodes, ...reserved].map((node) => {
-    const position = absolutePosition(project, node)
+    const position = rootPosition(project.nodes, node)
     return {
       x: position.x,
       y: position.y,
@@ -584,19 +569,7 @@ function rootPosition(
   node: CanvasNodeState
 ): { x: number; y: number } {
   const byId = new Map(nodes.map((candidate) => [candidate.id, candidate]))
-  const seen = new Set<string>([node.id])
-  let x = node.position.x
-  let y = node.position.y
-  let parentId = node.parentId
-  while (parentId && !seen.has(parentId)) {
-    seen.add(parentId)
-    const parent = byId.get(parentId)
-    if (!parent) break
-    x += parent.position.x
-    y += parent.position.y
-    parentId = parent.parentId
-  }
-  return { x, y }
+  return rootPositionWith(node, (id) => byId.get(id))
 }
 
 /** Desktop `ungroupNodes` semantics over persisted nodes: direct children move up one level. */

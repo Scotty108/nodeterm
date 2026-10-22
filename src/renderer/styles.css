@@ -162,6 +162,11 @@
   --radius: 8px;
   --radius-sm: 6px;
   --radius-lg: 12px;
+  /* The rendered-Markdown views' font (Settings → Appearance). App.tsx overrides these on <html>
+     from settings; these are the defaults (@shared/markdown-font) for an un-hydrated store. */
+  --md-font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+  --md-font-size: 13px;
+  --md-code-font-family: Menlo, Monaco, "Courier New", monospace;
   font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro', 'Helvetica Neue',
     sans-serif;
   font-size: 13px;
@@ -631,6 +636,16 @@ body,
   background: none;
 }
 
+/* Bulk pause: "⏸ 3 · 1 pending" after the tab name. Muted text, no fill — a paused project is a
+   resting state, not something asking for attention like the unread badge beside it. */
+.tab__paused {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 /* Unread-completion count badge on a project tab. */
 .tab__badge {
   display: inline-flex;
@@ -794,6 +809,17 @@ body,
 .tab-menu button:disabled {
   color: var(--muted);
   cursor: not-allowed;
+}
+
+/* A menu row whose disabled reason lives on a wrapper: a disabled button takes no pointer events
+   in Chromium, so neither its own `title` nor the cursor would ever show. */
+.tab-menu__reason {
+  display: block;
+  cursor: not-allowed;
+}
+
+.tab-menu__reason > button:disabled {
+  pointer-events: none;
 }
 
 .tab-menu button.danger:hover:not(:disabled) {
@@ -3150,8 +3176,8 @@ body,
   min-height: 0;
   overflow: auto;
   padding: 12px 16px;
-  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
-  font-size: 13px;
+  font-family: var(--md-font-family);
+  font-size: var(--md-font-size);
   line-height: 1.6;
   color: var(--text);
   /* Allow text selection / copy (React Flow nodes are non-selectable by default). */
@@ -3167,14 +3193,16 @@ body,
   line-height: 1.3;
 }
 
+/* Heading sizes are proportions of the body size (20 / 17 / 15 px at the default 13), so they
+   follow the Markdown font size setting. */
 .term-md__content h1 {
-  font-size: 20px;
+  font-size: 1.54em;
 }
 .term-md__content h2 {
-  font-size: 17px;
+  font-size: 1.31em;
 }
 .term-md__content h3 {
-  font-size: 15px;
+  font-size: 1.15em;
 }
 
 .term-md__content p,
@@ -3188,8 +3216,9 @@ body,
 }
 
 .term-md__content code {
-  font-family: Menlo, Monaco, monospace;
-  font-size: 12px;
+  /* The terminal's font, at 0.92 of the Markdown size (12px at the default 13). */
+  font-family: var(--md-code-font-family);
+  font-size: 0.92em;
   background: rgba(var(--tint-rgb), 0.08);
   padding: 1px 5px;
   border-radius: 5px;
@@ -3219,14 +3248,47 @@ body,
   max-width: 100%;
 }
 
-.term-md__content table {
+/* Tables in rendered Markdown — the ⌘M output view, the editor preview and the ⌘M chat view (its
+   messages and plan/question cards all render through `.term-chat__text`). Gridlines strong enough
+   to read (`--border` is a 10% separator, which made cells blur together), a tinted header row,
+   and a horizontal scroll inside the table for one wider than the view, so the thread never
+   scrolls sideways. A column's `:---:` alignment arrives as an `align` attribute, which an author
+   `text-align` would override — so only a header WITHOUT one is set (to the start edge, matching
+   its cells, instead of the browser's centred default). Sticky notes (on the canvas and in the
+   kanban card modal — both render through `.sticky-node__md`) share the group (issue #1179). */
+.term-md__content table,
+.term-chat__text table,
+.sticky-node__md table {
+  display: block;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
   border-collapse: collapse;
+  margin: 0 0 10px;
 }
 
 .term-md__content th,
-.term-md__content td {
-  border: 1px solid var(--border);
-  padding: 4px 8px;
+.term-md__content td,
+.term-chat__text th,
+.term-chat__text td,
+.sticky-node__md th,
+.sticky-node__md td {
+  border: 1px solid rgba(var(--tint-rgb), 0.22);
+  padding: 4px 10px;
+  vertical-align: top;
+}
+
+.term-md__content th,
+.term-chat__text th,
+.sticky-node__md th {
+  background: rgba(var(--tint-rgb), 0.06);
+  font-weight: 600;
+}
+
+.term-md__content th:not([align]),
+.term-chat__text th:not([align]),
+.sticky-node__md th:not([align]) {
+  text-align: start;
 }
 
 /* Chat panel — replaces the markdown overlay on chat-capable agent nodes (Cmd+M). */
@@ -3326,7 +3388,8 @@ body,
    ASSISTANT's is plain full-width text on the panel with no bubble, roomy line height and paragraph
    spacing, and a quiet action row under each turn (ChatTurnActions). */
 .term-chat__msg {
-  font-size: 13px;
+  font-family: var(--md-font-family);
+  font-size: var(--md-font-size);
   line-height: 1.5;
   word-break: break-word;
   min-width: 0;
@@ -3421,11 +3484,50 @@ body,
 .term-chat__text > :last-child {
   margin-bottom: 0;
 }
+.term-chat__text code {
+  font-family: var(--md-code-font-family);
+  font-size: 0.92em;
+}
 .term-chat__text pre {
   background: rgba(0, 0, 0, 0.35);
   padding: 8px;
   border-radius: 6px;
   overflow-x: auto;
+}
+/* A code block with its Copy button (nodes/CodeBlockCopy.tsx): the wrapper is the positioned box,
+   because the <pre> scrolls sideways and would carry the button with it. The wrapper takes the
+   <pre>'s block margin so the thread's first/last-child margin rules still apply. */
+.term-chat__code {
+  position: relative;
+  margin: 1em 0;
+}
+.term-chat__code > pre {
+  margin: 0;
+}
+/* Same control as the per-turn Copy (.term-chat__action), in the block's top-right corner. Hidden
+   until the block is hovered or the button is keyboard-focused, and kept while it says "Copied".
+   A solid backing so the code underneath does not show through it. */
+.term-chat__code-copy {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  opacity: 0;
+  transition: opacity 0.12s ease;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.term-chat__code:hover .term-chat__code-copy,
+.term-chat__code-copy:focus-visible,
+.term-chat__code-copy[data-copied] {
+  opacity: 1;
+}
+.term-chat__code-copy:hover {
+  background: var(--bg);
+  border-color: rgba(var(--tint-rgb), 0.3);
 }
 .term-chat__text a {
   color: var(--accent);
@@ -3797,8 +3899,8 @@ body,
   width: 100%;
   resize: none;
   padding: 4px 6px;
-  font-family: inherit;
-  font-size: 13px;
+  font-family: var(--md-font-family);
+  font-size: var(--md-font-size);
   color: var(--text-strong);
   background: transparent;
   border: none;
@@ -3958,6 +4060,48 @@ body,
   font-size: 11.5px;
   color: var(--text);
 }
+/* A simulator inside a run node (SimulatorView under the control rows). It fills what the node has
+   left, so resizing the node scales the screen (letterboxed, like a Simulator node): the bar stops
+   being a fixed strip and takes the space, and the panel takes the bar's. With the terminal shown
+   the two share the node. Positioned so the view's toasts, prompts and dialogs sit over the panel. */
+.run-bar--sim {
+  flex: 1 1 0;
+  min-height: 0;
+}
+.run-sim-host {
+  flex: 1 1 0;
+  min-height: 80px;
+  display: flex;
+  margin: 2px -8px -5px;
+  border-top: 1px solid var(--border);
+}
+.run-web {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.run-web__waiting {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--muted);
+  pointer-events: none;
+}
+.run-sim {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
 /* Terminal hidden (the default): the node is just the control rows. Same `display: none` path a
    collapsed node takes, so xterm and the tmux client stay alive underneath. */
 .term-node:has(.run-bar--compact) .term-node__body {
@@ -4089,6 +4233,16 @@ body,
 }
 .run-bar__select--config {
   max-width: 240px;
+}
+.run-bar__check {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+  cursor: pointer;
 }
 .run-bar__args {
   flex: 1;
@@ -5229,6 +5383,56 @@ body,
 
 .update-card__btn:hover {
   background: var(--accent-hover);
+}
+
+/* Preparing / restarting: the click was taken, the button says so and cannot be pressed twice. */
+.update-card__btn:disabled {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  opacity: 0.7;
+  cursor: default;
+}
+
+.update-card__btn:disabled:hover {
+  background: var(--accent);
+}
+
+.update-card__spinner {
+  width: 11px;
+  height: 11px;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: #fff;
+  border-radius: 50%;
+  animation: nt-spin 0.8s linear infinite;
+  animation-play-state: var(--nt-anim-state);
+}
+
+.update-card__actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.update-card__actions .update-card__link {
+  align-self: center;
+}
+
+.update-card__notes {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12.5px;
+  color: rgba(var(--tint-rgb), 0.7);
+}
+
+.update-card__notes li + li {
+  margin-top: 2px;
+}
+
+.update-card__hint {
+  margin: 0;
+  font-size: 12.5px;
+  color: rgba(var(--tint-rgb), 0.6);
 }
 
 .update-card--pill {
@@ -7478,6 +7682,92 @@ body,
   pointer-events: auto;
 }
 
+/* ---- Resize grab zones -------------------------------------------------------------------------
+   React Flow's resize lines are 1px and its corner handles 5px, so the resize cursor appeared only
+   on a hairline. Each control gets an invisible ::before hit region (the cursor and the press both
+   belong to the control); the visible line and handle are unchanged. HIG pointing-devices.md ›
+   "Add padding around interactive elements to create comfortable hit regions" — 12pt for an element
+   with a visible edge — and accessibility.md: desktop targets 20x20pt minimum, which the corners get.
+   - Edges: 12 screen px, biased OUTWARD (8 outside the border, 4 inside — and never more than 6
+     flow px inside), so the band takes as little as possible from header buttons and text.
+   - Corners: 20x20 screen px (14 outside, 6 inside, inner capped at 6 flow px), drawn after the lines so a corner wins where
+     they overlap, and covering the whole band intersection, so sliding along the border never
+     drops to the default cursor (HIG: contiguous hit regions).
+   - Sized in SCREEN px through `--nt-zoom` (lib/canvasZoomVar.ts); below zoom 0.3 the zone shrinks
+     with the node instead of swallowing a tiny one.
+   Exists only while the resizer renders, i.e. while the node is selected. */
+:root {
+  --nt-zoom: 1;
+}
+.react-flow__resize-control {
+  --rz-k: max(var(--nt-zoom), 0.3);
+  --rz-out: calc(8px / var(--rz-k));
+  /* The INNER part is also capped in flow px (6): zoomed out, 4 screen px is a big slice of a
+     small node's header — its drag area and its close/maximize buttons. */
+  --rz-in: min(calc(4px / var(--rz-k)), 6px);
+  /* Corner handles are already counter-scaled by React Flow (`scale: max(1/zoom, 1)`), so below
+     zoom 1 their flow px ARE screen px; only above it does the size need dividing. */
+  --rc-k: max(var(--nt-zoom), 1);
+  --rc-out: calc(14px / var(--rc-k));
+  /* Inner part: 6 screen px, at most 6 flow px (below zoom 1 the handle's own scale is 1/zoom). */
+  --rc-in: calc(6px * min(var(--nt-zoom), 1) / var(--rc-k));
+}
+/* The node's resize controls are a SIBLING of its root (so a glass root's backdrop-filter cannot
+   clip them), which puts the later-painted root over their inner half. Lift them above the root
+   and the terminal's hover guard (z 2); the kanban half-pill stays above them. */
+.react-flow__node > .react-flow__resize-control {
+  z-index: 3;
+}
+.react-flow__resize-control::before {
+  content: '';
+  position: absolute;
+}
+.react-flow__resize-control.line.left::before {
+  top: 0;
+  bottom: 0;
+  left: calc(-1 * var(--rz-out));
+  right: calc(-1 * var(--rz-in));
+}
+.react-flow__resize-control.line.right::before {
+  top: 0;
+  bottom: 0;
+  right: calc(-1 * var(--rz-out));
+  left: calc(-1 * var(--rz-in));
+}
+.react-flow__resize-control.line.top::before {
+  left: 0;
+  right: 0;
+  top: calc(-1 * var(--rz-out));
+  bottom: calc(-1 * var(--rz-in));
+}
+.react-flow__resize-control.line.bottom::before {
+  left: 0;
+  right: 0;
+  bottom: calc(-1 * var(--rz-out));
+  top: calc(-1 * var(--rz-in));
+}
+/* A handle's padding box is 5px, centred on the corner: offsets are from that centre. */
+.react-flow__resize-control.handle::before {
+  width: calc(var(--rc-out) + var(--rc-in));
+  height: calc(var(--rc-out) + var(--rc-in));
+}
+.react-flow__resize-control.handle.left::before {
+  left: calc(2.5px - var(--rc-out));
+}
+.react-flow__resize-control.handle.right::before {
+  left: calc(2.5px - var(--rc-in));
+}
+.react-flow__resize-control.handle.top::before {
+  top: calc(2.5px - var(--rc-out));
+}
+.react-flow__resize-control.handle.bottom::before {
+  top: calc(2.5px - var(--rc-in));
+}
+/* The paint-only copies (`.nt-resize-ghost`) carry no grab zone. */
+.react-flow__resize-control.nt-resize-ghost::before {
+  content: none;
+}
+
 /* Bound to a git worktree: a checkout, not a loose grouping. Solid, thicker border (the tint is
    bumped inline from the group's own data.color — no separate palette) so it reads as bound from
    across the canvas, where the label pill is too small to parse. */
@@ -8901,6 +9191,27 @@ button.group-node__setup:disabled {
 }
 /* The attribution line: quieter than a row, above the foot rule, and rendered in EVERY state — a
    failed sweep is exactly when a user is most likely to be blaming the wrong process. */
+/* The session host's own cost: a quiet, non-interactive line under the rows (Windows only). */
+.sessmem-host {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+  padding: 6px 2px 0;
+  border-top: 1px solid rgba(var(--tint-rgb), 0.08);
+  font-size: 12px;
+  color: rgba(var(--tint-rgb), 0.6);
+}
+.sessmem-host__label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sessmem-host__mb {
+  font-variant-numeric: tabular-nums;
+}
 .sessmem-panel__attrib {
   margin-top: 10px;
   font-size: 11px;
@@ -9169,6 +9480,14 @@ button.group-node__setup:disabled {
   padding: 0 2px;
 }
 .scm-error__dismiss:hover {
+  color: var(--text-strong);
+}
+/* Neutral variant: "waiting for GitHub sign-in" while Publish retries in-process. */
+.scm-error--info {
+  border-color: rgba(var(--tint-rgb), 0.18);
+  background: rgba(var(--tint-rgb), 0.06);
+}
+.scm-error--info .scm-error__msg {
   color: var(--text-strong);
 }
 
@@ -12590,6 +12909,77 @@ button.pull-checks__name {
 .confirm.share-team {
   width: 480px;
 }
+
+/* ---- nodeterm://open confirm sheet (components/OpenLinkSheet.tsx; reuses the .confirm shell) ---- */
+.confirm.open-link {
+  width: 520px;
+}
+.open-link__title {
+  flex: 0 0 auto;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.open-link__source {
+  flex: 0 0 auto;
+  margin: 2px 0 12px;
+  font-size: 12px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.open-link__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  margin-bottom: 14px;
+}
+.open-link__label {
+  display: block;
+  margin: 0 0 4px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+}
+.open-link__field {
+  margin-bottom: 10px;
+}
+.open-link__value {
+  margin: 0 0 10px;
+  font-size: 12px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.open-link__muted {
+  color: var(--muted);
+}
+.open-link__prompt {
+  margin: 0 0 10px;
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: rgba(var(--tint-rgb), 0.06);
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.open-link__note,
+.open-link__warn {
+  margin: -4px 0 10px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--state-warning) 12%, transparent);
+}
+.open-link__error {
+  margin: 0 0 6px;
+  font-size: 12px;
+  color: var(--danger);
+}
 .share-team__title {
   flex: 0 0 auto;
   margin: 0 0 10px;
@@ -12927,6 +13317,8 @@ button.pull-checks__name {
   text-overflow: ellipsis;
   cursor: pointer;
   backdrop-filter: blur(4px);
+  /* Over the node's resize controls (z 3). */
+  z-index: 4;
 }
 .kanban-node-pill:hover {
   filter: brightness(1.3);
@@ -16902,7 +17294,7 @@ body.focus-mode .dock:hover {
 }
 /* RAM panel secondary text (N5-L2): hard-coded 0.45–0.6 ink measured 3.95–4.22:1 on glass; it takes
    the glass secondary label. */
-:root[data-nt-glass='on'] :is(.sessmem-panel__scope, .sessmem-panel__note, .sessmem-row__project, .sessmem-row__orphan, .sessmem-row__cmd, .sessmem-row__kids, .sessmem-panel__attrib, .sessmem-panel__foot) {
+:root[data-nt-glass='on'] :is(.sessmem-panel__scope, .sessmem-panel__note, .sessmem-row__project, .sessmem-row__orphan, .sessmem-row__cmd, .sessmem-row__kids, .sessmem-panel__attrib, .sessmem-panel__foot, .sessmem-host) {
   color: var(--muted);
 }
 /* The Members picker's hover was a solid accent row with white text (3.65:1) while every other list
@@ -17203,6 +17595,39 @@ body.focus-mode .dock:hover {
 }
 :root[data-nt-glass='on'] .react-flow__node:not(.react-flow__node-group) .react-flow__resize-control.line {
   border-color: var(--glass-edge) !important;
+}
+/* The live resize controls moved OUTSIDE the node root (direct children of the node wrapper) only
+   take the pointer; they paint nothing in any look. A control outside the root cannot reproduce
+   where the old one painted (under glass: against the root's padding box, cut by its rounded
+   clip; in every look: partly under the node's own body), so each node also renders a second,
+   paint-only <NodeResizer> in the old place inside the root, its controls classed
+   `.nt-resize-ghost` and taking no pointer — so no second resizer can ever start a drag.
+   Specific enough, and !important, to beat React Flow's inline colour and the glass overrides. */
+:root .flow-wrap .react-flow .react-flow__node:not(.react-flow__node-group) > .react-flow__resize-control:is(.handle, .line) {
+  background-color: transparent !important;
+  border-color: transparent !important;
+}
+.react-flow__resize-control.nt-resize-ghost {
+  pointer-events: none;
+}
+/* Link dots moved OUTSIDE a terminal's root (so a glass root's backdrop-filter, its own stacking
+   context, no longer buries them under the resize controls) keep the look they had while that
+   root clipped them: laid out against its PADDING box, so centred 1px inside the border, and
+   showing only their inner half. Scoped to exactly when the root's backdrop-filter is live — it
+   is dropped while the camera moves with "Keep blur while moving" off (.canvas-moving) and under
+   Reduce Transparency, and there nothing was clipped. A clip-path also clips hit testing, so the
+   outer half goes to the resize band exactly as before; the tooltip (above, growing inward) stays
+   inside the clip, so on a node narrower than it the tooltip is no longer cut at the node's far
+   edge as it was (not reproduced: the clip box cannot reach the node's width). */
+@media (prefers-reduced-transparency: no-preference) {
+  :root[data-nt-glass='on'] .flow-wrap:not(.canvas-moving) .react-flow__node > .bridge-handle--in {
+    left: 1px;
+    clip-path: inset(-48px -480px -48px 50%);
+  }
+  :root[data-nt-glass='on'] .flow-wrap:not(.canvas-moving) .react-flow__node > .bridge-handle--out {
+    right: 1px;
+    clip-path: inset(-48px 50% -48px -480px);
+  }
 }
 /* State stays visible without the accent colour: selection is a neutral ink outline; unread and
    attention keep their own glows (app state, not a per-node colour), and their border reads
@@ -17676,7 +18101,6 @@ body.focus-mode .dock:hover {
   font-weight: 500;
   white-space: nowrap;
   cursor: pointer;
-  -webkit-app-region: no-drag;
 }
 .tab__return svg {
   width: 12px;
@@ -17685,4 +18109,231 @@ body.focus-mode .dock:hover {
 .tab__return:hover {
   background: rgba(var(--tint-rgb), 0.1);
   color: var(--text);
+}
+
+/* ── Simulator node (nodes/SimulatorNode.tsx) ─────────────────────────────────────────────────
+   A live iOS simulator screen: header, a control row, then the screen, which keeps the phone's
+   proportions (object-fit: contain) inside whatever size the node is. */
+.sim-node {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, calc(0.35 * var(--shadow-k)));
+}
+.sim-node.selected {
+  border-color: var(--accent);
+}
+.sim-node__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 8px;
+  cursor: grab;
+  flex-shrink: 0;
+}
+.sim-node__title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+}
+.sim-node__bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  padding: 4px 8px 6px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11.5px;
+  flex-shrink: 0;
+}
+.sim-node__device {
+  flex: 1;
+  min-width: 0;
+  max-width: none;
+}
+.sim-node__screen {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  /* theme-exempt: the letterbox around a device screen is black in every theme, like a video. */
+  background: #000;
+  outline: none;
+  cursor: pointer;
+  touch-action: none;
+}
+.sim-node__screen:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+.sim-node__frame {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  user-select: none;
+  pointer-events: none;
+}
+.sim-node__placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  text-align: center;
+  font-size: 12px;
+  line-height: 1.5;
+  color: rgba(255, 255, 255, 0.7);
+}
+.sim-node__note {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 8px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  font-size: 11px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.6);
+  pointer-events: none;
+}
+
+.sim-node__hint {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  top: 8px;
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  padding: 6px 8px;
+  border-radius: 7px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.72);
+}
+.sim-node__hint-close {
+  flex: none;
+  padding: 0 2px;
+  font: inherit;
+  font-size: 13px;
+  line-height: 1;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.sim-node__rec {
+  height: 22px;
+  padding: 0 7px;
+  font: inherit;
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 45%, transparent);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.sim-node__drop {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+  border: 2px dashed var(--accent);
+  pointer-events: none;
+}
+.sim-node__toast {
+  position: absolute;
+  left: 10px;
+  right: 10px;
+  bottom: 10px;
+  padding: 6px 10px;
+  border-radius: 7px;
+  font-size: 11.5px;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: 0 6px 20px rgba(0, 0, 0, calc(0.3 * var(--shadow-k)));
+  pointer-events: none;
+}
+.sim-node__toast--error {
+  color: var(--danger);
+}
+.sim-node__overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 12px;
+  background: color-mix(in srgb, var(--bg) 55%, transparent);
+}
+.sim-node__dialog {
+  width: 100%;
+  max-width: 340px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, calc(0.4 * var(--shadow-k)));
+  font-size: 12px;
+  color: var(--text);
+}
+.sim-node__dialog-title {
+  font-weight: 600;
+  font-size: 13px;
+}
+.sim-node__dialog-body {
+  color: var(--muted);
+  line-height: 1.45;
+}
+.sim-node__field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.sim-node__field span {
+  color: var(--muted);
+  font-size: 11px;
+}
+.sim-node__field input,
+.sim-node__field textarea {
+  font: 11.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+  color: var(--text);
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 5px 7px;
+  resize: vertical;
+}
+.sim-node__dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  margin-top: 2px;
 }

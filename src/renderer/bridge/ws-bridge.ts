@@ -27,11 +27,14 @@ import {
   type RpcMessage
 } from '../../shared/rpc'
 import { IPC } from '../../shared/ipc'
-import type { ChatPromptResult } from '../../shared/text-delivery'
+import type { ChatPromptResult, EmptyPromptResult } from '../../shared/text-delivery'
 import type { GitHubControlApi, GitHubIssuesApi } from '../../shared/github-issues'
 import {
   UNKNOWN_CLAUDE_CLI_CAPS,
   UNKNOWN_GROK_CLI_CAPS,
+  UNKNOWN_CURSOR_CLI_CAPS,
+  type CursorApi,
+  type CursorCliCaps,
   type BoardLogApi,
   type LogApi,
   type LogRecord,
@@ -59,6 +62,7 @@ import {
   type GitApi,
   type MemInfo,
   type NodeTerminalApi,
+  type PaneKeysResult,
   type PresenceApi,
   type PtyApi,
   type PtyCreateOptions,
@@ -80,6 +84,7 @@ import {
 } from '../../shared/types'
 import type { PeerIdentity } from '../../shared/presence'
 import type { PaneOwner } from '../../shared/agents/pane-owner-predicate'
+import type { LaunchIntentExecutionResult } from '../../shared/types'
 import { buildStubApi, unsupported } from './stubs'
 import { sanitizeStationNotices } from '@shared/station-notice'
 import { sanitizeOutcomeRecords } from '@shared/station-outcome'
@@ -293,6 +298,8 @@ export function buildRealApi(
       client.request(IPC.ptySendText, persistKey, text, opts?.enter) as Promise<boolean>,
     sendChatPrompt: (persistKey, text, agentId) =>
       client.request(IPC.ptySendChatPrompt, persistKey, text, agentId) as Promise<ChatPromptResult>,
+    sendToEmptyPrompt: (persistKey, text, agentId) =>
+      client.request(IPC.ptySendToEmptyPrompt, persistKey, text, agentId) as Promise<EmptyPromptResult>,
     // A failed read is unknown, never evidence that persistence is available.
     tmuxStatus: () =>
       client
@@ -300,22 +307,37 @@ export function buildRealApi(
         .catch(() => ({ available: false, installCommand: null, installLabel: null, platform: null, persistence: null })) as Promise<TmuxStatus>,
     // Unknown on failure (null), never a rejection: the restart poller reads null as "not a
     // shell yet" and gives up on its own deadline.
-    paneCommand: (persistKey) =>
-      client.request(IPC.ptyPaneCommand, persistKey).catch(() => null) as Promise<string | null>,
+    paneCommand: (persistKey, opts) =>
+      client.request(IPC.ptyPaneCommand, persistKey, opts).catch(() => null) as Promise<string | null>,
     // Real: core registers it. Unknown (null) on failure — a relay host refuses it to a non-editor
     // (EDITOR_ONLY), which reads as "no live cwd" and file links keep the node's launch cwd.
     paneCwd: (persistKey) =>
       client.request(IPC.ptyPaneCwd, persistKey).catch(() => null) as Promise<string | null>,
+    // Real: core registers it (host-only; a relay host refuses it). Never rejects.
+    sendPaneKeys: (nodeId, data) =>
+      client.request(IPC.ptySendPaneKeys, nodeId, data).catch(() => ({ ok: false, reason: 'failed' })) as Promise<PaneKeysResult>,
     // Documented degrade (#925): the Server Edition starts nodes through its HeadlessNodeFactory,
     // never through the browser renderer, so there is nothing for this to call.
     launchHeadless: () => unsupported('pty.launchHeadless'),
     // A REAL implementation, not a stub: core registers the handler, so the server this browser is
     // served from answers it. The hibernation exit fails CLOSED on a null, so a stub here would
     // have silently switched Eco off for the whole Server Edition rather than degrade it.
-    paneOwner: (persistKey) =>
-      client.request(IPC.ptyPaneOwner, persistKey).catch(() => null) as Promise<PaneOwner | null>,
+    paneOwner: (persistKey, opts) =>
+      client.request(IPC.ptyPaneOwner, persistKey, opts).catch(() => null) as Promise<PaneOwner | null>,
     terminateForeground: (persistKey, expectedAgentId) =>
-      client.request(IPC.ptyTerminateForeground, persistKey, expectedAgentId).catch(() => false) as Promise<boolean>,
+      client.request(IPC.ptyTerminateForeground, persistKey, expectedAgentId).catch(() => false) as Promise<boolean | 'unsupported'>,
+    // REAL: core registers it, so a server running on Windows answers with its own session host.
+    // On the Linux server every call answers `unsupported-shell` and the caller types its legacy
+    // line. A transport failure is `delivery-failed`, NOT a fallback: the reply may be what was
+    // lost, and typing the legacy line after a launch that did land would start the agent twice.
+    executeLaunch: (persistKey, request) =>
+      (client.request(IPC.ptyExecuteLaunch, persistKey, request) as Promise<LaunchIntentExecutionResult>).catch(
+        (): LaunchIntentExecutionResult => ({
+          ok: false,
+          reason: 'delivery-failed',
+          message: 'The agent launch could not be delivered to the terminal.'
+        })
+      ),
     // No server handler — the session-name poll degrades to no adopted name. A PRE-EXISTING gap,
     // and not any one agent's: `IPC.ptyReadSessionName` has never been registered server-side, so
     // claude's, grok's and gemini's read legs are equally stubbed here (the write leg works on both
@@ -343,6 +365,10 @@ export function buildRealApi(
   const workspace: WorkspaceApi = {
     load: () => client.request(IPC.workspaceLoad) as Promise<Workspace>,
     save: (ws: Workspace, opts?: WorkspaceSaveOptions) => client.request(IPC.workspaceSave, ws, opts) as Promise<void>,
+    // REAL: core's WorkspaceStore registers it, and it is the whole point on this surface — two
+    // browser tabs on one project must not both type a launch (#1173).
+    claimLaunch: (nodeId: string, command: string, manual: boolean) =>
+      client.request(IPC.workspaceClaimLaunch, nodeId, command, manual) as Promise<'claimed' | 'elsewhere'>,
     // REAL: WorkspaceStore (core) registers IPC.workspaceProbeFolder, so the server serves it.
     // Stubbing it to `null` meant "Open folder…" on a repo that already carries a committed
     // .nodeterm/project.json concluded there was no project there, created an EMPTY one, and the
@@ -366,7 +392,10 @@ export function buildRealApi(
     // REAL: Server Edition canvas control broadcasts its own persisted bridge/rope changes here —
     // wider than the node-only canvas:mut vocabulary, but ours, so they must not travel the
     // outside-edit channel and end up behind the conflict bar (see server/canvas-control.ts).
-    onServerChange: (cb) => client.subscribe(IPC.workspaceServerChange, cb as Listener)
+    onServerChange: (cb) => client.subscribe(IPC.workspaceServerChange, cb as Listener),
+    // Documented degrade: the quit / restart-to-update flush is a desktop main-process request.
+    // The server never quits on a tab's behalf, and the debounced autosave covers a browser.
+    onFlushRequest: () => () => {}
   }
 
   // REAL: WorkspaceStore (core) registers the project-settings:* channels too — same
@@ -939,6 +968,8 @@ export function buildSpeechApi(client: RpcClient): Pick<NodeTerminalApi, 'speech
     deleteModel: (id) => client.request(IPC.speechModelDelete, { id }) as Promise<void>,
     onProgress: (cb) => client.subscribe(IPC.speechProgress, cb as Listener),
     micConsent: () => Promise.resolve(true)
+    // `openMicSettings` is deliberately ABSENT: a browser's mic permission is its own site
+    // setting, and the dictation overlay hides its "Open microphone settings" button without it.
   }
   return { speech }
 }
@@ -1104,7 +1135,7 @@ export function buildRunConfigApi(client: RpcClient): Pick<NodeTerminalApi, 'run
     devices: (refresh) => client.request(IPC.runDevices, refresh) as Promise<RunDevicesResult>,
     bootDevice: (udid) => client.request(IPC.runBootDevice, udid) as Promise<boolean>,
     discoverProjects: (dir) => client.request(IPC.runDiscover, dir) as Promise<string[]>,
-    start: (nodeId, config) => client.request(IPC.runStart, nodeId, config) as Promise<RunStartResult>,
+    start: (nodeId, config, opts) => client.request(IPC.runStart, nodeId, config, opts) as Promise<RunStartResult>,
     status: (nodeId) => client.request(IPC.runStatus, nodeId) as Promise<RunStatus>,
     stop: (nodeId, force) => client.request(IPC.runStop, nodeId, force) as Promise<boolean>,
     signal: (nodeId, kind) => client.request(IPC.runSignal, nodeId, kind) as Promise<boolean>,
@@ -1169,6 +1200,16 @@ export function buildGrokApi(client: RpcClient): GrokApi {
       (client.request(IPC.grokCliCaps) as Promise<GrokCliCaps>).catch(() => UNKNOWN_GROK_CLI_CAPS),
     takenSessionIds: (cwd: string) =>
       (client.request(IPC.grokTakenSessionIds, cwd) as Promise<string[]>).catch(() => [])
+  }
+}
+
+/** cursor's model catalogue over WS-RPC: a REAL handler server-side (`registerCursorCliIpc`). */
+export function buildCursorApi(client: RpcClient): CursorApi {
+  return {
+    cliCaps: () =>
+      (client.request(IPC.cursorCliCaps) as Promise<CursorCliCaps>).catch(
+        () => UNKNOWN_CURSOR_CLI_CAPS
+      )
   }
 }
 
@@ -1420,7 +1461,8 @@ export async function installWsBridge(): Promise<boolean> {
       return {
         chat: t.chat,
         claude: { ...buildClaudeApi(client, stubApi.claude), readTranscript: t.claudeReadTranscript },
-        grok: buildGrokApi(client)
+        grok: buildGrokApi(client),
+        cursor: buildCursorApi(client)
       }
     })(),
     // Web replacement for the Electron native dialog: an in-app server-directory browser over

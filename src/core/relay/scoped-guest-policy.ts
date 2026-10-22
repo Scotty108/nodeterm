@@ -257,6 +257,9 @@ const ptyCreate: Check = (a, s) => {
   if (!nodeInScope(opts.persistKey, s)) return no(NODE_OUTSIDE)
   if (opts.ownerProjectId !== undefined && opts.ownerProjectId !== s.projectId) return no(OUTSIDE)
   delete opts.sshRemote
+  // The local-login exemption from the SSH-project refusal is this machine's own UI's mark, never
+  // a guest's (issue #1186).
+  delete opts.localOnSshCanvas
   if (s.deps.projectIsRemote?.(s.projectId)) opts.requireRemote = true
   const root = rootOf(s)
   if (opts.cwd === undefined || opts.cwd === null || opts.cwd === '') {
@@ -319,6 +322,7 @@ export const SCOPED: Readonly<Record<string, Check>> = Object.freeze({
   [IPC.ptyReadScrollback]: nodeArg0,
   [IPC.ptySendText]: nodeArg0,
   [IPC.ptySendChatPrompt]: nodeArg0,
+  [IPC.ptySendToEmptyPrompt]: nodeArg0,
   [IPC.ptyTmuxStatus]: pass,
   [IPC.ptyPaneCommand]: nodeArg0,
   [IPC.ptyPaneCwd]: nodeArg0,
@@ -434,6 +438,14 @@ export const SCOPED: Readonly<Record<string, Check>> = Object.freeze({
 export const SCOPED_REFUSED: ReadonlySet<string> = new Set<string>([
   // A whole-workspace write from a peer would replace the host's other projects.
   IPC.workspaceSave,
+  // Host-only (shared/host-control.ts): a peer's launch claim would make the host's own viewers
+  // stand down from a launch (#1173). A relay tab never sends it.
+  IPC.workspaceClaimLaunch,
+  // Host-only for every peer (shared/host-control.ts): it would type a launch on the host and read
+  // a host-local prompt file into it. A relay tab never sends it.
+  IPC.ptyExecuteLaunch,
+  // Types into a pane by node id; HOST_ONLY, and relay-api.ts stubs it.
+  IPC.ptySendPaneKeys,
   // Project settings / setup / trust: relay-api.ts keeps these LOCAL; the setup ones are host-only.
   IPC.projectSettingsRead,
   IPC.projectSettingsWriteShared,

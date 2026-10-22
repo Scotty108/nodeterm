@@ -31,6 +31,7 @@ import { groupsFirst } from '@shared/node-order'
 import { applyOwnCanvasMutation, createProject, reorderGroupWithinParent } from './workspace'
 import { registerCodexRelayProjectCheck } from './codexCli'
 import { markWorkspaceDirty } from './workspaceDirty'
+import { rootPositionWith } from '@shared/root-position'
 import { folderName } from '../lib/projectOpen'
 import { ownsProjectHere, popoutProjectId } from './windows'
 // One order-independent key for an edge's endpoints — the SAME rule `hiddenLinkIds` uses, so a
@@ -329,19 +330,7 @@ function rootStatePosition(
   nodes: CanvasNodeState[]
 ): { x: number; y: number } {
   const byId = new Map(nodes.map((candidate) => [candidate.id, candidate]))
-  const seen = new Set<string>([node.id])
-  let x = node.position.x
-  let y = node.position.y
-  let parentId = node.parentId
-  while (parentId && !seen.has(parentId)) {
-    seen.add(parentId)
-    const parent = byId.get(parentId)
-    if (!parent) break
-    x += parent.position.x
-    y += parent.position.y
-    parentId = parent.parentId
-  }
-  return { x, y }
+  return rootPositionWith(node, (id) => byId.get(id))
 }
 
 function stateIsDescendant(

@@ -57,6 +57,7 @@ import { useProjects } from '../state/projects'
 import { useSettings } from '../state/settings'
 import { useViewMode, viewFor } from '../state/viewMode'
 import { readLocal } from '../lib/localStore'
+import { rootPositionWith } from '@shared/root-position'
 
 /** Atlas page edge, in DEVICE pixels. 2048 (not Phase 0's 1024) because the atlas cells are
  *  device-sized AND the page is now keyed by COLOUR: at dpr 2 a 13px terminal font is roughly a
@@ -472,18 +473,7 @@ function absoluteRect(node: StackedNode, byId: Map<string, StackedNode>): StackR
   const w = positiveSize(node.measured?.width) ?? positiveSize(node.width)
   const h = positiveSize(node.measured?.height) ?? positiveSize(node.height)
   if (w === null || h === null) return null
-  let { x, y } = node.position
-  let parentId = node.parentId
-  const seen = new Set<string>([node.id])
-  for (let depth = 0; parentId && depth < MAX_PARENT_DEPTH; depth++) {
-    if (seen.has(parentId)) break
-    seen.add(parentId)
-    const parent = byId.get(parentId)
-    if (!parent) break
-    x += parent.position.x
-    y += parent.position.y
-    parentId = parent.parentId
-  }
+  const { x, y } = rootPositionWith(node, (id) => byId.get(id), MAX_PARENT_DEPTH)
   return { x, y, w, h }
 }
 

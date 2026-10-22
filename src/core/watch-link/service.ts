@@ -98,6 +98,7 @@ import {
   type WatchLinkStore
 } from './store'
 import type { RelayTransport } from '../relay/relay-socket'
+import { errorText } from '../../shared/error-text'
 
 /** setTimeout's own ceiling (a longer delay fires at once). A link lives ≤ 24 h, far below it. */
 const MAX_DELAY_MS = 2_147_483_647
@@ -287,7 +288,6 @@ export function sendToOwners(
   for (const id of p.clientIds()) if (p.isOwnerClient?.(id) === true) p.sendTo(id, channel, ...args)
 }
 
-const errorText = (err: unknown): string => (err instanceof Error ? err.message : String(err))
 /** An error's NAME only: what failed around a password (its hash, its check) may be in the message. */
 const errorName = (err: unknown): string => (err instanceof Error ? err.name : 'not an Error')
 const TIMEOUT = Symbol('timeout')
