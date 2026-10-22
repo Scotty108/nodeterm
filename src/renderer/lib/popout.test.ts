@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { alertsHere, isTabTearOff, nextActiveAfterDetach, popoutRefusal } from './popout'
+import { alertsHere, isTabTearOff, nextActiveAfterDetach, popoutRefusal, unreadCountHere } from './popout'
 
 const ctx = (over: Partial<Parameters<typeof popoutRefusal>[1]> = {}) => ({
   browser: false,
@@ -86,5 +86,30 @@ describe('alertsHere', () => {
   })
   it('a node no project knows yet alerts here', () => {
     expect(alertsHere(projects, 'fresh', () => false)).toBe(true)
+  })
+  it('in a pop-out, a node its one-project store does not know is the main window\'s', () => {
+    // A pop-out's store holds only its own project (`loadFor`), so a main-window node is unknown
+    // there. Reading it as "mine" made the pop-out chime and mark unread every main-window finish.
+    const popoutStore = [{ id: 'b', nodes: [{ id: 'b1' }] }] as never
+    const popoutOwns = (id: string) => id === 'b'
+    expect(alertsHere(popoutStore, 'a1', popoutOwns, { popout: true })).toBe(false)
+    expect(alertsHere(popoutStore, 'b1', popoutOwns, { popout: true })).toBe(true)
+    // …while a node on the pop-out's own live canvas (spawned since its last commit) is its own.
+    expect(alertsHere(popoutStore, 'fresh', popoutOwns, { popout: true, live: (id) => id === 'fresh' })).toBe(true)
+  })
+})
+
+describe('unreadCountHere', () => {
+  it('each window counts only the unread nodes it would alert for, so the shares sum to the total', () => {
+    const all = [
+      { id: 'a', nodes: [{ id: 'a1' }, { id: 'a2' }] },
+      { id: 'b', nodes: [{ id: 'b1' }] }
+    ] as never
+    const byId = { a1: { unread: true }, a2: { unread: false }, b1: { unread: true }, orphan: { unread: true } }
+    const main = unreadCountHere(byId, all, (id) => id !== 'b')
+    const popout = unreadCountHere(byId, [{ id: 'b', nodes: [{ id: 'b1' }] }] as never, (id) => id === 'b', { popout: true })
+    expect(main).toBe(2) // a1 + the node no project knows
+    expect(popout).toBe(1) // b1 only
+    expect(main + popout).toBe(3)
   })
 })

@@ -106,14 +106,34 @@ export function isTabTearOff(drag: TabDragEnd): boolean {
  * Whether THIS window raises the alert (unread, chime, OS notification) for an agent event on
  * `nodeId`. Agent status reaches every app window, so each keeps the state bookkeeping, but only
  * the window that shows the node interrupts the user: otherwise a popped-out node chimes twice and
- * the main window marks unread a finish the user watched in the pop-out. A node no project knows
- * yet (spawned since the last commit) is the active canvas's, i.e. this window's.
+ * the main window marks unread a finish the user watched in the pop-out.
+ *
+ * A node on this window's live canvas is this window's. A node no project in this window's store
+ * knows is the main window's: there it is a node spawned since the last commit, but a pop-out's
+ * store holds ONE project, so in a pop-out every other project's node is unknown — reading those
+ * as "mine" made a pop-out chime and mark unread every finish in the main window too. The same
+ * rule decides which window's badge share counts a node (`unreadCountHere`).
  */
 export function alertsHere(
   projects: readonly Pick<Project, 'id' | 'nodes'>[],
   nodeId: string,
-  ownsHere: (projectId: string) => boolean
+  ownsHere: (projectId: string) => boolean,
+  opts: { popout?: boolean; live?: (nodeId: string) => boolean } = {}
 ): boolean {
+  if (opts.live?.(nodeId)) return true
   const owner = projects.find((p) => p.nodes.some((n) => n.id === nodeId))
-  return !owner || ownsHere(owner.id)
+  if (owner) return ownsHere(owner.id)
+  return !opts.popout
+}
+
+/** How many unread nodes THIS window's badge share counts: those it would alert for. */
+export function unreadCountHere(
+  byId: Readonly<Record<string, { unread?: boolean } | undefined>>,
+  projects: readonly Pick<Project, 'id' | 'nodes'>[],
+  ownsHere: (projectId: string) => boolean,
+  opts: { popout?: boolean; live?: (nodeId: string) => boolean } = {}
+): number {
+  let count = 0
+  for (const [id, st] of Object.entries(byId)) if (st?.unread && alertsHere(projects, id, ownsHere, opts)) count++
+  return count
 }

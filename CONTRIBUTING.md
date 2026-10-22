@@ -386,7 +386,9 @@ anything else. Board-level fields survive every transform — `pullLinks` is one
   refuses), joins no presence, and any new "act on project X" IPC you add should resolve the
   window that shows X (`windowShowingProject` / `windowForNode` in main) rather than
   `getMainWindow()`. Per-node pushes go to every app window (`sendToAppWindows`), never to
-  `sendToMain` alone. In the renderer, write another project through the `useProjects` mutators,
+  `sendToMain` alone, and anything a renderer REPORTS to main (the unread badge count, the keyboard
+  stand-down bits) is kept per sending window — two windows writing one global value overwrite each
+  other. In the renderer, write another project through the `useProjects` mutators,
   not `useProjects.setState`: the mutators refuse a project another window owns (a test fails on
   a new mutator you did not classify), and anything with a side effect outside the store — ending
   a session, typing into a pane — must ask `refuseForeignProject` first.

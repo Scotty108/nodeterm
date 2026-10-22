@@ -86,6 +86,36 @@ export function sendToAppWindows(channel: string, ...args: unknown[]): void {
   sendToPopouts(channel, ...args)
 }
 
+/** The renderer of every live app window — the main window first, then each pop-out. For the
+ *  requests every renderer must answer for its OWN projects (the quit / restart-to-update canvas
+ *  flush): each window saves only what it owns, so asking the main window alone leaves a
+ *  pop-out's last edits behind. `isDestroyed` comes from the window, which owns that state. */
+export function appWindowContents(): {
+  id: number
+  isDestroyed(): boolean
+  send(channel: string, ...args: unknown[]): void
+}[] {
+  const out: { id: number; isDestroyed(): boolean; send(channel: string, ...args: unknown[]): void }[] = []
+  const main = getMainWindow()
+  if (main) {
+    const wc = main.webContents
+    out.push({ id: wc.id ?? -1, isDestroyed: () => main.isDestroyed(), send: (c, ...a) => wc.send(c, ...a) })
+  }
+  for (const win of byProject.values()) {
+    if (win.isDestroyed()) continue
+    const wc = win.webContents
+    out.push({ id: wc.id, isDestroyed: () => win.isDestroyed(), send: (c, ...a) => wc.send(c, ...a) })
+  }
+  return out
+}
+
+/** Whether `win` is one of our app windows (the main window or a pop-out) — never a DevTools
+ *  window or the notch HUD. */
+export function isAppWindow(win: { webContents: { id: number } } | null | undefined): boolean {
+  if (!win) return false
+  return (win as unknown) === getMainWindow() || popoutProjectOf(win.webContents.id) !== null
+}
+
 /** The window that shows `projectId`: its pop-out, else the main window. `null` while the main
  *  window is closed (macOS) and the project is not popped out. */
 export function windowShowingProject(projectId: string | undefined): PopoutWindowLike | MainWindowLike | null {

@@ -1,7 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { setMainWindow, type MainWindowLike } from './main-window'
 import {
+  appWindowContents,
   detachedProjectIds,
+  isAppWindow,
   menuTarget,
   onDetachedChange,
   popoutClientIds,
@@ -144,5 +146,35 @@ describe('menu target', () => {
     expect(menuTarget(main, main)).toBe(main)
     expect(menuTarget(devtools, main)).toBe(main)
     expect(menuTarget(null, main)).toBe(main)
+  })
+})
+
+describe('appWindowContents / isAppWindow', () => {
+  it('lists the main window first, then every live pop-out, so a flush reaches each renderer', () => {
+    const main = fakeWindow(1)
+    setMainWindow(main)
+    const a = fakeWindow(2)
+    const b = fakeWindow(3)
+    registerPopout('pa', a)
+    registerPopout('pb', b)
+    b.destroy()
+    const contents = appWindowContents()
+    expect(contents.map((c) => c.id)).toEqual([1, 2])
+    contents[1].send('app:flush-request', 'x')
+    expect(a.sent).toEqual([['app:flush-request', 'x']])
+    expect(contents[1].isDestroyed()).toBe(false)
+    a.destroy()
+    expect(contents[1].isDestroyed()).toBe(true)
+  })
+
+  it('an app window is the main window or a pop-out, never another webContents', () => {
+    const main = fakeWindow(1)
+    setMainWindow(main)
+    const pop = fakeWindow(2)
+    registerPopout('p', pop)
+    expect(isAppWindow(main)).toBe(true)
+    expect(isAppWindow(pop)).toBe(true)
+    expect(isAppWindow(fakeWindow(9))).toBe(false) // DevTools, the notch HUD
+    expect(isAppWindow(null)).toBe(false)
   })
 })

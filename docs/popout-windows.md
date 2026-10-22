@@ -127,8 +127,10 @@ back to this window**) runs a **flush handshake**: main intercepts `close`, send
 does the window really close. Bounded at 2.5 s, because a wedged renderer must not hold a window
 open — the ack means "you may close me", never "the save landed". The registry's `closed` handler
 un-registers the project, `window:detached-change` clears the ghost, and the tab is clickable
-again. On quit every window closes without the handshake, the same debounced-autosave exposure the
-main window has always had.
+again. On quit every window closes without the handshake; instead, quit and restart-to-update ask
+EVERY app window for main's capped canvas flush (`flushAppRenderers` → `requestRendererFlush`, 1 s
+per window, never rejecting), because each window saves only what it owns — flushing the main
+window alone left a pop-out's last debounce of edits behind.
 
 ## 3. Where per-node traffic goes
 
@@ -168,6 +170,29 @@ Main used to send everything to *the* window. Now:
   the focused one. The move BETWEEN windows could not be driven reliably under automation (macOS
   often reports no focused window to a Playwright-driven app), so that half rests on the unit tests
   of its two parts (`menuTarget`, `window-key-state`) and is on the device checklist.
+- **Facts the launch loop and the chips read go to every app window** — station outcomes
+  (`--after-success`), station hand-over holds (plain `--after`), station-failure notices and the
+  Cursor subagent tracker's events (`sendToAppWindows`). These arrived on main after the pop-out
+  work and first went to the main window only, so an armed node in a popped-out project never saw
+  the report it was waiting for.
+- **The unread badge is a sum.** Each window reports the unread count of the nodes it would ALERT
+  for (`unreadCountHere`, the `alertsHere` rule) and main sums the live windows' shares (a share is
+  dropped where its page ends). Before, the two windows' counts overwrote each other. "Unfocused"
+  for the Windows taskbar flash means no app window has focus, and focusing a pop-out ends the
+  main window's flash.
+- **`alertsHere` in a pop-out**: a pop-out's store holds ONE project, so every other project's node
+  is unknown there. An unknown node now counts as the main window's (a node on the pop-out's own
+  live canvas is still the pop-out's), where it used to read as "mine" — a pop-out chimed and
+  marked unread every finish in the main window.
+- **A notch HUD row click raises the window that shows the node** (`windowForNode`), not the main
+  window first (which then forwarded, bringing two windows forward).
+- **A minimized pop-out is backgrounded** like a minimized main window (`app:window-visibility`), so
+  its terminals count as offscreen for the reclaim levers. A pop-out never hides itself, so a raw
+  `hide` (macOS occlusion) never counts.
+- **A project-setup trust prompt goes to the focused app window** (a setup run starts from a
+  worktree created there), else the main window; its dismissal goes to every app window.
+- **`nodeterm://` links stay main-window only**: links are delivered to the main window and only it
+  may say `ready`, so only the MAIN window's page death holds them again.
 - **Pop-outs count as attached clients** (`clientIds()` includes them). Not optional: the pty
   manager decides "attached" against that list, and a subscriber missing from it reads as detached
   to the session reaper — a pop-out's terminals would be culled after the grace window.
@@ -246,6 +271,10 @@ Main used to send everything to *the* window. Now:
   windows. Reading `unread` in one window can be undone by the other's next persist. The honest fix
   is per-window keys or main-owned state; not done here.
 - **A pop-out's geometry is not remembered** (§4).
+- **The update card, the tray and prepare-for-update live in the main window.** A pop-out shows no
+  update button; prepare-for-update (Windows) can ask only the main window's MOUNTED agent nodes to
+  quit cleanly, so a pop-out's agents are disclosed as "stopped without a clean exit" (their busy
+  state still blocks it, through the core mirror).
 - **The Omni Kanban and the sessions sidebar list a detached project from main's mirrored copy**,
   which lags the pop-out by one autosave debounce (≤ 800 ms). Only NAVIGATION routes to the window
   (row click, "Go to", Show window); every edit or teardown is refused there with a pointer to the
@@ -291,6 +320,12 @@ Verified on macOS (see the PR for the run). Owed elsewhere:
 6. **`terminal-first` with two windows**: focus a terminal in a pop-out, then click into the main
    window (no terminal focused there) — ⌘M should minimize the main window; click back into the
    pop-out's terminal — ⌘M should reach the terminal.
+8. **Unread badge with two windows** (macOS Dock, Windows overlay): finish an agent in the main
+   window and one in a pop-out while the app is in the background — the badge reads 2, and reading
+   each node drops it by one.
+9. **Notch HUD**: click a row for a node in a popped-out project — only the pop-out comes forward.
+10. **Quit with an unsaved pop-out edit**: move a node in a pop-out and quit within a second — the
+    move is there after relaunch.
 7. **The reviewer's blocking scenarios on a device**: with a terminal-bearing project popped out,
    the main window's sidebar project menu shows only Show window / Bring back; sidebar ×, Omni
    delete and "Close project → end sessions" are refused with the strip, and `tmux ls` still lists

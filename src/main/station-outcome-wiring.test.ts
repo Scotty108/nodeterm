@@ -49,9 +49,9 @@ describe('desktop main', () => {
     expect(main).toMatch(/messagingDeps\.onHandover = \(ev\) => \{\s*stationOutcomes\.onHandover\(ev\)/)
   })
 
-  it('registers the read channel and pushes every change to the window', () => {
+  it('registers the read channel and pushes every change to every app window (pop-outs included)', () => {
     expect(main).toContain('registerStationOutcomeIpc(corePlatform, () => stationOutcomes)')
-    expect(main).toMatch(/new StationOutcomeStore\(\s*\(records\) =>\s*sendToMain\(IPC\.stationOutcomeChanged, records\)/)
+    expect(main).toMatch(/new StationOutcomeStore\(\s*\(records\) =>\s*sendToAppWindows\(IPC\.stationOutcomeChanged, records\)/)
   })
 
   it('persists the store and the delivery queue, and loads them after the status mirror (durable state)', () => {

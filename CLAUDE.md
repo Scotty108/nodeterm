@@ -8873,12 +8873,18 @@ the Settings section and ShortcutsPanel start disagreeing about what a chord mea
   (`window-key-state.ts`; the menu's stand-down follows the focused app window). (4)
   **Pop-outs are attached clients** (`clientIds()`), or the reaper reads their sessions as
   detached. (5) **Closing runs a bounded flush handshake** (`window:popout-flush` /
-  `-flushed`, 2.5 s) — the ack means "you may close me", never "the save landed"; on quit the
-  handshake is skipped, the same debounced-autosave exposure the main window has. (6) The main
+  `-flushed`, 2.5 s) — the ack means "you may close me", never "the save landed"; on quit and
+  restart-to-update the handshake is skipped and EVERY app window gets main's capped canvas flush
+  instead (`flushAppRenderers`). (6) The main
   window's copy of a popped-out project is kept fresh by `window:popout-project-saved` →
   `replaceProject` (never active there, never edited there, so a plain replace clobbers nothing).
   Deliberately not: persisted across restarts, nestable, available in a browser/relay tab
   (`windows.popout` rejects; the tab menu hides the row; `isBrowserRuntime()` disarms the drag).
+  (7) **Everything main added for "the window" needs a two-window decision**: the per-node facts
+  the launch loop and chips read (station outcomes / hand-overs / notices) go to every app window,
+  the unread badge is the SUM of each window's share (`unreadCountHere` — inside a pop-out, whose
+  store holds one project, an unknown node is the main window's), and a notch HUD click raises
+  `windowForNode`. A new `sendToMain` of a per-node fact is a pop-out bug.
   Known v1 gaps, all in the doc: shared `localStorage` across windows (last-writer-wins on the
   per-viewer stores), geometry not remembered,
   and the WebGL budget is

@@ -200,6 +200,8 @@ import {
   saveScopeFor,
   sendToAppWindows,
   windowShowingProject,
+  appWindowContents,
+  isAppWindow,
   type PopoutWindowLike
 } from './popout-windows'
 import { popoutHash } from '../shared/popout-window'
@@ -561,8 +563,14 @@ settingsStore.onChange((s) => {
 // The main window's renderer id, kept here because `main-window.ts` forgets the window in its own
 // `closed` listener, which runs before ours. Only that page listens for `nodeterm://` links.
 let mainRendererId: number | null = null
+// Each app window's share of the unread badge (see the `appSetBadge` handler). `applyBadge` is
+// assigned once the handlers are registered; before that a page cannot have reported anything.
+const badgeShareBySender = new Map<number, number>()
+let applyBadge = (): void => {}
 const clearRendererKeyState = (webContentsId: number): void => {
   clearKeyState(webContentsId)
+  // The page that reported this share is gone; a reloaded page reports its own again.
+  if (badgeShareBySender.delete(webContentsId)) applyBadge()
   // The same page death ends the `nodeterm://` link listener: hold links again until the next page
   // says it is ready (a link must not be sent into a renderer that is not there to show it). Only
   // the MAIN window's page counts: links are sent to it alone and only it may say `ready`
@@ -581,7 +589,7 @@ const ptyManager = new PtyManager()
 // way agent-status events do (sendToMain — resolves the live window at send time).
 const whisperModels = new WhisperModelStore({
   dir: join(app.getPath('userData'), 'speech-models'),
-  onProgress: (id, pct) => sendToMain(IPC.speechProgress, { id, pct })
+  onProgress: (id, pct) => sendToAppWindows(IPC.speechProgress, { id, pct })
 })
 const speechService = new SpeechService({ models: whisperModels, isPremium })
 
@@ -755,7 +763,19 @@ const projectSetupService = new ProjectSetupService({
   // their screen. Same main-window-only push the ssh passphrase prompt uses; with the window closed
   // (macOS) the prompt is simply not delivered and the run rides out its expiry as `unanswered`,
   // which is the fail-closed direction.
-  sendConsent: (channel, payload) => sendToMain(channel, payload)
+  //
+  // With pop-out windows "this window" is the app window the user is in when the prompt is raised
+  // (a setup run starts from a worktree created there), else the main window. The dismissal goes
+  // to every app window: it names a request id, so a window that never showed it ignores it.
+  sendConsent: (channel, payload) => {
+    if (channel !== IPC.projectSetupConsentRequest) {
+      sendToAppWindows(channel, payload)
+      return
+    }
+    const focused = BrowserWindow.getFocusedWindow()
+    if (focused && !focused.isDestroyed() && isAppWindow(focused)) focused.webContents.send(channel, payload)
+    else sendToMain(channel, payload)
+  }
 })
 const projectSetupDeps: ProjectSetupHandlerDeps = {
   projectTargetInfo: (projectId) => workspaceStore.projectTargetInfo(projectId),
@@ -1400,6 +1420,13 @@ function requestPopoutFlush(win: BrowserWindow): Promise<void> {
   })
 }
 
+/** Ask EVERY app window's renderer to write its pending canvas edits (quit, restart-to-update).
+ *  Each window saves only what it owns (`saveScopeFor`), so flushing the main window alone left a
+ *  pop-out's last debounce of edits behind. Each request is capped and never rejects. */
+function flushAppRenderers(): Promise<unknown> {
+  return Promise.all(appWindowContents().map((wc) => requestRendererFlush(wc, ipcMain)))
+}
+
 /** Bring a pop-out to the front. Every caller is a CLICK — the ghosted tab, a sidebar row, a
  *  notification (see window-raise.guard.test.ts, which counts these). */
 function raisePopout(win: PopoutWindowLike): void {
@@ -1435,6 +1462,16 @@ function createPopoutWindow(projectId: string): BrowserWindow {
   })
   registerPopout(projectId, win)
   const clientId = win.webContents.id
+  // Minimize / restore send the same "backgrounded" signal the main window's do, so a minimized
+  // pop-out's terminals count as offscreen and the reclaim levers can run there too
+  // (renderer/terminal/window-backgrounded.ts). A pop-out never hides itself (its close closes),
+  // so a raw `hide` — macOS occlusion — never counts: `hiddenByApp` stays false.
+  for (const ev of WINDOW_VISIBILITY_EVENTS) {
+    win.on(ev as 'hide', () => {
+      const signal = windowVisibilitySignal(ev, { hiddenByApp: false })
+      if (signal && !win.isDestroyed()) win.webContents.send(IPC.appWindowVisibility, signal)
+    })
+  }
   win.on('closed', () => {
     // Same reasoning as the main window's `closed`: a destroyed window sends no `pty:kill`, so
     // its pty subscriptions must be dropped here or its sessions stay paused/attached forever.
@@ -2116,7 +2153,15 @@ app.whenReady().then(async () => {
   onDetachedChange((ids) => sendToMain(IPC.windowDetachedChange, ids))
   // The menu's stand-down follows the FOCUSED app window's keyboard bits, so moving between the main
   // window and a pop-out owes a sync — a window change is not a focus-mirror event in either page.
-  app.on('browser-window-focus', () => syncMenuForStandDown())
+  app.on('browser-window-focus', (_e, focused) => {
+    syncMenuForStandDown()
+    // Windows: the taskbar flash an unread rise raised on the MAIN window (`appSetBadge`) is for a
+    // user who is not looking at the app; coming back to it through a pop-out ends it too.
+    if (process.platform === 'win32' && isAppWindow(focused)) {
+      const main = getMainWindow() as unknown as BrowserWindow | null
+      if (main && !main.isDestroyed()) main.flashFrame(false)
+    }
+  })
 
   // Settings' shortcut recorder arming/disarming. Guarded on the sender being the live main window
   // (the same `getMainWindow()?.webContents.id !== event.sender.id` test `registerElectronGitHubControl`
@@ -2189,10 +2234,23 @@ app.whenReady().then(async () => {
   // nothing. The decision is the pure `planBadge` (taskbar-badge.ts). The same count feeds the
   // background-mode tray's tooltip/menu (de-duplicated there, so a resend rebuilds nothing).
   let lastBadgeCount: number | null = null // null until the first report: that one is a baseline
-  ipcMain.on(IPC.appSetBadge, (_e, count: number) => {
-    const n = normalizeUnread(count)
+  ipcMain.on(IPC.appSetBadge, (e, count: number) => {
+    // Every app window reports the unread count of the nodes IT shows (a popped-out project's
+    // nodes count in its pop-out, `alertsHere`), so the badge is the SUM of the live windows'
+    // reports — a single last-writer value flipped between the two windows' counts. A window's
+    // share is dropped where its page ends (`clearRendererKeyState`, the same three sites).
+    const share = normalizeUnread(count)
+    if (share > 0) badgeShareBySender.set(e.sender.id, share)
+    else badgeShareBySender.delete(e.sender.id)
+    applyBadge()
+  })
+  applyBadge = (): void => {
+    let total = 0
+    for (const share of badgeShareBySender.values()) total += share
+    const n = normalizeUnread(total)
     const win = getMainWindow() as unknown as BrowserWindow | null
-    const plan = planBadge(process.platform, n, lastBadgeCount, !!win?.isFocused())
+    // "Unfocused" means no app window has focus: a focused pop-out is the user looking at the app.
+    const plan = planBadge(process.platform, n, lastBadgeCount, isAppWindow(BrowserWindow.getFocusedWindow()))
     lastBadgeCount = n
     trayState.unread = n
     backgroundTray?.update({ ...trayState })
@@ -2207,7 +2265,7 @@ app.whenReady().then(async () => {
       }
     }
     if (plan.flash && win && !win.isDestroyed()) win.flashFrame(true)
-  })
+  }
 
   // Show an OS notification — but only when the window is in the background. Clicking it
   // brings the app forward and asks the renderer to focus the originating node.
@@ -2540,7 +2598,7 @@ app.whenReady().then(async () => {
     pendingQuestionOf: (id) => mirrorEntry(id)?.pendingQuestion?.toolUseId,
     appendBoardLog: (projectId, entry) => appendBoardLogVia(boardLogRouter, projectId, entry),
     deliver: (notice) => deliverStationNotice(notice, messagingDeps),
-    publish: (views) => sendToMain(IPC.stationNoticeChanged, views),
+    publish: (views) => sendToAppWindows(IPC.stationNoticeChanged, views),
     // The memoized index scan, not `getNode` (which re-parses a project file per call): the sweep
     // asks this for every node it tracks.
     exists: (id) => workspaceStore.projectIdsForNode(id).length > 0
@@ -2557,7 +2615,7 @@ app.whenReady().then(async () => {
   // that made it; `loadFromDisk()` runs below, after the status mirror it compares against.
   const stationOutcomesFile = new DurableFactFile(OUTCOME_FACT, { userDataDir: corePlatform.userDataDir })
   const stationOutcomes = new StationOutcomeStore(
-    (records) => sendToMain(IPC.stationOutcomeChanged, records),
+    (records) => sendToAppWindows(IPC.stationOutcomeChanged, records),
     {
       durable: stationOutcomesFile,
       sessionOf: (id) => {
@@ -2576,7 +2634,7 @@ app.whenReady().then(async () => {
   // between the reports and the queue.
   const stationHandoversFile = new DurableFactFile(HANDOVER_FACT, { userDataDir: corePlatform.userDataDir })
   const stationHandovers = new StationHandoverTracker(
-    (records) => sendToMain(IPC.stationHandoverChanged, records),
+    (records) => sendToAppWindows(IPC.stationHandoverChanged, records),
     Date.now,
     stationHandoversFile
   )
@@ -2720,7 +2778,10 @@ app.whenReady().then(async () => {
     onUpdateReady: (version) => {
       trayState.updateReady = version
       backgroundTray?.update({ ...trayState })
-    }
+    },
+    // Every app window, pop-outs included (the default flushes and asks the main window only).
+    flushRenderer: flushAppRenderers,
+    appFocused: () => isAppWindow(BrowserWindow.getFocusedWindow())
   })
   // Prepare-for-update (Windows session host, issue #829). The user confirmed the whole flow in
   // its own dialog, so the quit at its end skips the ordinary quit confirmation, like the
@@ -2815,7 +2876,7 @@ app.whenReady().then(async () => {
     }
   }
   const startNotchHud = (): void =>
-    initNotchHud({ getNodeTitle: displayTitleFor }, notchTunables())
+    initNotchHud({ getNodeTitle: displayTitleFor, windowForNode: (id) => windowForNode(id) }, notchTunables())
   if (win.isVisible()) startNotchHud()
   else win.once('show', startNotchHud)
   buildAppMenu(win)
@@ -3240,7 +3301,7 @@ app.whenReady().then(async () => {
   const cursorSubagents = createCursorSubagentTracker({
     tail: subagentTail,
     emit: (ev) => {
-      sendToMain(IPC.agentStatus, ev)
+      sendToAppWindows(IPC.agentStatus, ev)
       recordAgentEvent(ev)
     }
   })
@@ -5797,7 +5858,7 @@ app.on('before-quit', (e) => {
   // (OWNED_SHUTDOWN_TIMEOUT_MS) and never throws, so quit is never held by a device.
   const simulatorsDown = shutdownOwnedSimulators()
   const flush = Promise.allSettled([
-    requestRendererFlush(getMainWindow()?.webContents, ipcMain).then(() => remoteWorkspaceIO.flush()),
+    flushAppRenderers().then(() => remoteWorkspaceIO.flush()),
     remoteWorkspaceIO.flush(),
     ptyManager.killAll(),
     watchLinksStopped

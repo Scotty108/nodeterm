@@ -505,7 +505,7 @@ import {
 } from '../lib/explorerPinHint'
 import { sameSshEndpoint, setKanbanPublishHook, setStoredCanvasPublishHook, useProjects } from '../state/projects'
 import { isPopoutWindow, ownsProjectHere, popoutProjectId, useWindows } from '../state/windows'
-import { alertsHere, nextActiveAfterDetach, popoutRefusal } from '../lib/popout'
+import { alertsHere, nextActiveAfterDetach, popoutRefusal, unreadCountHere } from '../lib/popout'
 import { useAgentStatus, recordsTurnInterrupt } from '../state/agentStatus'
 import { usePendingPause, startPendingPauseWatcher } from '../state/pendingPause'
 import {
@@ -5265,10 +5265,16 @@ export function Canvas() {
   // Reflect Claude nodes with unread output as a macOS Dock badge count (across all projects).
   // Subscribes to the derived count (a primitive), not the byId map, for the same reason as
   // loopSig above — state flips must not re-render the canvas.
+  // With pop-out windows each window reports only the nodes it would ALERT for (`alertsHere`) and
+  // main sums the windows' shares, so a node counts once. `detachedIds` is read here so a pop-out
+  // opening or closing re-runs the count in the main window.
+  const detachedIds = useWindows((s) => s.detached)
   const unreadCount = useAgentStatus((s) => {
-    let count = 0
-    for (const st of Object.values(s.byId)) if (st?.unread) count++
-    return count
+    void detachedIds
+    return unreadCountHere(s.byId, useProjects.getState().projects, ownsProjectHere, {
+      popout: isPopoutWindow(),
+      live: (id) => nodesRef.current.some((n) => n.id === id)
+    })
   })
   useEffect(() => {
     window.nodeTerminal.setBadgeCount(unreadCount)
@@ -17189,7 +17195,13 @@ export function Canvas() {
         // The alert — unread, chime, notification — belongs to the ONE window that shows the node:
         // otherwise a popped-out node chimes twice, and the main window marks unread (and
         // notifies) a finish the user sat and watched in the pop-out.
-        if (!alertsHere(useProjects.getState().projects, e.nodeId, ownsProjectHere)) return
+        if (
+          !alertsHere(useProjects.getState().projects, e.nodeId, ownsProjectHere, {
+            popout: isPopoutWindow(),
+            live: (id) => nodesRef.current.some((n) => n.id === id)
+          })
+        )
+          return
         // Unread unless the user is actively in this node's terminal (focused window +
         // this node is the active terminal). So a finish while you're in another terminal,
         // or with nothing focused, still flags unread.
