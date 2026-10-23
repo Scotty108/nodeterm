@@ -21,5 +21,16 @@ export function ptyRefusal(unavailable: NonNullable<PtyCreateResult['unavailable
       connectionLost: false
     }
   }
+  // A remote node's create found its id held by a live session that is not on its host (a local
+  // session, or another endpoint) and did not join it. The project's master may be perfectly
+  // healthy, so this is not a lost connection — reporting one would kick the reconnector, whose
+  // respawn refuses again.
+  if (unavailable === 'held-elsewhere') {
+    return {
+      message:
+        "a session with this terminal's id is already running somewhere other than its host, so it was not joined — nothing was started",
+      connectionLost: false
+    }
+  }
   return { message: 'not connected — nothing was started locally', connectionLost: true }
 }

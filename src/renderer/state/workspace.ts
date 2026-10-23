@@ -53,6 +53,14 @@ export { accountNodeColor, agentAccountColor } from '@shared/agents/account-colo
 import { mutationTrustsLaunch, sanitizeInboundNode } from '@shared/node-exec'
 import { SYSTEM_NODE_COLORS } from '@shared/node-colors'
 import { groupsFirstBy } from '@shared/node-order'
+import {
+  NODE_SIZE_MAX,
+  STICKY_NODE_SIZE,
+  TERMINAL_NODE_SIZE_MIN,
+  resolveDefaultNodeSize,
+  type NodeSize,
+  type SizableNodeKind
+} from '@shared/default-node-size'
 import { rootPositionWith } from '@shared/root-position'
 
 // Preserve the renderer's long-standing import surface; validation and the palette now live in
@@ -60,7 +68,7 @@ import { rootPositionWith } from '@shared/root-position'
 export { NODE_COLORS, SYSTEM_NODE_COLORS } from '@shared/node-colors'
 
 const TERMINAL_SIZE = { width: 640, height: 440 }
-const STICKY_SIZE = { width: 240, height: 200 }
+const STICKY_SIZE = STICKY_NODE_SIZE
 const GROUP_SIZE = { width: 520, height: 360 }
 /** A fresh worktree group starts empty but exists to HOLD terminals/agents, and the default
  *  GROUP_SIZE (520×360) is smaller than a single terminal (600×400) — a dropped-in terminal would
@@ -357,9 +365,42 @@ export function terminalNodeSize(): { width: number; height: number } {
     return Math.min(hi, Math.max(lo, n))
   }
   return {
-    width: clamp(s.defaultNodeWidth, 280, 2400, TERMINAL_SIZE.width),
-    height: clamp(s.defaultNodeHeight, 160, 1600, TERMINAL_SIZE.height)
+    width: clamp(s.defaultNodeWidth, TERMINAL_NODE_SIZE_MIN.width, NODE_SIZE_MAX.width, TERMINAL_SIZE.width),
+    height: clamp(s.defaultNodeHeight, TERMINAL_NODE_SIZE_MIN.height, NODE_SIZE_MAX.height, TERMINAL_SIZE.height)
   }
+}
+
+export const BUILTIN_NODE_SIZES: Readonly<Record<SizableNodeKind, NodeSize>> = {
+  sticky: STICKY_SIZE,
+  editor: EDITOR_SIZE,
+  diff: DIFF_SIZE,
+  video: VIDEO_SIZE,
+  web: WEB_SIZE,
+  browser: BROWSER_SIZE,
+  files: FILES_SIZE,
+  dino: DINO_SIZE,
+  trigger: TRIGGER_SIZE,
+  simulator: SIMULATOR_SIZE
+}
+
+/**
+ * Default size for NEW nodes of a non-terminal kind: the user's per-kind setting (Settings →
+ * Behavior → Default node size), else the kind's built-in size, clamped between its resizer
+ * minimum and the canvas maximum. Read at creation time, never at mount (settings hydrate late).
+ */
+export function defaultNodeSize(kind: SizableNodeKind): NodeSize {
+  const stored = useSettings.getState().settings.defaultNodeSizes?.[kind]
+  return resolveDefaultNodeSize(stored, BUILTIN_NODE_SIZES[kind], NODE_MIN_SIZES[kind])
+}
+
+/** `placeNode` at the kind's default size. */
+function placeSized(
+  kind: SizableNodeKind,
+  center: { x: number; y: number } | undefined,
+  index: number
+): Pick<CanvasNode, 'position' | 'width' | 'height' | 'style'> {
+  const { width, height } = defaultNodeSize(kind)
+  return placeNode(kind, center, index, width, height)
 }
 
 /**
@@ -453,7 +494,7 @@ export function createSimulatorNode(
   return {
     id: nextId('sim'),
     type: 'simulator',
-    ...placeNode('simulator', center, index, SIMULATOR_SIZE.width, SIMULATOR_SIZE.height),
+    ...placeSized('simulator', center, index),
     data: {
       title: c.name ?? 'Simulator',
       color: RUN_NODE_COLOR,
@@ -1110,7 +1151,7 @@ export function createEditorNode(
   return {
     id: nextId('editor'),
     type: 'editor',
-    ...placeNode('editor', center, index, EDITOR_SIZE.width, EDITOR_SIZE.height),
+    ...placeSized('editor', center, index),
     data: {
       title: filePath.split('/').pop() || 'untitled',
       color: '#6ac4dc',
@@ -1174,7 +1215,7 @@ export function createVideoNode(
   return {
     id: nextId('video'),
     type: 'video',
-    ...placeNode('video', center, index, VIDEO_SIZE.width, VIDEO_SIZE.height),
+    ...placeSized('video', center, index),
     data: {
       title: filePath.split('/').pop() || 'video',
       color: '#bf5af2',
@@ -1197,7 +1238,7 @@ export function createWebNode(
   return {
     id: nextId('web'),
     type: 'web',
-    ...placeNode('web', center, index, WEB_SIZE.width, WEB_SIZE.height),
+    ...placeSized('web', center, index),
     data: {
       title,
       color: '#6ac4dc',
@@ -1227,7 +1268,7 @@ export function createBrowserNode(
   return {
     id: nextId('browser'),
     type: 'browser',
-    ...placeNode('browser', center, index, BROWSER_SIZE.width, BROWSER_SIZE.height),
+    ...placeSized('browser', center, index),
     data: {
       title,
       color: '#0a84ff',
@@ -1260,7 +1301,7 @@ export function createFilesNode(
     // manager sitting off-grid beside snapped neighbours, and off-grid in SIZE too — React Flow
     // resizes by adding a grid multiple to the start size, so an unsnapped box can never be
     // dragged onto the grid afterwards.
-    ...placeNode('files', center, index, FILES_SIZE.width, FILES_SIZE.height),
+    ...placeSized('files', center, index),
     data: {
       title: folderTitle(cwd),
       color: '#ffd60a',
@@ -1283,7 +1324,7 @@ export function createDiffNode(
   return {
     id: nextId('diff'),
     type: 'diff',
-    ...placeNode('diff', center, index, DIFF_SIZE.width, DIFF_SIZE.height),
+    ...placeSized('diff', center, index),
     data: {
       title: `${relPath.split('/').pop() || relPath} (${commitOid ? commitOid.slice(0, 7) : 'diff'})`,
       color: '#e0af68',
@@ -1301,7 +1342,7 @@ export function createStickyNode(index: number, center?: { x: number; y: number 
   return {
     id: nextId('sticky'),
     type: 'sticky',
-    ...placeNode('sticky', center, index, STICKY_SIZE.width, STICKY_SIZE.height),
+    ...placeSized('sticky', center, index),
     data: {
       title: 'Note',
       color: '#ffd60a',
@@ -1317,13 +1358,14 @@ export function createStickyNode(index: number, center?: { x: number; y: number 
  * invalid/absent spec schedules nothing and cannot be armed).
  */
 export function createTriggerNode(index: number, center?: { x: number; y: number }): CanvasNode {
+  const size = defaultNodeSize('trigger')
   return {
     id: nextId('trigger'),
     type: 'trigger',
-    position: placeAt(center, index, TRIGGER_SIZE.width, TRIGGER_SIZE.height),
-    width: TRIGGER_SIZE.width,
-    height: TRIGGER_SIZE.height,
-    style: { width: TRIGGER_SIZE.width, height: TRIGGER_SIZE.height },
+    position: placeAt(center, index, size.width, size.height),
+    width: size.width,
+    height: size.height,
+    style: { width: size.width, height: size.height },
     data: {
       title: 'Trigger',
       color: '#e6a23c',
@@ -1341,7 +1383,7 @@ export function createDinoNode(
   return {
     id: nextId('dino'),
     type: 'dino',
-    ...placeNode('dino', center, index, DINO_SIZE.width, DINO_SIZE.height),
+    ...placeSized('dino', center, index),
     data: {
       title: 'Dino',
       color: '#a2a2a2',

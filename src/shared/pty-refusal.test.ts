@@ -22,4 +22,14 @@ describe('PTY refusal presentation', () => {
   it('the join-only message does not claim the terminal is not running', () => {
     expect(ptyRefusal('join-only').message).not.toMatch(/is not running/)
   })
+  // A remote node's create found a live session with its id held somewhere else (locally, or on
+  // another host) and did not join it. The project's master is fine: read as `connectionLost`, the
+  // node would show "not connected" and kick the reconnector, whose retry refuses again.
+  it('a held-elsewhere refusal is not a lost connection, and says nothing was started', () => {
+    expect(ptyRefusal('held-elsewhere')).toEqual({
+      connectionLost: false,
+      message:
+        "a session with this terminal's id is already running somewhere other than its host, so it was not joined — nothing was started"
+    })
+  })
 })

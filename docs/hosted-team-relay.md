@@ -798,9 +798,11 @@ it is a new way to use it.
   client's baseline and is never cast, so on a governed project it never reaches disk: every load
   derives it again. The repairs are deterministic, so this costs nothing visible, but a repair that
   must persist on a shared project has to be cast.
-- **The card modal's comments on a relay tab** (`BoardLogPanel`) still read and write the local core's
-  board log, not the host's, because the modal renders outside the tab's session. This predates the
-  authority; it is a follow-up.
+- **The issue summary modal's "Agent runs" on a relay tab** (`GitHubIssueSummaryModal` →
+  `BoardLogPanel`) still pairs the LOCAL api with the relay project's id: `KanbanView` renders under
+  App's local provider, and unlike the card modal this modal is not wrapped in
+  `ProjectSessionScope`, so the history is read from this machine's core, not the host's. It is
+  pre-existing; a follow-up.
 
 ## Status and troubleshooting
 

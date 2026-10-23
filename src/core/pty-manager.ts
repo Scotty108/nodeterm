@@ -745,6 +745,16 @@ function normalizeSize(cols: number, rows: number): PtySize {
 }
 
 /**
+ * The same machine, as far as a `requireRemote` join is concerned: host, user (`''` when unset) and
+ * port (22 when unset). The ControlMaster path is deliberately not compared — two views of one host
+ * may hold different masters for it — and neither are identity file or extra args, which change how
+ * we log in, not where the session runs.
+ */
+function sameSshEndpoint(a: SshConnection, b: SshConnection): boolean {
+  return a.host === b.host && (a.user ?? '') === (b.user ?? '') && (a.port ?? 22) === (b.port ?? 22)
+}
+
+/**
  * Hand a remote spawn's gate slot back the moment its pty produces its first byte — the cheapest
  * signal that the ssh channel is up and the host has answered.
  *
@@ -898,6 +908,11 @@ interface Session {
   /** True when this node had an `accountId` but its config dir was gone at spawn, so we fell back
    *  to the system account. `create()` surfaces it to the renderer (warning chip). */
   accountFallback?: boolean
+  /** Set once `join` has warned that this session holds a remote-only node's id somewhere other
+   *  than that node's host (`held-elsewhere`). A watcher retries its join every 2/4/8/15 s for as
+   *  long as the link lives, and every retry is refused the same way, so the warning is logged once
+   *  for the life of this held session; a later session under the same id warns again. */
+  heldElsewhereWarned?: boolean
   /**
    * This session is backed by the session-host process (docs/windows-session-host.md), not a
    * local tmux — selected only when no local tmux was found (primarily Windows). `session.proc`
@@ -2664,6 +2679,27 @@ export class PtyManager {
       existing = existingId ? this.sessions.get(existingId) : undefined
     }
     if (!existingId || !existing) return undefined
+    // A node that lives on a remote host never joins a session that is not on THAT host. The match
+    // above is by node id alone, and a LOCAL session can carry a remote node's id (a hosted team
+    // tab's node mounted under it, a pre-`requireRemote` orphan), so joining it would put the remote
+    // node on this machine's shell — the outcome `spawnRefusal` refuses for a spawn. Refused when
+    // the held session is local, or when the create names its master and that master reaches a
+    // different endpoint. A create with no `sshRemote` (its master momentarily down) still joins a
+    // held REMOTE session: it runs on a host, and nothing says it is the wrong one. The held session
+    // is never touched — it may hold work someone typed into it (same rule as prepareRelayAttach).
+    if (
+      options.requireRemote &&
+      (!existing.sshRemote ||
+        (options.sshRemote && !sameSshEndpoint(options.sshRemote.conn, existing.sshRemote.conn)))
+    ) {
+      if (!existing.heldElsewhereWarned) {
+        existing.heldElsewhereWarned = true
+        console.warn(
+          `[pty] ${sessionName(persistKey)} is held ${existing.sshRemote ? 'on another host' : 'on this machine'} but node ${persistKey} must run on its remote host; not joined, and the held session was left untouched`
+        )
+      }
+      return Promise.resolve({ sessionId: '', fresh: false, unavailable: 'held-elsewhere' })
+    }
     // The joining VIEW's composite key: a second client, OR the SAME client's second view (the
     // kanban card modal). Either way it is a distinct subscriber of the one shared session/pty.
     const sub = subKey(clientId, options.viewerId ?? PRIMARY_VIEWER)
@@ -2759,10 +2795,11 @@ export class PtyManager {
     // node's identity, which is the one outcome a remote node must never have (see
     // `PtyCreateOptions.requireRemote`). Refuse instead; the renderer waits for the master.
     //
-    // Deliberately on the SPAWN path (`spawnNew`, and the relay host's `prepareRelayAttach`) and
-    // not in `create`: a co-attach JOIN to a live session for
-    // this node id is still correct (that session already runs wherever it runs), so only the
-    // branch that would have created a new local session is refused. `findSsh()` is checked for
+    // Deliberately on the SPAWN path (`spawnNew`, and the relay host's `prepareRelayAttach`). A
+    // co-attach JOIN never reaches it: `join` answers first and has its own rule
+    // (`'held-elsewhere'`) — it refuses when the held session for this node id is local or on
+    // another host, and still attaches to a live session on the requested remote (or on any remote
+    // while the create's master is down). `findSsh()` is checked for
     // the same reason `spawnSession` checks it — without the executable the remote branch there
     // is skipped and the local one runs.
     if (options.requireRemote && !(options.sshRemote && options.persistKey && findSsh())) {

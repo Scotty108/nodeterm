@@ -4,6 +4,7 @@ import type { IdentitySeedEntry } from './agent-identity-seed'
 import type { PrWaitHold } from './pr-wait'
 import type { SessionBackend } from './session-backend'
 import type { AgentIntegrationsSettings } from './agent-integrations'
+import type { NodeSize, SizableNodeKind } from './default-node-size'
 // Types shared across the main, preload, and renderer processes.
 
 import { TABBAR_HEIGHT_PX } from './window-chrome-metrics'
@@ -410,9 +411,15 @@ export interface PtyCreateResult {
    * `PtyCreateOptions.requireRemote` for what used to happen instead. The renderer shows the
    * "not connected" overlay and re-spawns the node once the project's master is back.
    *
-   * Only ever set for a create that would have SPAWNED: a co-attach to a live session for this
-   * node id still joins (the session is already running wherever it runs), so a second view of a
-   * healthy remote terminal is unaffected.
+   * `'ssh'` is only ever set for a create that would have SPAWNED: a co-attach to a live session
+   * for this node id on the requested remote still joins, so a second view of a healthy remote
+   * terminal is unaffected.
+   *
+   * `'held-elsewhere'`: a `requireRemote` create found a live session for this node id held by this
+   * process, but NOT on the requested remote — it is local, or its endpoint (host, user, port)
+   * differs from the create's `sshRemote`. The join is refused and nothing was started; the held
+   * session is left untouched. A create with no `sshRemote` (master down) still joins a held
+   * remote session. Not a lost connection: retrying would refuse again.
    *
    * `'codex-account'` is the S6 fail-closed twin: a LOCAL Codex node that explicitly selected a
    * managed account whose home is missing refuses rather than spawning against the system login
@@ -423,7 +430,7 @@ export interface PtyCreateResult {
    * session could be confirmed to join or reattach to — either it is gone, or its existence could
    * not be checked — so nothing was started. Not a lost connection.
    */
-  unavailable?: 'ssh' | 'codex-account' | 'join-only'
+  unavailable?: 'ssh' | 'codex-account' | 'join-only' | 'held-elsewhere'
 }
 
 /** Payload of `pty:recycled` — see IPC.ptyRecycled and `recycleAction` in the renderer. */
@@ -1939,6 +1946,10 @@ export interface Settings {
    *  whatever size they were saved with; other node kinds keep their own defaults. */
   defaultNodeWidth: number
   defaultNodeHeight: number
+  /** Default size (px) for NEW nodes of every other kind the add menus create, keyed by kind; a
+   *  kind with no entry opens at its built-in size. Read through `defaultNodeSize` (renderer) /
+   *  `resolveDefaultNodeSize` (@shared/default-node-size), which clamp hand edits. Machine-local. */
+  defaultNodeSizes: Partial<Record<SizableNodeKind, NodeSize>>
   /** Sessions sidebar: the DEFAULT for a project row the user never toggled — on (historical)
    *  keeps the active project expanded and collapses the others, off leaves everything expanded.
    *  Explicit toggles live in `sidebarCollapsedItems` and always win. */
@@ -2448,6 +2459,7 @@ export const DEFAULT_SETTINGS: Settings = {
   markdownFontSize: DEFAULT_MARKDOWN_FONT_SIZE,
   defaultNodeWidth: 640,
   defaultNodeHeight: 440,
+  defaultNodeSizes: {},
   sidebarAutoCollapse: true,
   sidebarCollapsedItems: {},
   sidebarGrouping: 'project',

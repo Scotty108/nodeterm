@@ -1,4 +1,5 @@
 import type { NodeKind } from '@shared/types'
+import { STICKY_NODE_MIN_SIZE } from '@shared/default-node-size'
 
 /**
  * Minimum width/height for each node kind. These are the single source of truth
@@ -12,7 +13,7 @@ import type { NodeKind } from '@shared/types'
  */
 export const NODE_MIN_SIZES: Record<NodeKind, { width: number; height: number }> = {
   terminal: { width: 260, height: 160 },
-  sticky: { width: 160, height: 120 },
+  sticky: STICKY_NODE_MIN_SIZE,
   group: { width: 200, height: 140 },
   editor: { width: 320, height: 200 },
   diff: { width: 420, height: 220 },

@@ -1224,6 +1224,21 @@ export const useProjects = create<ProjectsState>((set, get) => guardProjectOwner
   }
 }))
 
+/**
+ * Add an EMPTY relay tab: a project for a connection whose host shared nothing that could be adopted
+ * (a Team Access tab's fallback, a hosted team's placeholder). Marked `remote` like every relay tab,
+ * because it IS one: the host's nodes reach it over canvas sync, so it must never be saved into this
+ * machine's workspace (`toWorkspace` filters `remote`) nor, once its relay session is gone, resolve
+ * to the local session (session.ts `sessionForProject`). Added like any project first, so it takes
+ * the store's name cap and does not take the screen.
+ */
+export function addRelayTab(label: string): Project {
+  const store = useProjects.getState()
+  const relay = { ...store.addProject(label), remote: true }
+  store.replaceProject(relay)
+  return relay
+}
+
 // Codex launch caps must know a relay tab when they see one: its sessions run on ANOTHER machine's
 // codex, which this machine's probe never saw (see `codexApprovalCaps`). Registered here rather
 // than imported there, because this store imports workspace.ts, which imports codexCli.ts.

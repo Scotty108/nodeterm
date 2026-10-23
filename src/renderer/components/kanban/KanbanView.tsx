@@ -45,6 +45,7 @@ import { NO_ISSUE_RUNS, boundRunsByIssue, type IssueRun } from '../../lib/issueR
 import { useGitHubIssues } from '../../state/githubIssues'
 import { useAgentStatus } from '../../state/agentStatus'
 import { useSession } from '../../session/session'
+import { ProjectSessionScope } from '../../session/owning-project'
 import { KanbanSourceFilter, type KanbanSource } from './KanbanSourceFilter'
 import { GitHubIssueSummaryModal } from './GitHubIssueSummaryModal'
 import { ConfirmDialog } from '../ConfirmDialog'
@@ -1279,6 +1280,9 @@ export const KanbanView = memo(function KanbanView({
         />
       )}
       {modalNodeId && byId.has(modalNodeId) && (
+        // The board renders under App's LOCAL provider, outside Canvas's node subtree: the modal
+        // runs under ITS project's session, so a team tab's terminal attaches to the host's core.
+        <ProjectSessionScope projectId={projectId}>
         <CardModal
           projectName={projectName}
           projectColor={projectColor}
@@ -1316,6 +1320,7 @@ export const KanbanView = memo(function KanbanView({
             onOpenNode(nodeId)
           }}
         />
+        </ProjectSessionScope>
       )}
       {modalIssue && (
         <GitHubIssueSummaryModal

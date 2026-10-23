@@ -18,6 +18,7 @@ import { markCanvasCovered } from '../../lib/canvasCovered'
 import { showCanvas, useViewMode } from '../../state/viewMode'
 import { KanbanScopeSwitch } from './KanbanScopeSwitch'
 import { sessionForProject } from '../../session/session'
+import { ProjectSessionScope } from '../../session/owning-project'
 import { isHostedReadOnly } from '../../state/hostedTeams'
 import { activePermissionMode } from '../../state/permissionMode'
 import { CardModal } from './CardModal'
@@ -349,6 +350,9 @@ const Swimlane = memo(function Swimlane({
         <ContextMenu x={cardMenu.x} y={cardMenu.y} zIndex={60} items={cardMenuItems(cardMenu.nodeId)} onClose={() => setCardMenu(null)} />
       )}
       {modalNodeId && byId.has(modalNodeId) && (
+        // The overview renders under App's LOCAL provider: the modal runs under THIS lane's
+        // project's session, so a team lane's terminal attaches to the host's core.
+        <ProjectSessionScope projectId={projectId}>
         <CardModal
           projectName={projectName}
           projectColor={projectColor}
@@ -373,6 +377,7 @@ const Swimlane = memo(function Swimlane({
           team={teams.get(modalNodeId) ?? NO_STATIONS}
           onTravel={(nodeId) => { setModalNodeId(null); travel(nodeId) }}
         />
+        </ProjectSessionScope>
       )}
     </div>
   )

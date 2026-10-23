@@ -503,7 +503,7 @@ import {
   shouldShowExplorerPinHint,
   writeSeenExplorerPinHint
 } from '../lib/explorerPinHint'
-import { sameSshEndpoint, setKanbanPublishHook, setStoredCanvasPublishHook, useProjects } from '../state/projects'
+import { addRelayTab, sameSshEndpoint, setKanbanPublishHook, setStoredCanvasPublishHook, useProjects } from '../state/projects'
 import { isPopoutWindow, ownsProjectHere, popoutProjectId, useWindows } from '../state/windows'
 import { alertsHere, nextActiveAfterDetach, popoutRefusal, unreadCountHere } from '../lib/popout'
 import { useAgentStatus, recordsTurnInterrupt } from '../state/agentStatus'
@@ -659,6 +659,7 @@ import {
   useSession,
   SessionProvider,
   sessionForProject,
+  boundSessionForProject,
   presenceForProject,
   setActiveSession,
   disposeSession,
@@ -801,6 +802,9 @@ import { snapNodeToGrid } from '../lib/nodeSizing'
 import { snapResizeChanges } from '../lib/resizeSnap'
 import { canClearDirty, canCommitCanvas, canCreateOnCanvas, liveCanvasHolds } from '../state/persistGuards'
 import { mirrorLatest, rebaseOnLatest, useNodesEpoch } from './nodesEpoch'
+import { useFlowStoreOwner } from './flowStoreOwner'
+import { useFlowLanding } from './flowLanding'
+import { OwningProjectContext } from '../session/owning-project'
 import { boardLiveNodeIds, createKanbanPublisher } from './kanban-sync'
 import { applyToStoredCopy, createStoredCanvasPublisher } from './stored-publish'
 import { isHidden } from '../lib/ui-visibility'
@@ -1708,10 +1712,12 @@ export function Canvas() {
   //
   // Dispose by the project BINDING, not by iterating relayTabsRef: an INVOLUNTARY drop already
   // removed the tab from relayTabsRef (it went offline) but KEPT the session bound, so only
-  // `sessionForProject` still reaches it — iterating relayTabsRef alone would orphan the offline
-  // session in the registry forever. `disposeSession` is idempotent: it runs the held teardowns for
-  // a still-live tab, no-ops them for an already-offline one, and unbinds + drops the entry either
-  // way. We also sweep any live relayTabsRef entry for the project so a dead connectionId can't linger.
+  // `boundSessionForProject` still reaches it — iterating relayTabsRef alone would orphan the offline
+  // session in the registry forever. (The live binding only: an UNBOUND remote tab resolves through
+  // `sessionForProject` to the offline relay sentinel, which owns nothing and is never disposed.)
+  // `disposeSession` is idempotent: it runs the held teardowns for a still-live tab, no-ops them for
+  // an already-offline one, and unbinds + drops the entry either way. We also sweep any live
+  // relayTabsRef entry for the project so a dead connectionId can't linger.
   const disposeRelayTabForProject = useCallback((projectId: string) => {
     // One of a hosted team's several tabs: dismiss just this one. The team's connection lives on
     // for the others (and the joiner keeps reconnecting into one that is still open).
@@ -1722,15 +1728,15 @@ export function Canvas() {
     }
     // A hosted tab's team stops trying to come back into it, in any phase (R40). A no-op otherwise.
     hostedJoinerRef.current?.tabClosed(projectId)
-    const s = sessionForProject(projectId)
+    const s = boundSessionForProject(projectId)
     for (const [connectionId, tab] of relayTabsRef.current) {
       // By session too: a team's last tab may be one a share event opened after the mount. Never
       // while the connection still serves other tabs (one closed earlier lingers in `projectIds`).
-      const ours = tab.projectIds.includes(projectId) || (s.source === 'relay' && tab.sessionId === s.id)
+      const ours = tab.projectIds.includes(projectId) || (s?.source === 'relay' && tab.sessionId === s.id)
       const othersBound = projectIdsBoundToSession(tab.sessionId).some((id) => id !== projectId)
       if (ours && !othersBound) relayTabsRef.current.delete(connectionId)
     }
-    if (s.source === 'relay') {
+    if (s?.source === 'relay') {
       disposeSession(s.id)
       useHostedTeams.getState().forget(s.id) // a no-op for a Team Access relay tab
     }
@@ -2898,6 +2904,13 @@ export function Canvas() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [nodes, ephemeralNodes, keepAliveEntries]
   )
+  // The project whose nodes React Flow's STORE holds, which a switch moves one commit after
+  // `nodes` (see flowStoreOwner.ts). The node subtree's session is keyed on it, never on the
+  // active id, so the outgoing project's nodes never remount under the incoming project's session.
+  const flowOwnerProjectId = useFlowStoreOwner(allNodes, renderedProjectId)
+  const nodeSession = sessionForProject(flowOwnerProjectId ?? '')
+  // Work that frames a just-loaded project waits for that same ownership (see flowLanding.ts).
+  const flowLanding = useFlowLanding(flowOwnerProjectId)
 
   // Context-link edges, statically styled (no per-message activity in the pull model).
   const accent = settings.accent
@@ -3479,41 +3492,49 @@ export function Canvas() {
       } else {
         setResumeProject(null)
       }
-      // Finish an "Open recent" resume that had to land on this project first.
-      const pendingResume = pendingResumeRef.current
-      if (pendingResume && pendingResume.projectId === project.id) {
-        pendingResumeRef.current = null
-        resumeCreateRef.current(pendingResume.conv)
-      }
-      // Finish a `nodeterm://open` link that had to land on this project first.
-      const pendingLink = pendingLinkRef.current
-      if (pendingLink && pendingLink.projectId === project.id) {
-        pendingLinkRef.current = null
-        if (Date.now() - pendingLink.at < PENDING_LINK_MAX_MS) linkCreateRef.current(pendingLink.open)
-      }
-      // Consume a cross-project focus request (notification click on a background node).
-      const pending = pendingFocusRef.current
-      if (pending) {
-        pendingFocusRef.current = null
-        const node = nodesRef.current.find((n) => n.id === pending)
-        if (node) {
-          // Same rule as focusNodeById: if the project we just landed on shows the BOARD, the
-          // node lives on a card, not on the canvas hidden under it.
-          if (isGlobalKanbanOpen() || isKanbanOpen(useProjects.getState().activeProjectId)) {
-            useViewMode.getState().requestCard(pending)
-          } else {
-            setNodes((ns) => ns.map((n) => ({ ...n, selected: n.id === pending })))
-            goToNode(node)
-            // Same as focusNodeById: after the cross-project switch lands, hand the keyboard to the
-            // target terminal so the user can type without a second click.
-            useTerminalFocus.getState().request(pending)
-          }
-          useAgentStatus.getState().setActive(pending, true)
-          useAgentStatus.getState().clearUnread(pending)
+      // The rest frames the new project or reads its nodes off React Flow's store, so it waits
+      // until the store holds THIS project's nodes (flowLanding.ts): a session-changing switch
+      // remounts <ReactFlow> after that copy, and this timer can fire before it.
+      flowLanding.land(project.id, () => {
+        // Finish an "Open recent" resume that had to land on this project first.
+        const pendingResume = pendingResumeRef.current
+        if (pendingResume && pendingResume.projectId === project.id) {
+          pendingResumeRef.current = null
+          resumeCreateRef.current(pendingResume.conv)
         }
-      }
+        // Finish a `nodeterm://open` link that had to land on this project first.
+        const pendingLink = pendingLinkRef.current
+        if (pendingLink && pendingLink.projectId === project.id) {
+          pendingLinkRef.current = null
+          if (Date.now() - pendingLink.at < PENDING_LINK_MAX_MS) linkCreateRef.current(pendingLink.open)
+        }
+        // Consume a cross-project focus request (notification click on a background node).
+        const pending = pendingFocusRef.current
+        if (pending) {
+          pendingFocusRef.current = null
+          const node = nodesRef.current.find((n) => n.id === pending)
+          if (node) {
+            // Same rule as focusNodeById: if the project we just landed on shows the BOARD, the
+            // node lives on a card, not on the canvas hidden under it.
+            if (isGlobalKanbanOpen() || isKanbanOpen(useProjects.getState().activeProjectId)) {
+              useViewMode.getState().requestCard(pending)
+            } else {
+              setNodes((ns) => ns.map((n) => ({ ...n, selected: n.id === pending })))
+              goToNode(node)
+              // Same as focusNodeById: after the cross-project switch lands, hand the keyboard to
+              // the target terminal so the user can type without a second click.
+              useTerminalFocus.getState().request(pending)
+            }
+            useAgentStatus.getState().setActive(pending, true)
+            useAgentStatus.getState().clearUnread(pending)
+          }
+        }
+      })
     }, 0)
-    return () => clearTimeout(t)
+    return () => {
+      clearTimeout(t)
+      flowLanding.cancel()
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeProjectId, reloadNonce, setNodes, setViewport, installEpoch])
 
@@ -5710,7 +5731,10 @@ export function Canvas() {
               }
               return { id: reconnectProjectId } // reconnect: reuse the existing tab, don't spawn one
             }
-          : (name) => useProjects.getState().addProject(name),
+          : // The host shared nothing to adopt: an EMPTY relay tab — `remote`, like every relay tab,
+            // or it would be saved as a local project carrying the host's node ids and resolve to
+            // the LOCAL session once its relay session is gone.
+            (name) => addRelayTab(name),
         // First connect adopts the host's shared project (its nodes, fresh id). On reconnect the
         // existing tab (with its nodes) is reused via addProject above, so no adopt lever is passed.
         adoptProject: reconnectProjectId
@@ -5741,9 +5765,10 @@ export function Canvas() {
         .then((tab): HostedMountOutcome | null => {
           relayTabsRef.current.set(connectionId, tab)
           // The session's api, read ONCE while the mount's tab is surely bound to it: a share event
-          // may close that tab later, and resolving through it then would answer the local session.
-          const bound = sessionForProject(tab.projectId)
-          const api = bound.id === tab.sessionId ? bound.api : null
+          // may close that tab later, and resolving through it then would answer no session at all.
+          // The live binding only — never the offline sentinel an unbound remote tab falls back to.
+          const bound = boundSessionForProject(tab.projectId)
+          const api = bound?.id === tab.sessionId ? bound.api : null
           if (reconnectProjectId) {
             // The fresh session is now bound to the tab (openRelayTab rebound the SAME project id),
             // so it is finally safe to drop the stale offline session it replaced. Disposing only
@@ -5896,7 +5921,9 @@ export function Canvas() {
       bookmarks: async () => (await window.nodeTerminal.relayHosted?.bookmarks()) ?? [],
       removeBookmark: (hostId) => window.nodeTerminal.relayHosted.removeBookmark(hostId),
       mount: (connectionId, req, hooks) => {
-        const bound = req.reconnectProjectId ? sessionForProject(req.reconnectProjectId) : null
+        // The live binding only: the stale session a reconnect replaces is never the offline
+        // sentinel an unbound remote tab resolves to (it would be "disposed" after the rebind).
+        const bound = req.reconnectProjectId ? boundSessionForProject(req.reconnectProjectId) : null
         return confirmAndMount(
           connectionId,
           req.label || 'Hosted team',
@@ -5976,8 +6003,9 @@ export function Canvas() {
       // A hosted team's tab reconnects from its bookmark: no code to paste.
       if (hostedJoinerRef.current?.reconnectTab(projectId)) return
       const label = useProjects.getState().getProject(projectId)?.name ?? 'Remote host'
-      const bound = sessionForProject(projectId)
-      const staleSessionId = bound.source === 'relay' ? bound.id : undefined
+      // The live binding only (never the offline sentinel): an unbound tab has no stale session.
+      const bound = boundSessionForProject(projectId)
+      const staleSessionId = bound?.source === 'relay' ? bound.id : undefined
       void reconnectRelayTab(projectId, {
         promptForOffer: async () => {
           const offer = await promptDialog({ message: "Paste the host's new pairing code:" })
@@ -10224,8 +10252,9 @@ export function Canvas() {
   // reason: the ⇧⌘T plan executor just below reopens through the guarded form.
   //
   // A relay (team) tab is refused here, the one funnel every reopen goes through: once closed its
-  // relay session is gone, and `sessionForProject` would fall back to the LOCAL session, mounting
-  // the host's node ids on this machine's core (local shells, an agent cold-resume). False = refused.
+  // relay session is gone, and its nodes could never start — `sessionForProject` answers the offline
+  // relay session for it (before that existed it fell back to the LOCAL session, mounting the host's
+  // node ids on this machine's core: local shells, an agent cold-resume). False = refused.
   const reopenProjectUnchecked = useCallback(
     (id: string): boolean => {
       if (useProjects.getState().getProject(id)?.remote) {
@@ -18403,16 +18432,21 @@ export function Canvas() {
   /** Land on `projectId`, then resume there (now if the canvas already holds it). */
   const resumeWhenLanded = useCallback(
     (projectId: string, conv: RecentConversation) => {
+      // "Holds it" means React Flow's store, not just the epoch tag: after "Open folder & resume"
+      // switches projects, this runs in the `.then` after the load effect installed the tag but
+      // before the store copy, and framing then would drive the pan/zoom a remount destroys.
+      // Otherwise the load effect's landing consumes the pending resume (flowLanding.ts).
       if (
         projectId === useProjects.getState().activeProjectId &&
-        canCreateOnCanvas(nodesProjectIdRef.current, projectId)
+        canCreateOnCanvas(nodesProjectIdRef.current, projectId) &&
+        flowLanding.holds(projectId)
       ) {
         createRecentResumeNode(conv)
         return
       }
       pendingResumeRef.current = { projectId, conv }
     },
-    [createRecentResumeNode]
+    [createRecentResumeNode, flowLanding]
   )
 
   const resumeRecentConversation = useCallback(
@@ -18529,7 +18563,13 @@ export function Canvas() {
           return
         }
       }
-      if (projectId === useProjects.getState().activeProjectId && canCreateOnCanvas(nodesProjectIdRef.current, projectId)) {
+      // Same rule as resumeWhenLanded: after `openOrAdoptFolder` switched projects the tag is
+      // installed before React Flow's store holds the nodes, so the link waits for the landing.
+      if (
+        projectId === useProjects.getState().activeProjectId &&
+        canCreateOnCanvas(nodesProjectIdRef.current, projectId) &&
+        flowLanding.holds(projectId)
+      ) {
         createFromLink(open)
         return
       }
@@ -18539,7 +18579,7 @@ export function Canvas() {
         if (!ok && pendingLinkRef.current?.open === open) pendingLinkRef.current = null
       } else switchProject(projectId)
     },
-    [api, openOrAdoptFolder, createFromLink, reopenProject, switchProject]
+    [api, openOrAdoptFolder, createFromLink, reopenProject, switchProject, flowLanding]
   )
 
   const linkPermissionLabel = useCallback(
@@ -19865,15 +19905,25 @@ export function Canvas() {
             </div>
           </div>
         )}
-        {/* The active project's node subtree runs under ITS session (local for a local tab, the
-            relay session for a remote tab). Keyed by session id so an api swap REMOUNTS the nodes
-            (obligation 3): TerminalNode/EditorNode capture `api` in []-effects, so a live
-            api change must remount them or they keep talking to the old core. For an all-local user
-            the key is always 'local', so this never remounts — zero behavior change. */}
-        <SessionProvider session={sessionForProject(activeProjectId || '')} key={sessionForProject(activeProjectId || '').id}>
+        {/* The node subtree runs under the session of the project whose nodes React Flow's STORE
+            holds (`flowOwnerProjectId`) — local for a local tab, the relay session for a remote
+            tab. Keyed by session id so an api swap REMOUNTS the nodes (obligation 3):
+            TerminalNode/EditorNode capture `api` in []-effects, so a live api change must remount
+            them or they keep talking to the old core. NOT keyed on `activeProjectId`: xyflow copies
+            the `nodes` prop into its store in a passive effect and `ReactFlowProvider` sits above
+            this provider, so a key that flipped with the active id remounted whatever the store
+            still held — the OUTGOING nodes — under the INCOMING session (a team tab's terminals
+            were created on this desktop's core). For an all-local user the key is always 'local',
+            so this never remounts. */}
+        <SessionProvider session={nodeSession} key={nodeSession.id}>
+        <OwningProjectContext.Provider value={flowOwnerProjectId}>
         <ReactFlow
           className={wallpaperBg ? 'has-wallpaper' : undefined}
           nodes={allNodes}
+          // Read only at mount. A session-changing switch remounts this <ReactFlow> (key above) one
+          // commit AFTER the load effect applied the project's camera, and the fresh pan/zoom starts
+          // here — so hand it the live camera; xyflow's default put every such switch at the origin.
+          defaultViewport={viewportRef.current}
           edges={displayEdges}
           nodeTypes={nodeTypes}
           edgeTypes={edgeTypes}
@@ -20018,6 +20068,7 @@ export function Canvas() {
             <StatusAwareMiniMap onNodeDoubleClick={goToNode} />
           </MinimapDock>
         </ReactFlow>
+        </OwningProjectContext.Provider>
         </SessionProvider>
 
         {/* MUST stay OUTSIDE <ReactFlow>. The library's wrapper carries inline

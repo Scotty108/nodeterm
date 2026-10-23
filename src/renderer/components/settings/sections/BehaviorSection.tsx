@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { useSettings } from '../../../state/settings'
 import { SettingsSection } from '../SettingsSection'
 import { SearchableRow } from '../SearchableRow'
@@ -14,6 +15,16 @@ import { backgroundCloseDescription, backgroundCloseRowVisible } from '@renderer
 import type { BackgroundOnCloseSetting } from '@shared/types'
 import { clampWheelZoomSpeed } from '@renderer/canvas/wheel-zoom'
 import { DEFAULT_WORKTREE_PATH_TEMPLATE } from '@shared/worktree'
+import { Button } from '@renderer/ui/Button'
+import type { NodeSize } from '@shared/default-node-size'
+import {
+  NODE_SIZE_CHOICES,
+  NODE_SIZE_CHOICE_LABELS,
+  nodeSizeField,
+  nodeSizePatch,
+  nodeSizeResetPatch,
+  type NodeSizeChoice
+} from '@renderer/lib/defaultNodeSizeSetting'
 
 const ROWS = {
   defaultView: {
@@ -31,7 +42,10 @@ const ROWS = {
   gridSize: { title: 'Grid size', keywords: ['grid', 'size', 'snap'] },
   nodeSize: {
     title: 'Default node size',
-    keywords: ['node', 'size', 'width', 'height', 'terminal', 'default']
+    keywords: [
+      'node', 'size', 'width', 'height', 'terminal', 'default', 'sticky', 'note', 'browser', 'web',
+      'editor', 'diff', 'file', 'manager', 'video', 'simulator', 'trigger', 'dino'
+    ]
   },
   snap: { title: 'Snap to grid', keywords: ['snap', 'grid', 'align'] },
   autoAlign: {
@@ -177,29 +191,7 @@ export function BehaviorSection({ isActive }: { isActive: boolean }): React.JSX.
         />
       </SearchableRow>
       <SearchableRow {...ROWS.nodeSize}>
-        <FieldRow
-          label="Default node size (px)"
-          description="Size new terminal and agent nodes open at. Existing nodes keep their size."
-          control={
-            <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
-              <NumberField
-                value={settings.defaultNodeWidth}
-                min={280}
-                max={2400}
-                step={20}
-                onChange={(v) => update({ defaultNodeWidth: v || 640 })}
-              />
-              <span style={{ opacity: 0.6 }}>×</span>
-              <NumberField
-                value={settings.defaultNodeHeight}
-                min={160}
-                max={1600}
-                step={20}
-                onChange={(v) => update({ defaultNodeHeight: v || 440 })}
-              />
-            </div>
-          }
-        />
+        <DefaultNodeSizeRow />
       </SearchableRow>
       <SearchableRow {...ROWS.snap}>
         <FieldRow
@@ -524,5 +516,63 @@ export function BehaviorSection({ isActive }: { isActive: boolean }): React.JSX.
         </SearchableRow>
       )}
     </SettingsSection>
+  )
+}
+
+/**
+ * One width × height pair for whichever kind the picker names. New nodes of that kind open at it;
+ * existing nodes keep their size. The model (and why terminal is special) is in
+ * lib/defaultNodeSizeSetting.ts.
+ */
+function DefaultNodeSizeRow(): React.JSX.Element {
+  const settings = useSettings((s) => s.settings)
+  const update = useSettings((s) => s.update)
+  const [choice, setChoice] = useState<NodeSizeChoice>('terminal')
+  const field = nodeSizeField(settings, choice)
+  const set = (size: NodeSize): void => {
+    update(nodeSizePatch(settings, choice, size))
+  }
+  return (
+    <FieldRow
+      label="Default node size (px)"
+      description="Size new nodes of the chosen kind open at. Existing nodes keep their size."
+      control={
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+          <Select
+            aria-label="Node kind"
+            value={choice}
+            onChange={(e) => setChoice(e.target.value as NodeSizeChoice)}
+          >
+            {NODE_SIZE_CHOICES.map((c) => (
+              <option key={c} value={c}>
+                {NODE_SIZE_CHOICE_LABELS[c]}
+              </option>
+            ))}
+          </Select>
+          <NumberField
+            ariaLabel={`${NODE_SIZE_CHOICE_LABELS[choice]} default width`}
+            value={field.size.width}
+            min={field.min.width}
+            max={field.max.width}
+            step={20}
+            onChange={(v) => set({ width: v || field.size.width, height: field.size.height })}
+          />
+          <span style={{ opacity: 0.6 }}>×</span>
+          <NumberField
+            ariaLabel={`${NODE_SIZE_CHOICE_LABELS[choice]} default height`}
+            value={field.size.height}
+            min={field.min.height}
+            max={field.max.height}
+            step={20}
+            onChange={(v) => set({ width: field.size.width, height: v || field.size.height })}
+          />
+          {field.isCustom && (
+            <Button variant="ghost" onClick={() => update(nodeSizeResetPatch(settings, choice))}>
+              Reset
+            </Button>
+          )}
+        </div>
+      }
+    />
   )
 }
